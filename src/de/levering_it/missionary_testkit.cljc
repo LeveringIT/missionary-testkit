@@ -66,7 +66,7 @@
 ;; -----------------------------------------------------------------------------
 
 (defrecord TestScheduler
-  [state policy seed strict? trace?])
+           [state policy seed strict? trace?])
 
 (defn- maybe-trace-state
   "If tracing enabled (state has non-nil :trace vector), append event."
@@ -93,16 +93,16 @@
             strict?    false
             trace?     false}}]
    (->TestScheduler
-     (atom {:now-ms        (long initial-ms)
-            :next-id       0
-            :micro-q       empty-queue
-            ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
-            :timers        (sorted-map)
-            ;; trace is either nil or vector
-            :trace         (when trace? [])
-            ;; JVM-only "driver thread" captured lazily under strict mode
-            :driver-thread #?(:clj nil :cljs ::na)})
-     policy (long seed) (boolean strict?) (boolean trace?))))
+    (atom {:now-ms        (long initial-ms)
+           :next-id       0
+           :micro-q       empty-queue
+           ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
+           :timers        (sorted-map)
+           ;; trace is either nil or vector
+           :trace         (when trace? [])
+           ;; JVM-only "driver thread" captured lazily under strict mode
+           :driver-thread #?(:clj nil :cljs ::na)})
+    policy (long seed) (boolean strict?) (boolean trace?))))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -374,7 +374,7 @@
   (-cancel! [x]))
 
 (defrecord Job
-  [^TestScheduler sched id label state cancel-thunk]
+           [^TestScheduler sched id label state cancel-thunk]
   ICancellable
   (-cancel! [_]
     ;; cancel-thunk may be nil or already invoked; cancellation is cooperative.
@@ -401,49 +401,49 @@
          ;; Complete job via scheduler microtask, so completions become part of deterministic order.
          complete! (fn [status v]
                      (enqueue-microtask!
-                       sched
-                       (fn []
-                         (swap! job-state
-                                (fn [st]
-                                  (if (= :pending (:status st))
-                                    (assoc st :status status
-                                              (if (= status :success) :value :error) v)
-                                    st))))
-                       {:label label
-                        :kind  :job/complete
-                        :lane  :default}))]
+                      sched
+                      (fn []
+                        (swap! job-state
+                               (fn [st]
+                                 (if (= :pending (:status st))
+                                   (assoc st :status status
+                                          (if (= status :success) :value :error) v)
+                                   st))))
+                      {:label label
+                       :kind  :job/complete
+                       :lane  :default}))]
 
      ;; Start task immediately (but its completion is always delivered through scheduler microtasks).
      (binding [*scheduler* sched]
        (try
          (let [cancel
                (task
-                 (fn [v]
-                   ;; strict: detect off-driver-thread callback (JVM only)
-                   #?(:clj
-                      (if (and (:strict? sched)
-                               (let [owner (:driver-thread @(:state sched))]
-                                 (and owner (not= owner (Thread/currentThread)))))
-                        (complete! :failure
-                                   (mt-ex off-scheduler-callback sched
+                (fn [v]
+                  ;; strict: detect off-driver-thread callback (JVM only)
+                  #?(:clj
+                     (if (and (:strict? sched)
+                              (let [owner (:driver-thread @(:state sched))]
+                                (and owner (not= owner (Thread/currentThread)))))
+                       (complete! :failure
+                                  (mt-ex off-scheduler-callback sched
                                          "Task success callback invoked off scheduler thread."
                                          {:label label}))
-                        (complete! :success v))
-                      :cljs
-                      (complete! :success v)))
-                 (fn [e]
-                   #?(:clj
-                      (if (and (:strict? sched)
-                               (let [owner (:driver-thread @(:state sched))]
-                                 (and owner (not= owner (Thread/currentThread)))))
-                        (complete! :failure
-                                   (mt-ex off-scheduler-callback sched
+                       (complete! :success v))
+                     :cljs
+                     (complete! :success v)))
+                (fn [e]
+                  #?(:clj
+                     (if (and (:strict? sched)
+                              (let [owner (:driver-thread @(:state sched))]
+                                (and owner (not= owner (Thread/currentThread)))))
+                       (complete! :failure
+                                  (mt-ex off-scheduler-callback sched
                                          "Task failure callback invoked off scheduler thread."
                                          {:label label
                                           :mt/original-error (pr-str e)}))
-                        (complete! :failure e))
-                      :cljs
-                      (complete! :failure e))))]
+                       (complete! :failure e))
+                     :cljs
+                     (complete! :failure e))))]
            (reset! cancel-cell (or cancel (fn [] nil))))
          (catch #?(:clj Throwable :cljs :default) e
            (complete! :failure e)
@@ -495,12 +495,12 @@
      (let [sched (require-scheduler!)
            done? (atom false)
            tok   (schedule-timer!
-                   sched (long ms)
-                   (fn []
-                     (when (compare-and-set! done? false true)
-                       (s x)))
-                   {:kind  :sleep
-                    :label "sleep"})]
+                  sched (long ms)
+                  (fn []
+                    (when (compare-and-set! done? false true)
+                      (s x)))
+                  {:kind  :sleep
+                   :label "sleep"})]
        (fn cancel
          []
          (when (compare-and-set! done? false true)
@@ -542,16 +542,16 @@
        (try
          (reset! cancel-child
                  (task
-                   (fn [v]
-                     ;; if child succeeds first, succeed
-                     (enqueue-microtask! sched (fn [] (finish! :success v))
-                                         {:kind :timeout/child-success
-                                          :label "timeout-child-success"}))
-                   (fn [e]
-                     ;; if child fails first, fail
-                     (enqueue-microtask! sched (fn [] (finish! :failure e))
-                                         {:kind :timeout/child-failure
-                                          :label "timeout-child-failure"}))))
+                  (fn [v]
+                    ;; if child succeeds first, succeed
+                    (enqueue-microtask! sched (fn [] (finish! :success v))
+                                        {:kind :timeout/child-success
+                                         :label "timeout-child-success"}))
+                  (fn [e]
+                    ;; if child fails first, fail
+                    (enqueue-microtask! sched (fn [] (finish! :failure e))
+                                        {:kind :timeout/child-failure
+                                         :label "timeout-child-failure"}))))
          (catch #?(:clj Throwable :cljs :default) e
            (finish! :failure e)
            (reset! cancel-child (fn [] nil))))
@@ -559,15 +559,15 @@
        ;; Start timer
        (reset! timer-token
                (schedule-timer!
-                 sched (long ms)
-                 (fn []
-                   (when (compare-and-set! done? false true)
-                     ;; timeout fired first -> cancel child and succeed with fallback
-                     (when-let [c @cancel-child]
-                       (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
-                     (s x)))
-                 {:kind  :timeout/timer
-                  :label "timeout-timer"}))
+                sched (long ms)
+                (fn []
+                  (when (compare-and-set! done? false true)
+                    ;; timeout fired first -> cancel child and succeed with fallback
+                    (when-let [c @cancel-child]
+                      (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
+                    (s x)))
+                {:kind  :timeout/timer
+                 :label "timeout-timer"}))
 
        ;; cancellation thunk
        (fn cancel []
@@ -640,11 +640,11 @@
   ([^TestScheduler sched task opts]
    #?(:clj  (run* sched task opts)
       :cljs (js/Promise.
-              (fn [resolve reject]
-                (try
-                  (resolve (run* sched task opts))
-                  (catch :default e
-                    (reject e)))))))
+             (fn [resolve reject]
+               (try
+                 (resolve (run* sched task opts))
+                 (catch :default e
+                   (reject e))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Deterministic executors (JVM-only)
@@ -657,12 +657,12 @@
      (reify Executor
        (execute [_ runnable]
          (enqueue-microtask!
-           sched
-           (fn []
-             (.run ^Runnable runnable))
-           {:kind :executor
-            :lane :default
-            :label "executor"})))))
+          sched
+          (fn []
+            (.run ^Runnable runnable))
+          {:kind :executor
+           :lane :default
+           :label "executor"})))))
 
 #?(:cljs
    (defn executor [_]
@@ -674,12 +674,12 @@
      (reify Executor
        (execute [_ runnable]
          (enqueue-microtask!
-           sched
-           (fn []
-             (.run ^Runnable runnable))
-           {:kind :executor
-            :lane :cpu
-            :label "cpu-executor"})))))
+          sched
+          (fn []
+            (.run ^Runnable runnable))
+          {:kind :executor
+           :lane :cpu
+           :label "cpu-executor"})))))
 
 #?(:cljs
    (defn cpu-executor [_]
@@ -690,12 +690,12 @@
      (reify Executor
        (execute [_ runnable]
          (enqueue-microtask!
-           sched
-           (fn []
-             (.run ^Runnable runnable))
-           {:kind :executor
-            :lane :blk
-            :label "blk-executor"})))))
+          sched
+          (fn []
+            (.run ^Runnable runnable))
+          {:kind :executor
+           :lane :blk
+           :label "blk-executor"})))))
 
 #?(:cljs
    (defn blk-executor [_]
@@ -726,11 +726,11 @@
        `(let [~sched-sym ~sched-expr]
           (binding [*scheduler* ~sched-sym]
             (with-redefs
-              [missionary.core/sleep   sleep
-               missionary.core/timeout timeout
-               ~@(when-not cljs?
-                   `[missionary.core/cpu (cpu-executor ~sched-sym)
-                     missionary.core/blk (blk-executor ~sched-sym)])]
+             [missionary.core/sleep   sleep
+              missionary.core/timeout timeout
+              ~@(when-not cljs?
+                  `[missionary.core/cpu (cpu-executor ~sched-sym)
+                    missionary.core/blk (blk-executor ~sched-sym)])]
               ~@body))))))
 
 ;; -----------------------------------------------------------------------------
@@ -757,16 +757,16 @@
                              (on-scheduler-context? sched))
                       (thunk)
                       (enqueue-microtask!
-                        sched
-                        (fn [] (thunk))
-                        {:kind  kind
-                         :label label
-                         :lane  :default}))))]
+                       sched
+                       (fn [] (thunk))
+                       {:kind  kind
+                        :label label
+                        :lane  :default}))))]
        (flow (wrap n :flow/notifier)
              (wrap t :flow/terminator))))))
 
 (defrecord FlowProcess
-  [^TestScheduler sched label state process]
+           [^TestScheduler sched label state process]
   ICancellable
   (-cancel! [_]
     (ensure-driver-thread! sched "flow cancel!")
@@ -989,7 +989,7 @@
             (binding [*scheduler* sched
                       *in-scheduler* true]
               (swap! st assoc :cancelled? true :closed? true :failed (cancelled-ex)
-                        :pending nil :queue [] :ready? false)
+                     :pending nil :queue [] :ready? false)
               ;; wake consumer to observe cancellation via transfer error
               (signal-ready!)
               nil))))
@@ -1000,38 +1000,38 @@
           (let [done? (atom false)
                 entry {:v v :s s :f f :done? done?}]
             (enqueue-microtask!
-              sched
-              (fn []
-                (let [{:keys [terminated? closed? failed]} @st]
-                  (cond
-                    terminated?
-                    (f (mt-ex illegal-transfer sched "emit on terminated subject." {:label label}))
+             sched
+             (fn []
+               (let [{:keys [terminated? closed? failed]} @st]
+                 (cond
+                   terminated?
+                   (f (mt-ex illegal-transfer sched "emit on terminated subject." {:label label}))
 
-                    failed
-                    (f failed)
+                   failed
+                   (f failed)
 
-                    closed?
-                    (f (mt-ex illegal-transfer sched "emit on closed subject." {:label label}))
+                   closed?
+                   (f (mt-ex illegal-transfer sched "emit on closed subject." {:label label}))
 
-                    :else
-                    (do
-                      (swap! st
-                             (fn [st0]
-                               (cond
-                                 (nil? (:pending st0))
-                                 (assoc st0 :pending entry)
+                   :else
+                   (do
+                     (swap! st
+                            (fn [st0]
+                              (cond
+                                (nil? (:pending st0))
+                                (assoc st0 :pending entry)
 
-                                 :else
-                                 (update st0 :queue conj entry))))
-                      (signal-ready!)))))
-              {:kind :subject/emit
-               :label label})
+                                :else
+                                (update st0 :queue conj entry))))
+                     (signal-ready!)))))
+             {:kind :subject/emit
+              :label label})
             (fn cancel []
               (when (compare-and-set! done? false true)
                 (enqueue-microtask! sched (fn [] (f (cancelled-ex)))
                                     {:kind :subject/emit-cancel
                                      :label label}))
-              nil)))))
+              nil))))
 
       :offer
       (fn [v]
@@ -1054,34 +1054,34 @@
       (fn []
         (fn [s f]
           (enqueue-microtask!
-            sched
-            (fn []
-              (swap! st assoc :closed? true)
-              (signal-terminate!)
-              (s nil))
-            {:kind :subject/close
-             :label label})
+           sched
+           (fn []
+             (swap! st assoc :closed? true)
+             (signal-terminate!)
+             (s nil))
+           {:kind :subject/close
+            :label label})
           (fn cancel []
             (enqueue-microtask! sched (fn [] (f (cancelled-ex)))
                                 {:kind :subject/close-cancel
                                  :label label})
-            nil))))
+            nil)))
 
       :fail
       (fn [ex]
         (fn [s f]
           (enqueue-microtask!
-            sched
-            (fn []
-              (apply-failure! ex)
-              (s nil))
-            {:kind :subject/fail
-             :label label})
+           sched
+           (fn []
+             (apply-failure! ex)
+             (s nil))
+           {:kind :subject/fail
+            :label label})
           (fn cancel []
             (enqueue-microtask! sched (fn [] (f (cancelled-ex)))
                                 {:kind :subject/fail-cancel
                                  :label label})
-            nil))))})))
+            nil)))})))
 
 (defn state
   "Create a controlled continuous signal similar to watch, but deterministic.
@@ -1124,7 +1124,7 @@
                (when-let [n (:n @st)]
                  (enqueue-microtask! sched (fn [] (n))
                                      {:kind :state/notifier
-                                      :label label}))))))
+                                      :label label})))))
 
          signal-terminate!
          (fn []
@@ -1140,7 +1140,7 @@
                (when-let [t (:t @st)]
                  (enqueue-microtask! sched (fn [] (t))
                                      {:kind :state/terminator
-                                      :label label}))))))]
+                                      :label label})))))]
 
      {:flow
       (fn [n t]
