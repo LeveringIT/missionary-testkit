@@ -25,6 +25,8 @@ TestScheduler (record)
 ├── strict?            - boolean (thread safety checks)
 ├── trace?             - boolean
 └── schedule           - nil | vector of selection decisions
+                         Basic: :fifo, :lifo, :random
+                         Targeted: [:nth n], [:by-label l], [:by-id id]
 ```
 
 ### Execution Model

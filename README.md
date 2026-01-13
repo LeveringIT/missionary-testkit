@@ -86,7 +86,7 @@ The scheduler manages virtual time and a queue of pending tasks:
                                 :trace?     true   ; enable execution trace
                                 :strict?    false  ; thread safety checks
                                 :policy     :fifo  ; task ordering
-                                :schedule   nil})) ; interleaving schedule (vector of :fifo/:lifo/:random)
+                                :schedule   nil})) ; interleaving schedule (see Schedule Decisions)
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
 (mt/pending sched)  ; => {:microtasks [...] :timers [...]}
@@ -278,15 +278,27 @@ See how many distinct outcomes a concurrent task can produce:
 ### Schedule Decisions
 
 Schedules control task selection when the queue has multiple ready tasks:
+
+**Basic decisions:**
 - `:fifo` - first in, first out (default)
 - `:lifo` - last in, first out
 - `:random` - random selection (deterministic via seed)
+
+**Targeted decisions:**
+- `[:nth n]` - select nth task (wraps if n >= queue size)
+- `[:by-label label]` - select first task with matching label
+- `[:by-id id]` - select task with specific ID
+
+All targeted decisions fall back to the first task if no match is found.
 
 ```clojure
 ;; Create scheduler with explicit schedule
 (mt/make-scheduler {:schedule [:lifo :fifo :lifo :fifo]})
 
-;; Generate schedule from seed
+;; Mix basic and targeted decisions
+(mt/make-scheduler {:schedule [:fifo [:nth 2] :lifo [:by-label "producer"]]})
+
+;; Generate schedule from seed (basic decisions only)
 (mt/seed->schedule 42 10) ; => [:lifo :fifo :random ...]
 ```
 
