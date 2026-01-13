@@ -1,0 +1,1 @@
+{:start-nrepl-cmd ["clojure" "-M:nrepl"]}

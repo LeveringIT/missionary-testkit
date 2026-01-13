@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "clojure-mcp": {
+      "type": "stdio",
+      "command": "clojure",
+      "args": ["-Tmcp", "start", ":config-profile", ":cli-assist"]
+    }
+  }
+}
