@@ -18,11 +18,13 @@ TestScheduler (record)
 │   ├── :micro-q       - PersistentQueue of pending microtasks
 │   ├── :timers        - sorted-map [at-ms tie order id] -> timer-map
 │   ├── :trace         - nil | vector of trace events
-│   └── :driver-thread - JVM: Thread | nil, CLJS: ::na
+│   ├── :driver-thread - JVM: Thread | nil, CLJS: ::na
+│   └── :schedule-idx  - current position in schedule (for interleaving)
 ├── policy             - :fifo | :seeded
 ├── seed               - long (for :seeded policy)
 ├── strict?            - boolean (thread safety checks)
-└── trace?             - boolean
+├── trace?             - boolean
+└── schedule           - nil | vector of selection decisions
 ```
 
 ### Execution Model
@@ -100,6 +102,18 @@ Task completes  → result delivered via microtask (deterministic ordering)
 - `(executor sched)` → java.util.concurrent.Executor (JVM only)
 - `(cpu-executor sched)` → Executor (JVM only)
 - `(blk-executor sched)` → Executor (JVM only)
+
+### Interleaving (Concurrency Bug Testing)
+- `(trace->schedule trace)` → vector of selection decisions from trace
+- `(replay-schedule task schedule)` / `(replay-schedule task schedule opts)` → runs task with exact schedule
+- `(seed->schedule seed n)` → deterministically generates schedule of length n
+- `(check-interleaving task-fn opts)` → runs task-fn with many interleavings, returns nil or failure info
+- `(explore-interleavings task-fn opts)` → explores interleavings, returns {:unique-results n :results [...]}
+- `(selection-gen)` → test.check generator for single selection decision
+- `(schedule-gen max-decisions)` → test.check generator for schedule vector
+
+Note: `check-interleaving` and `explore-interleavings` take a task-fn (0-arg function returning a task)
+to ensure fresh state for each iteration.
 
 ## Dynamic Vars
 
@@ -201,9 +215,10 @@ clojure -T:build deploy
 
 ### Scheduler Invariants
 1. Time never decreases: `advance-to!` throws if `t < now-ms`
-2. Microtasks execute in FIFO order within same virtual time
+2. Microtasks execute in FIFO order within same virtual time (unless schedule overrides)
 3. Timers promote to microtask queue in sorted order when due
 4. All task completions route through microtask queue (deterministic ordering)
+5. With `:schedule`, selection decisions override FIFO when queue has >1 item
 
 ### run Defaults
 - `auto-advance? true` - automatically advances to next timer
@@ -230,7 +245,7 @@ clojure -T:build deploy
 
 ## Test Coverage
 
-19 tests, 91 assertions covering:
+26 tests, 125 assertions covering:
 - Scheduler creation and time control
 - Sleep and timeout behavior
 - Job lifecycle
@@ -241,6 +256,7 @@ clojure -T:build deploy
 - run budgets and deadlock detection
 - Executor operations
 - Error handling
+- Interleaving (schedule selection, trace extraction, replay, check/explore)
 
 ## File Structure
 

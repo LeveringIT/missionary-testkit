@@ -19,6 +19,7 @@ missionary-testkit provides a **virtual time scheduler** that makes async tests:
 - **Deterministic**: Same inputs always produce same outputs
 - **Debuggable**: Full execution trace with timestamps
 - **Controllable**: Step through async execution one microtask at a time
+- **Thorough**: Explore different task interleavings to find concurrency bugs
 
 ## Quickstart
 
@@ -84,7 +85,8 @@ The scheduler manages virtual time and a queue of pending tasks:
 (def sched (mt/make-scheduler {:initial-ms 0      ; starting time
                                 :trace?     true   ; enable execution trace
                                 :strict?    false  ; thread safety checks
-                                :policy     :fifo})) ; task ordering
+                                :policy     :fifo  ; task ordering
+                                :schedule   nil})) ; interleaving schedule (vector of :fifo/:lifo/:random)
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
 (mt/pending sched)  ; => {:microtasks [...] :timers [...]}
@@ -224,6 +226,70 @@ Enable tracing to see exactly what happened:
 ;;     ...]
 ```
 
+## Concurrency Bug Testing
+
+missionary-testkit can explore different task interleavings to find race conditions and concurrency bugs.
+
+### Finding Bugs with check-interleaving
+
+```clojure
+(mt/with-determinism [_ (mt/make-scheduler)]
+  (let [;; A task factory - returns fresh task with fresh state each iteration
+        make-task (fn []
+                    (let [shared (atom 0)]
+                      (m/sp
+                       (m/? (m/join (fn [& _] @shared)
+                                   (m/sp (swap! shared + 10))
+                                   (m/sp (swap! shared * 2)))))))
+
+        ;; Check if any interleaving produces unexpected results
+        result (mt/check-interleaving make-task
+                 {:num-tests 100
+                  :seed 42
+                  :property (fn [v] (#{20 12} v))})]  ; only valid results
+
+    (when result
+      (println "Bug found!")
+      (println "Seed:" (:seed result))
+      (println "Schedule:" (:schedule result)))))
+```
+
+### Replaying a Failing Schedule
+
+When `check-interleaving` finds a bug, you can replay the exact schedule:
+
+```clojure
+;; Replay the failing case
+(mt/with-determinism [_ (mt/make-scheduler)]
+  (mt/replay-schedule failing-task (:schedule result)))
+```
+
+### Exploring All Outcomes
+
+See how many distinct outcomes a concurrent task can produce:
+
+```clojure
+(mt/with-determinism [_ (mt/make-scheduler)]
+  (let [make-task (fn [] ...)  ; task factory
+        result (mt/explore-interleavings make-task {:num-samples 50 :seed 42})]
+    (println "Unique results:" (:unique-results result))))
+```
+
+### Schedule Decisions
+
+Schedules control task selection when the queue has multiple ready tasks:
+- `:fifo` - first in, first out (default)
+- `:lifo` - last in, first out
+- `:random` - random selection (deterministic via seed)
+
+```clojure
+;; Create scheduler with explicit schedule
+(mt/make-scheduler {:schedule [:lifo :fifo :lifo :fifo]})
+
+;; Generate schedule from seed
+(mt/seed->schedule 42 10) ; => [:lifo :fifo :random ...]
+```
+
 ## Error Detection
 
 The scheduler automatically detects common problems:
@@ -297,6 +363,14 @@ The scheduler automatically detects common problems:
 ### Integration Macro
 - `(with-determinism [sched expr] & body)` - rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`
 
+### Interleaving (Concurrency Testing)
+- `(check-interleaving task-fn opts)` - find failures across many interleavings (task-fn is a 0-arg function)
+- `(explore-interleavings task-fn opts)` - explore unique outcomes (task-fn is a 0-arg function)
+- `(replay-schedule task schedule)` - replay exact execution order
+- `(trace->schedule trace)` - extract schedule from trace
+- `(seed->schedule seed n)` - generate schedule from seed
+- `(selection-gen)` / `(schedule-gen n)` - test.check generators
+
 ## Running Tests
 
 ```bash
@@ -306,6 +380,6 @@ clojure -X:test cognitect.test-runner.api/test
 
 ## License
 
-Copyright 2026 Hendrik
+Copyright 2026 Levering IT GmbH
 
 Distributed under the Eclipse Public License version 1.0.

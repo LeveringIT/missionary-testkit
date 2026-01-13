@@ -47,26 +47,25 @@
    (or *scheduler*
        (throw (ex-info msg {:mt/kind ::no-scheduler})))))
 
-
 ;; -----------------------------------------------------------------------------
 ;; Cross-platform queue helpers
 ;; -----------------------------------------------------------------------------
 
 (def ^:private empty-queue
-  #?(:clj  clojure.lang.PersistentQueue/EMPTY
+  #?(:clj clojure.lang.PersistentQueue/EMPTY
      :cljs cljs.core/PersistentQueue.EMPTY))
 
 (defn- q-empty? [q] (empty? q))
-(defn- q-peek  [q] (peek q))
-(defn- q-pop   [q] (pop q))
-(defn- q-conj  [q x] (conj q x))
+(defn- q-peek [q] (peek q))
+(defn- q-pop [q] (pop q))
+(defn- q-conj [q x] (conj q x))
 
 ;; -----------------------------------------------------------------------------
 ;; Scheduler
 ;; -----------------------------------------------------------------------------
 
 (defrecord TestScheduler
-           [state policy seed strict? trace?])
+           [state policy seed strict? trace? schedule])
 
 (defn- maybe-trace-state
   "If tracing enabled (state has non-nil :trace vector), append event."
@@ -83,26 +82,30 @@
    :policy     :fifo | :seeded
    :seed       42
    :strict?    true|false
-   :trace?     true|false}"
+   :trace?     true|false
+   :schedule   nil | vector of selection decisions for interleaving}"
   ([]
    (make-scheduler {}))
-  ([{:keys [initial-ms policy seed strict? trace?]
-     :or   {initial-ms 0
-            policy     :fifo
-            seed       0
-            strict?    false
-            trace?     false}}]
+  ([{:keys [initial-ms policy seed strict? trace? schedule]
+     :or {initial-ms 0
+          policy :fifo
+          seed 0
+          strict? false
+          trace? false
+          schedule nil}}]
    (->TestScheduler
-    (atom {:now-ms        (long initial-ms)
-           :next-id       0
-           :micro-q       empty-queue
+    (atom {:now-ms (long initial-ms)
+           :next-id 0
+           :micro-q empty-queue
            ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
-           :timers        (sorted-map)
+           :timers (sorted-map)
            ;; trace is either nil or vector
-           :trace         (when trace? [])
+           :trace (when trace? [])
            ;; JVM-only "driver thread" captured lazily under strict mode
-           :driver-thread #?(:clj nil :cljs ::na)})
-    policy (long seed) (boolean strict?) (boolean trace?))))
+           :driver-thread #?(:clj nil :cljs ::na)
+           ;; interleaving: schedule index (consumed as used)
+           :schedule-idx 0})
+    policy (long seed) (boolean strict?) (boolean trace?) schedule)))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -128,10 +131,10 @@
 (defn- diag
   ([sched] (diag sched nil))
   ([^TestScheduler sched label]
-   (cond-> {:mt/now-ms  (now-ms sched)
+   (cond-> {:mt/now-ms (now-ms sched)
             :mt/pending (pending sched)}
      (:trace? sched) (assoc :mt/trace (trace sched))
-     (some? label)   (assoc :mt/label label))))
+     (some? label) (assoc :mt/label label))))
 
 (defn- mt-ex
   ([kind sched msg]
@@ -142,7 +145,7 @@
    (let [data (merge {:mt/kind kind}
                      (diag sched (:label extra))
                      (dissoc extra :label))]
-     #?(:clj  (if (some? cause) (ex-info msg data cause) (ex-info msg data))
+     #?(:clj (if (some? cause) (ex-info msg data cause) (ex-info msg data))
         :cljs (ex-info msg data)))))
 
 (defn- seeded-tie
@@ -187,26 +190,26 @@
 (defn- enqueue-microtask!
   ([^TestScheduler sched f] (enqueue-microtask! sched f {}))
   ([^TestScheduler sched f {:keys [label kind lane]
-                            :or   {kind :microtask
-                                   lane :default}}]
+                            :or {kind :microtask
+                                 lane :default}}]
    (let [id (next-id! sched)]
      (swap! (:state sched)
             (fn [s]
               (let [now (:now-ms s)
-                    mt  {:id     id
-                         :kind   kind
-                         :label  label
-                         :lane   lane
-                         :enq-ms now
-                         :from   :micro
-                         :f      f}]
+                    mt {:id id
+                        :kind kind
+                        :label label
+                        :lane lane
+                        :enq-ms now
+                        :from :micro
+                        :f f}]
                 (-> s
                     (update :micro-q q-conj mt)
-                    (maybe-trace-state {:event  :enqueue-microtask
-                                        :id     id
-                                        :kind   kind
-                                        :label  label
-                                        :lane   lane
+                    (maybe-trace-state {:event :enqueue-microtask
+                                        :id id
+                                        :kind kind
+                                        :label label
+                                        :lane lane
                                         :now-ms now})))))
      id)))
 
@@ -214,36 +217,36 @@
   "Schedule f to run at now+delay-ms as a timer; returns a cancellation token."
   ([^TestScheduler sched delay-ms f] (schedule-timer! sched delay-ms f {}))
   ([^TestScheduler sched delay-ms f {:keys [label kind lane]
-                                     :or   {kind :timer
-                                            lane :default}}]
+                                     :or {kind :timer
+                                          lane :default}}]
    (let [id (next-id! sched)
          token (atom nil)]
      (swap! (:state sched)
             (fn [s]
-              (let [now   (:now-ms s)
+              (let [now (:now-ms s)
                     at-ms (+ now (long delay-ms))
                     order id
-                    tie   (case (:policy sched)
-                            :seeded (seeded-tie (:seed sched) order)
+                    tie (case (:policy sched)
+                          :seeded (seeded-tie (:seed sched) order)
                             ;; default/fallback
-                            order)
-                    k     [at-ms tie order id]
-                    t     {:id    id
-                           :kind  kind
-                           :label label
-                           :lane  lane
-                           :at-ms at-ms
-                           :key   k
-                           :f     f}]
+                          order)
+                    k [at-ms tie order id]
+                    t {:id id
+                       :kind kind
+                       :label label
+                       :lane lane
+                       :at-ms at-ms
+                       :key k
+                       :f f}]
                 (reset! token k)
                 (-> s
                     (update :timers assoc k t)
-                    (maybe-trace-state {:event  :enqueue-timer
-                                        :id     id
-                                        :at-ms  at-ms
-                                        :kind   kind
-                                        :label  label
-                                        :lane   lane
+                    (maybe-trace-state {:event :enqueue-timer
+                                        :id id
+                                        :at-ms at-ms
+                                        :kind kind
+                                        :label label
+                                        :lane lane
                                         :now-ms now})))))
      @token)))
 
@@ -255,21 +258,99 @@
              (if-let [t (get-in s [:timers timer-token])]
                (-> s
                    (update :timers dissoc timer-token)
-                   (maybe-trace-state {:event  :cancel-timer
-                                       :id     (:id t)
-                                       :at-ms  (:at-ms t)
-                                       :label  (:label t)
+                   (maybe-trace-state {:event :cancel-timer
+                                       :id (:id t)
+                                       :at-ms (:at-ms t)
+                                       :label (:label t)
                                        :now-ms (:now-ms s)}))
                s))))
   nil)
+
+;; -----------------------------------------------------------------------------
+;; Queue selection for interleaving
+;; -----------------------------------------------------------------------------
+
+(defn- q->vec
+  "Convert queue to vector for indexed access."
+  [q]
+  (vec (seq q)))
+
+(defn- vec->q
+  "Convert vector back to queue."
+  [v]
+  (reduce q-conj empty-queue v))
+
+(defn- remove-nth
+  "Remove item at index n from vector."
+  [v n]
+  (into (subvec v 0 n) (subvec v (inc n))))
+
+(defn- select-from-queue
+  "Select an item from the queue based on the decision.
+  Returns [selected-item remaining-queue] or nil if queue is empty.
+
+  Decisions:
+  - :fifo - first in, first out (default)
+  - :lifo - last in, first out
+  - :random - random selection (uses seed for determinism)
+  - [:nth n] - select nth item (wraps if n >= queue size)
+  - [:by-label label] - select first item with matching label
+  - [:by-id id] - select item with matching id"
+  [q decision seed]
+  (when-not (q-empty? q)
+    (let [v (q->vec q)
+          n (count v)]
+      (case decision
+        :fifo
+        [(first v) (vec->q (subvec v 1))]
+
+        :lifo
+        [(peek v) (vec->q (pop v))]
+
+        :random
+        (let [idx (mod (Math/abs (hash [seed (first v)])) n)]
+          [(nth v idx) (vec->q (remove-nth v idx))])
+
+        ;; default: check for vector decisions
+        (cond
+          (and (vector? decision) (= :nth (first decision)))
+          (let [idx (mod (second decision) n)]
+            [(nth v idx) (vec->q (remove-nth v idx))])
+
+          (and (vector? decision) (= :by-label (first decision)))
+          (let [label (second decision)
+                idx (or (first (keep-indexed (fn [i item] (when (= label (:label item)) i)) v))
+                        0)]
+            [(nth v idx) (vec->q (remove-nth v idx))])
+
+          (and (vector? decision) (= :by-id (first decision)))
+          (let [target-id (second decision)
+                idx (or (first (keep-indexed (fn [i item] (when (= target-id (:id item)) i)) v))
+                        0)]
+            [(nth v idx) (vec->q (remove-nth v idx))])
+
+          ;; fallback to FIFO
+          :else
+          [(first v) (vec->q (subvec v 1))])))))
+
+(defn- get-schedule-decision
+  "Get the current schedule decision and advance the index.
+  Returns [decision new-state]."
+  [^TestScheduler sched s]
+  (if-let [schedule (:schedule sched)]
+    (let [idx (:schedule-idx s)]
+      (if (< idx (count schedule))
+        [(nth schedule idx) (update s :schedule-idx inc)]
+        [:fifo s])) ; default to FIFO when schedule exhausted
+    [:fifo s]))
 
 (defn- promote-due-timers-in-state
   "Move all timers with at-ms <= now-ms into the microtask queue, in timer order."
   [^TestScheduler sched s]
   (let [now (:now-ms s)]
     (loop [timers (:timers s)
-           micro  (:micro-q s)
-           ids    []]
+           micro (:micro-q s)
+           ids []]
       (if-let [[k t] (first timers)]
         (if (<= (:at-ms t) now)
           (recur (dissoc timers k)
@@ -277,15 +358,15 @@
                  (conj ids (:id t)))
           (cond-> (assoc s :timers timers :micro-q micro)
             (seq ids)
-            (maybe-trace-state {:event  :promote-timers
-                                :ids    ids
-                                :count  (count ids)
+            (maybe-trace-state {:event :promote-timers
+                                :ids ids
+                                :count (count ids)
                                 :now-ms now})))
         (cond-> (assoc s :timers timers :micro-q micro)
           (seq ids)
-          (maybe-trace-state {:event  :promote-timers
-                              :ids    ids
-                              :count  (count ids)
+          (maybe-trace-state {:event :promote-timers
+                              :ids ids
+                              :count (count ids)
                               :now-ms now}))))))
 
 (defn- next-timer-time
@@ -303,16 +384,30 @@
             q (:micro-q s)]
         (if (q-empty? q)
           idle
-          (let [mt (q-peek q)
-                q' (q-pop q)
-                now (:now-ms s)
-                s' (-> s
+          ;; Get schedule decision and select from queue
+          (let [[decision s-with-idx] (get-schedule-decision sched s)
+                q-size (count (q->vec q))
+                ;; Only use schedule-based selection when queue has multiple items
+                [mt q'] (if (> q-size 1)
+                          (select-from-queue q decision (:seed sched))
+                          [(q-peek q) (q-pop q)])
+                now (:now-ms s-with-idx)
+                ;; Build trace event with selection info when queue had choices
+                select-trace (when (> q-size 1)
+                               {:event :select-task
+                                :decision decision
+                                :queue-size q-size
+                                :selected-id (:id mt)
+                                :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec q)))
+                                :now-ms now})
+                s' (-> s-with-idx
                        (assoc :micro-q q')
-                       (maybe-trace-state {:event  :run-microtask
-                                           :id     (:id mt)
-                                           :kind   (:kind mt)
-                                           :label  (:label mt)
-                                           :lane   (:lane mt)
+                       (cond-> select-trace (maybe-trace-state select-trace))
+                       (maybe-trace-state {:event :run-microtask
+                                           :id (:id mt)
+                                           :kind (:kind mt)
+                                           :label (:label mt)
+                                           :lane (:lane mt)
                                            :now-ms now}))]
             (if (compare-and-set! state-atom s s')
               (do
@@ -365,7 +460,6 @@
                     {:label "advance!"})))
     (advance-to! sched (+ (now-ms sched) dt))))
 
-
 ;; -----------------------------------------------------------------------------
 ;; Jobs (task driving)
 ;; -----------------------------------------------------------------------------
@@ -394,8 +488,8 @@
    (start! sched task {}))
   ([^TestScheduler sched task {:keys [label] :as _opts}]
    (ensure-driver-thread! sched "start!")
-   (let [id          (next-id! sched)
-         job-state   (atom {:status :pending})
+   (let [id (next-id! sched)
+         job-state (atom {:status :pending})
          cancel-cell (atom nil)
 
          ;; Complete job via scheduler microtask, so completions become part of deterministic order.
@@ -410,8 +504,8 @@
                                           (if (= status :success) :value :error) v)
                                    st))))
                       {:label label
-                       :kind  :job/complete
-                       :lane  :default}))]
+                       :kind :job/complete
+                       :lane :default}))]
 
      ;; Start task immediately (but its completion is always delivered through scheduler microtasks).
      (binding [*scheduler* sched]
@@ -477,7 +571,7 @@
 ;; -----------------------------------------------------------------------------
 
 (defn- cancelled-ex []
-  #?(:clj  (Cancelled.)
+  #?(:clj (Cancelled.)
      :cljs (Cancelled.)))
 
 (defn sleep
@@ -494,13 +588,13 @@
    (fn [s f]
      (let [sched (require-scheduler!)
            done? (atom false)
-           tok   (schedule-timer!
-                  sched (long ms)
-                  (fn []
-                    (when (compare-and-set! done? false true)
-                      (s x)))
-                  {:kind  :sleep
-                   :label "sleep"})]
+           tok (schedule-timer!
+                sched (long ms)
+                (fn []
+                  (when (compare-and-set! done? false true)
+                    (s x)))
+                {:kind :sleep
+                 :label "sleep"})]
        (fn cancel
          []
          (when (compare-and-set! done? false true)
@@ -566,7 +660,7 @@
                     (when-let [c @cancel-child]
                       (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
                     (s x)))
-                {:kind  :timeout/timer
+                {:kind :timeout/timer
                  :label "timeout-timer"}))
 
        ;; cancellation thunk
@@ -586,12 +680,12 @@
 
 (defn- run*
   [^TestScheduler sched task {:keys [auto-advance? max-steps max-time-ms label]
-                              :or   {auto-advance? true
-                                     max-steps     100000
-                                     max-time-ms   60000}}]
+                              :or {auto-advance? true
+                                   max-steps 100000
+                                   max-time-ms 60000}}]
   (ensure-driver-thread! sched "run")
   (let [start-time (now-ms sched)
-        job        (start! sched task {:label label})]
+        job (start! sched task {:label label})]
     (loop [steps 0]
       (let [steps (+ steps (tick! sched))
             elapsed (- (now-ms sched) start-time)]
@@ -638,7 +732,7 @@
   ([^TestScheduler sched task]
    (run sched task {}))
   ([^TestScheduler sched task opts]
-   #?(:clj  (run* sched task opts)
+   #?(:clj (run* sched task opts)
       :cljs (js/Promise.
              (fn [resolve reject]
                (try
@@ -726,7 +820,7 @@
        `(let [~sched-sym ~sched-expr]
           (binding [*scheduler* ~sched-sym]
             (with-redefs
-             [missionary.core/sleep   sleep
+             [missionary.core/sleep sleep
               missionary.core/timeout timeout
               ~@(when-not cljs?
                   `[missionary.core/cpu (cpu-executor ~sched-sym)
@@ -749,7 +843,7 @@
   ([^TestScheduler sched flow]
    (scheduled-flow sched flow {}))
   ([^TestScheduler sched flow {:keys [mode label]
-                               :or   {mode :async}}]
+                               :or {mode :async}}]
    (fn [n t]
      (let [wrap (fn [thunk kind]
                   (fn []
@@ -759,9 +853,9 @@
                       (enqueue-microtask!
                        sched
                        (fn [] (thunk))
-                       {:kind  kind
+                       {:kind kind
                         :label label
-                        :lane  :default}))))]
+                        :lane :default}))))]
        (flow (wrap n :flow/notifier)
              (wrap t :flow/terminator))))))
 
@@ -791,9 +885,9 @@
    (spawn-flow! sched flow {}))
   ([^TestScheduler sched flow {:keys [label] :as _opts}]
    (ensure-driver-thread! sched "spawn-flow!")
-   (let [st (atom {:ready?      false
+   (let [st (atom {:ready? false
                    :terminated? false
-                   :cancelled?  false})
+                   :cancelled? false})
          ;; internal n/t mutate flags only; flow is wrapped to marshal signals via scheduler
          n* (fn [] (swap! st assoc :ready? true))
          t* (fn [] (swap! st assoc :terminated? true :ready? false))
@@ -848,14 +942,14 @@
   - `offer` only succeeds when there is no backlog (pending/queued/failed/closed)."
   ([^TestScheduler sched] (subject sched {}))
   ([^TestScheduler sched {:keys [label] :as _opts}]
-   (let [st (atom {:n          nil
-                   :t          nil
-                   :ready?     false
+   (let [st (atom {:n nil
+                   :t nil
+                   :ready? false
                    :terminated? false
-                   :closed?    false
-                   :failed     nil         ;; ex to throw on transfer
-                   :pending    nil         ;; {:v ... :done? atom :s s :f f}
-                   :queue      []          ;; vector of entries
+                   :closed? false
+                   :failed nil ;; ex to throw on transfer
+                   :pending nil ;; {:v ... :done? atom :s s :f f}
+                   :queue [] ;; vector of entries
                    :cancelled? false})
 
          ;; helper: schedule notifier if transfer available and not already ready
@@ -1098,14 +1192,14 @@
   - does not block; readiness is always marshaled through scheduler microtasks"
   ([^TestScheduler sched] (state sched {}))
   ([^TestScheduler sched {:keys [initial label] :as _opts}]
-   (let [st (atom {:n          nil
-                   :t          nil
-                   :ready?     false
+   (let [st (atom {:n nil
+                   :t nil
+                   :ready? false
                    :terminated? false
-                   :closed?    false
-                   :failed     nil
+                   :closed? false
+                   :failed nil
                    :cancelled? false
-                   :value      initial})
+                   :value initial})
 
          signal-ready!
          (fn []
@@ -1164,8 +1258,8 @@
                 (swap! st assoc :ready? false)
                 (cond
                   cancelled? (throw (cancelled-ex))
-                  failed     (throw failed)
-                  :else      value))))
+                  failed (throw failed)
+                  :else value))))
           #?(:clj clojure.lang.IFn :cljs cljs.core/IFn)
           (#?(:clj invoke :cljs -invoke) [_]
             ;; cancel/dispose => fail with Cancelled and wake consumer
@@ -1207,6 +1301,180 @@
         nil)})))
 
 ;; -----------------------------------------------------------------------------
+;; Interleaving: trace extraction and replay
+;; -----------------------------------------------------------------------------
+
+(defn trace->schedule
+  "Extract the sequence of selection decisions from a trace.
+  Returns a vector of decisions that can be used to replay the same execution order."
+  [trace]
+  (->> trace
+       (filter #(= :select-task (:event %)))
+       (mapv :decision)))
+
+(defn replay-schedule
+  "Run a task with the exact schedule from a previous trace.
+  Returns the task result.
+
+  Usage:
+    (def original-trace (mt/trace sched))
+    (mt/replay-schedule task (mt/trace->schedule original-trace))"
+  ([task schedule]
+   (replay-schedule task schedule {}))
+  ([task schedule {:keys [trace? max-steps max-time-ms]
+                   :or {trace? true
+                        max-steps 100000
+                        max-time-ms 60000}}]
+   (let [sched (make-scheduler {:schedule schedule :trace? trace?})]
+     (binding [*scheduler* sched]
+       (run sched task {:max-steps max-steps
+                        :max-time-ms max-time-ms})))))
+
+(defn seed->schedule
+  "Deterministically generate a schedule from a seed.
+  Creates a schedule of the given length with random FIFO/LIFO/random decisions."
+  [seed num-decisions]
+  #?(:clj
+     (let [rng (java.util.Random. seed)]
+       (vec (repeatedly num-decisions
+                        #(case (.nextInt rng 3)
+                           0 :fifo
+                           1 :lifo
+                           2 :random))))
+     :cljs
+     (let [;; Simple LCG for CLJS
+           lcg (fn [s] (mod (+ (* 1103515245 s) 12345) 2147483648))]
+       (loop [s seed
+              result []
+              i 0]
+         (if (>= i num-decisions)
+           result
+           (let [next-s (lcg s)
+                 decision (case (mod next-s 3)
+                            0 :fifo
+                            1 :lifo
+                            2 :random)]
+             (recur next-s (conj result decision) (inc i))))))))
+
+;; -----------------------------------------------------------------------------
+;; Interleaving: test helpers
+;; -----------------------------------------------------------------------------
+
+(defn check-interleaving
+  "Run a task with many different interleavings to find failures.
+  Returns nil if all pass, or a map with failure info including the schedule
+  that caused the failure.
+
+  task-fn should be a 0-arg function that returns a fresh task for each test.
+  This ensures mutable state (like atoms) is reset between iterations.
+
+  Options:
+  - :num-tests   - number of different schedules to try (default 100)
+  - :seed        - base seed for schedule generation (default: current time)
+  - :property    - (fn [result] boolean) - returns true if result is valid
+  - :max-steps   - max scheduler steps per run (default 10000)
+  - :max-time-ms - max virtual time per run (default 60000)
+  - :schedule-length - length of generated schedules (default 100)
+
+  Returns on failure:
+  {:failure    {:value v} or {:error e}
+   :seed       seed used for this iteration
+   :schedule   schedule that caused failure
+   :trace      full trace (if trace? was true)
+   :iteration  which iteration failed}"
+  [task-fn {:keys [num-tests seed property max-steps max-time-ms schedule-length]
+            :or {num-tests 100
+                 max-steps 10000
+                 max-time-ms 60000
+                 schedule-length 100}}]
+  (let [base-seed (or seed #?(:clj (System/currentTimeMillis)
+                              :cljs (.getTime (js/Date.))))]
+    (loop [i 0]
+      (when (< i num-tests)
+        (let [test-seed (+ base-seed i)
+              schedule (seed->schedule test-seed schedule-length)
+              sched (make-scheduler {:schedule schedule :trace? true :seed test-seed})
+              result (binding [*scheduler* sched]
+                       (try
+                         {:value (run sched (task-fn) {:max-steps max-steps
+                                                       :max-time-ms max-time-ms})}
+                         (catch #?(:clj Throwable :cljs :default) e
+                           {:error e})))]
+          (if (or (:error result)
+                  (and property (not (property (:value result)))))
+            {:failure result
+             :seed test-seed
+             :schedule (trace->schedule (trace sched))
+             :trace (trace sched)
+             :iteration i}
+            (recur (inc i))))))))
+
+(defn explore-interleavings
+  "Explore different interleavings of a task and return a summary.
+
+  task-fn should be a 0-arg function that returns a fresh task for each test.
+  This ensures mutable state (like atoms) is reset between iterations.
+
+  Options:
+  - :num-samples     - number of different schedules to try (default 100)
+  - :seed            - base seed for schedule generation
+  - :schedule-length - length of generated schedules (default 100)
+  - :max-steps       - max scheduler steps per run (default 10000)
+
+  Returns:
+  {:unique-results - count of distinct results seen
+   :results        - vector of {:result r :schedule s} maps}"
+  [task-fn {:keys [num-samples seed schedule-length max-steps]
+            :or {num-samples 100
+                 schedule-length 100
+                 max-steps 10000}}]
+  (let [base-seed (or seed #?(:clj (System/currentTimeMillis)
+                              :cljs (.getTime (js/Date.))))
+        results (for [i (range num-samples)
+                      :let [test-seed (+ base-seed i)
+                            schedule (seed->schedule test-seed schedule-length)
+                            sched (make-scheduler {:schedule schedule
+                                                   :trace? true
+                                                   :seed test-seed})
+                            r (binding [*scheduler* sched]
+                                (try
+                                  (run sched (task-fn) {:max-steps max-steps})
+                                  (catch #?(:clj Throwable :cljs :default) e
+                                    {:error e})))]]
+                  {:result r
+                   :schedule (trace->schedule (trace sched))})]
+    {:unique-results (count (distinct (map :result results)))
+     :results (vec results)}))
+
+;; -----------------------------------------------------------------------------
+;; Interleaving: test.check generators (optional, requires test.check)
+;; -----------------------------------------------------------------------------
+
+;; These are functions that return generators to avoid requiring test.check at load time
+(defn selection-gen
+  "Generator for a single selection decision.
+  Requires clojure.test.check.generators to be available."
+  []
+  (require '[clojure.test.check.generators :as gen])
+  (let [gen-ns (find-ns 'clojure.test.check.generators)]
+    ((ns-resolve gen-ns 'frequency)
+     [[5 ((ns-resolve gen-ns 'return) :fifo)]
+      [3 ((ns-resolve gen-ns 'return) :lifo)]
+      [2 ((ns-resolve gen-ns 'return) :random)]])))
+
+(defn schedule-gen
+  "Generator for a schedule of selection decisions.
+  Requires clojure.test.check.generators to be available.
+
+  Usage with test.check:
+    (require '[clojure.test.check.generators :as gen])
+    (gen/sample (mt/schedule-gen 10))"
+  [max-decisions]
+  (require '[clojure.test.check.generators :as gen])
+  (let [gen-ns (find-ns 'clojure.test.check.generators)]
+    ((ns-resolve gen-ns 'vector) (selection-gen) 0 max-decisions)))
+
+;; -----------------------------------------------------------------------------
 ;; Flow collection convenience
 ;; -----------------------------------------------------------------------------
 
@@ -1221,7 +1489,7 @@
   - If :timeout-ms is provided, wraps with mt/timeout and returns ::mt/timeout on expiry."
   ([flow] (collect flow {}))
   ([flow {:keys [xf timeout-ms label]
-          :or   {xf nil}}]
+          :or {xf nil}}]
    (let [f (if xf (m/eduction xf flow) flow)
          t (m/reduce conj [] f)
          t (if timeout-ms

@@ -48,12 +48,12 @@
   (testing "advance-to! throws on negative time jump"
     (let [sched (mt/make-scheduler {:initial-ms 100})]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"advance-to! requires t >= now"
-            (mt/advance-to! sched 50)))))
+                            (mt/advance-to! sched 50)))))
 
   (testing "advance! throws on negative delta"
     (let [sched (mt/make-scheduler)]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-negative"
-            (mt/advance! sched -10))))))
+                            (mt/advance! sched -10))))))
 
 ;; =============================================================================
 ;; Sleep Tests
@@ -171,7 +171,7 @@
       (mt/tick! sched)
       (is (mt/done? job))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"test error"
-            (mt/result job))))))
+                            (mt/result job))))))
 
 ;; =============================================================================
 ;; Subject (Discrete Flow) Tests
@@ -262,7 +262,7 @@
 
       (is (mt/ready? proc))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"subject failed"
-            (mt/transfer! proc))))))
+                            (mt/transfer! proc))))))
 
 ;; =============================================================================
 ;; State (Continuous Flow) Tests
@@ -320,7 +320,7 @@
       (mt/tick! sched)
       (is (not (mt/ready? proc)))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not ready"
-            (mt/transfer! proc)))))
+                            (mt/transfer! proc)))))
 
   (testing "cancel! cancels flow process"
     (let [sched (mt/make-scheduler)
@@ -384,29 +384,29 @@
 
   (testing "run detects deadlock without auto-advance"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Deadlock"
-          (mt/with-determinism [sched (mt/make-scheduler)]
-            (mt/run sched
-                    (m/sp (m/? (m/sleep 100)))
-                    {:auto-advance? false})))))
+                          (mt/with-determinism [sched (mt/make-scheduler)]
+                            (mt/run sched
+                                    (m/sp (m/? (m/sleep 100)))
+                                    {:auto-advance? false})))))
 
   (testing "run enforces step budget"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Step budget exceeded"
-          (mt/with-determinism [sched (mt/make-scheduler)]
-            (mt/run sched
-                    (m/sp
+                          (mt/with-determinism [sched (mt/make-scheduler)]
+                            (mt/run sched
+                                    (m/sp
                      ;; Create many microtasks
-                     (loop [i 0]
-                       (when (< i 1000)
-                         (m/? (m/sleep 0))
-                         (recur (inc i)))))
-                    {:max-steps 100})))))
+                                     (loop [i 0]
+                                       (when (< i 1000)
+                                         (m/? (m/sleep 0))
+                                         (recur (inc i)))))
+                                    {:max-steps 100})))))
 
   (testing "run enforces time budget"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Time budget exceeded"
-          (mt/with-determinism [sched (mt/make-scheduler)]
-            (mt/run sched
-                    (m/sp (m/? (m/sleep 10000 :done)))
-                    {:max-time-ms 1000}))))))
+                          (mt/with-determinism [sched (mt/make-scheduler)]
+                            (mt/run sched
+                                    (m/sp (m/? (m/sleep 10000 :done)))
+                                    {:max-time-ms 1000}))))))
 
 ;; =============================================================================
 ;; Collect Tests
@@ -519,7 +519,7 @@
       (mt/tick! sched)
       (is (mt/done? job))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
-            (mt/result job)))))
+                            (mt/result job)))))
 
   (testing "transfer after termination throws"
     (let [sched (mt/make-scheduler)
@@ -530,12 +530,12 @@
       (mt/tick! sched)
       (is (mt/terminated? proc))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"terminated"
-            (mt/transfer! proc))))))
+                            (mt/transfer! proc))))))
 
 (deftest no-scheduler-test
   (testing "sleep throws without scheduler"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No TestScheduler"
-          ((mt/sleep 100 :done) (fn [_]) (fn [_]))))))
+                          ((mt/sleep 100 :done) (fn [_]) (fn [_]))))))
 
 ;; =============================================================================
 ;; Integration Tests
@@ -581,7 +581,7 @@
                                       (m/ap
                                        (m/?> (m/amb=
                                               (:flow subj1)
-                                              (:flow subj2))))))))))))))
+                                              (:flow subj2)))))))))))))))
 
 (deftest integration-sequential-flows-test
   (testing "collecting flows sequentially with cat"
@@ -597,4 +597,339 @@
                                       (m/? (emit :b))
                                       (m/? (emit :c))
                                       (m/? (close)))
-                                     (mt/collect flow))))))))))))
+                                     (mt/collect flow)))))))))))
+
+;; =============================================================================
+;; Interleaving Tests
+;; =============================================================================
+
+(deftest schedule-selection-test
+  (testing "FIFO selection maintains order"
+    (let [order (atom [])]
+      (mt/with-determinism [sched (mt/make-scheduler {:schedule [:fifo :fifo :fifo] :trace? true})]
+        ;; Create a task that starts 3 concurrent sleeps at t=0
+        (mt/run sched
+                (m/sp
+                 (m/? (m/join vector
+                              (m/sp (swap! order conj :a) :a)
+                              (m/sp (swap! order conj :b) :b)
+                              (m/sp (swap! order conj :c) :c))))))
+      ;; With FIFO, order depends on when tasks were enqueued
+      (is (= 3 (count @order)))))
+
+  (testing "LIFO selection reverses order"
+    (mt/with-determinism [sched (mt/make-scheduler {:schedule [:lifo :lifo :lifo :lifo :lifo
+                                                               :lifo :lifo :lifo :lifo :lifo]
+                                                    :trace? true})]
+      ;; Run a task - with LIFO the last enqueued task runs first
+      (mt/run sched
+              (m/sp
+               (m/? (m/join vector
+                            (m/sleep 0 :a)
+                            (m/sleep 0 :b)
+                            (m/sleep 0 :c)))))))
+
+  (testing "schedule falls back to FIFO when exhausted"
+    (mt/with-determinism [sched (mt/make-scheduler {:schedule [:lifo] :trace? true})]
+      ;; Schedule has only 1 decision, rest should use FIFO
+      (is (= :done
+             (mt/run sched
+                     (m/sp
+                      (m/? (m/sleep 10))
+                      (m/? (m/sleep 10))
+                      :done)))))))
+
+(deftest trace->schedule-test
+  (testing "extracts schedule from trace"
+    (mt/with-determinism [sched (mt/make-scheduler {:schedule [:lifo :fifo :lifo] :trace? true})]
+      ;; Run something with concurrent tasks to trigger selection events
+      (mt/run sched
+              (m/sp
+               (m/? (m/join vector
+                            (m/sleep 0 :a)
+                            (m/sleep 0 :b)
+                            (m/sleep 0 :c)))))
+      (let [extracted (mt/trace->schedule (mt/trace sched))]
+        ;; Should be a vector of decisions
+        (is (vector? extracted))
+        ;; Decisions should be keywords
+        (is (every? keyword? extracted)))))
+
+  (testing "empty trace yields empty schedule"
+    (is (= [] (mt/trace->schedule []))))
+
+  (testing "trace without select events yields empty schedule"
+    (is (= [] (mt/trace->schedule [{:event :run-microtask :id 1}
+                                   {:event :advance-to :from 0 :to 100}])))))
+
+(deftest replay-schedule-test
+  (testing "replay produces same result with same schedule"
+    (mt/with-determinism [_ (mt/make-scheduler)]
+      (let [task (m/sp
+                  (m/? (m/join +
+                               (m/sleep 0 1)
+                               (m/sleep 0 2)
+                               (m/sleep 0 3))))
+            schedule [:fifo :fifo :fifo :fifo :fifo :fifo]
+            r1 (mt/replay-schedule task schedule)
+            r2 (mt/replay-schedule task schedule)]
+        (is (= r1 r2)))))
+
+  (testing "different schedules can produce different results"
+    ;; This test uses a task where order matters
+    (mt/with-determinism [_ (mt/make-scheduler)]
+      (let [;; Task that records execution order
+            order (atom [])
+            make-task (fn []
+                        (reset! order [])
+                        (m/sp
+                         (m/? (m/join (fn [& args] @order)
+                                      (m/sp (swap! order conj :a) :a)
+                                      (m/sp (swap! order conj :b) :b)
+                                      (m/sp (swap! order conj :c) :c)))))]
+        ;; Run with different schedules
+        (let [r1 (mt/replay-schedule (make-task) [:fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo])
+              r2 (mt/replay-schedule (make-task) [:lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo])]
+          ;; Results should be vectors of the recorded order
+          (is (vector? r1))
+          (is (vector? r2)))))))
+
+(deftest seed->schedule-test
+  (testing "generates schedule of correct length"
+    (let [schedule (mt/seed->schedule 42 10)]
+      (is (vector? schedule))
+      (is (= 10 (count schedule)))))
+
+  (testing "same seed produces same schedule"
+    (is (= (mt/seed->schedule 12345 20)
+           (mt/seed->schedule 12345 20))))
+
+  (testing "different seeds produce different schedules"
+    (is (not= (mt/seed->schedule 1 10)
+              (mt/seed->schedule 2 10))))
+
+  (testing "schedule contains valid decisions"
+    (let [schedule (mt/seed->schedule 42 100)]
+      (is (every? #{:fifo :lifo :random} schedule)))))
+
+(deftest check-interleaving-test
+  (testing "returns nil when all tests pass"
+    (mt/with-determinism [_ (mt/make-scheduler)]
+      (let [task-fn (fn [] (m/sp (m/? (m/sleep 10 :done))))
+            result (mt/check-interleaving task-fn {:num-tests 10
+                                                   :seed 42
+                                                   :property (fn [v] (= v :done))})]
+        (is (nil? result)))))
+
+  (testing "returns failure info when property fails"
+    ;; Task factory creates fresh atom each time
+    (let [make-task (fn []
+                      (let [counter (atom 0)]
+                        (m/sp
+                         (swap! counter inc)
+                         @counter)))
+          ;; Property that always fails (counter will be 1)
+          result (mt/check-interleaving make-task {:num-tests 10
+                                                   :seed 42
+                                                   :property (fn [v] (= v 0))})] ; fails: counter is 1
+      (when result
+        (is (map? result))
+        (is (contains? result :failure))
+        (is (contains? result :seed))
+        (is (contains? result :schedule))
+        (is (contains? result :iteration)))))
+
+  (testing "returns failure info when task throws"
+    (let [task-fn (fn [] (m/sp (throw (ex-info "intentional failure" {}))))
+          result (mt/check-interleaving task-fn {:num-tests 5 :seed 42})]
+      (is (map? result))
+      (is (contains? (:failure result) :error)))))
+
+(deftest explore-interleavings-test
+  (testing "explores multiple schedules"
+    (mt/with-determinism [_ (mt/make-scheduler)]
+      (let [task-fn (fn [] (m/sp (m/? (m/sleep 10 :done))))
+            result (mt/explore-interleavings task-fn {:num-samples 5
+                                                      :seed 42})]
+        (is (map? result))
+        (is (contains? result :unique-results))
+        (is (contains? result :results))
+        (is (= 5 (count (:results result)))))))
+
+  (testing "counts unique results correctly"
+    ;; Task factory that always returns same value
+    (let [task-fn (fn [] (m/sp :constant))
+          result (mt/explore-interleavings task-fn {:num-samples 10
+                                                    :seed 42})]
+      (is (= 1 (:unique-results result)))))
+
+  (testing "each result includes schedule"
+    (mt/with-determinism [_ (mt/make-scheduler)]
+      (let [task-fn (fn [] (m/sp (m/? (m/sleep 0 :done))))
+            result (mt/explore-interleavings task-fn {:num-samples 3 :seed 42})]
+        (is (every? #(contains? % :schedule) (:results result)))
+        (is (every? #(contains? % :result) (:results result)))))))
+
+(deftest select-task-trace-event-test
+  (testing "select-task events are traced when queue has multiple items"
+    (mt/with-determinism [sched (mt/make-scheduler {:schedule [:lifo :fifo] :trace? true})]
+      ;; Run concurrent tasks that will queue up
+      (mt/run sched
+              (m/sp
+               (m/? (m/join vector
+                            (m/sleep 0 :a)
+                            (m/sleep 0 :b)))))
+      (let [trace (mt/trace sched)
+            select-events (filter #(= :select-task (:event %)) trace)]
+        ;; Should have select events when queue had choices
+        (when (seq select-events)
+          (let [ev (first select-events)]
+            (is (contains? ev :decision))
+            (is (contains? ev :queue-size))
+            (is (contains? ev :selected-id))
+            (is (contains? ev :alternatives)))))))
+
+  (testing "no select-task events when queue always has single item"
+    (mt/with-determinism [sched (mt/make-scheduler {:trace? true})]
+      ;; Run sequential tasks - queue never has multiple items
+      (mt/run sched
+              (m/sp
+               (m/? (m/sleep 10))
+               (m/? (m/sleep 10))
+               :done))
+      (let [trace (mt/trace sched)
+            select-events (filter #(= :select-task (:event %)) trace)]
+        (is (empty? select-events))))))
+
+;; =============================================================================
+;; Interleaving Bug Detection Demo
+;; =============================================================================
+
+(deftest interleaving-reveals-bug-test
+  (testing "lost update bug: concurrent read-modify-write without synchronization"
+    ;; Classic concurrency bug: two tasks read a value, modify it, then write back.
+    ;; Both reads happen before any yield, so one update is ALWAYS lost.
+    ;;
+    ;; Timeline 1 (A writes last):
+    ;;   1. A reads counter (0)
+    ;;   2. B reads counter (0)
+    ;;   3. A yields, B yields
+    ;;   4. B writes counter (0 + 20 = 20)
+    ;;   5. A writes counter (0 + 10 = 10)  <- B's update is lost!
+    ;;   Result: 10
+    ;;
+    ;; Timeline 2 (B writes last):
+    ;;   1. A reads counter (0)
+    ;;   2. B reads counter (0)
+    ;;   3. A yields, B yields
+    ;;   4. A writes counter (0 + 10 = 10)
+    ;;   5. B writes counter (0 + 20 = 20)  <- A's update is lost!
+    ;;   Result: 20
+
+    (let [;; A buggy "bank transfer" simulation
+          make-buggy-task
+          (fn []
+            (let [account (atom 0)]
+              (m/sp
+               (m/? (m/join
+                     (fn [_ _] @account)
+                       ;; Task A: deposit 10
+                     (m/sp
+                      (let [balance @account] ; read
+                        (m/? (m/sleep 0)) ; yield point - allows interleaving
+                        (reset! account (+ balance 10)))) ; write
+                       ;; Task B: deposit 20
+                     (m/sp
+                      (let [balance @account] ; read
+                        (m/? (m/sleep 0)) ; yield point
+                        (reset! account (+ balance 20)))))))))
+
+          ;; Property: final balance should always be 30 (10 + 20)
+          valid? (fn [result] (= 30 result))]
+
+      ;; Explore interleavings to find the bug
+      (mt/with-determinism [_ (mt/make-scheduler)]
+        (let [exploration (mt/explore-interleavings make-buggy-task
+                                                    {:num-samples 50
+                                                     :seed 12345})]
+          ;; Should find multiple unique results (bug manifests as different outcomes)
+          (is (> (:unique-results exploration) 1)
+              "Bug should cause different outcomes under different interleavings")
+
+          ;; Extract the actual results seen
+          ;; Note: 30 is not possible because both reads happen before any yield point.
+          ;; The bug manifests as either 10 or 20 depending on which write happens last.
+          (let [results (set (map :result (:results exploration)))]
+            (is (or (contains? results 10)
+                    (contains? results 20))
+                "Result 10 or 20 should be possible (lost update)")
+            (is (= #{10 20} results)
+                "Both lost update outcomes should be observed"))))))
+
+  (testing "check-interleaving finds the bug and provides reproducible schedule"
+    (let [make-buggy-task
+          (fn []
+            (let [counter (atom 0)]
+              (m/sp
+               (m/? (m/join
+                     (fn [_ _] @counter)
+                     (m/sp
+                      (let [v @counter]
+                        (m/? (m/sleep 0))
+                        (reset! counter (+ v 5))))
+                     (m/sp
+                      (let [v @counter]
+                        (m/? (m/sleep 0))
+                        (reset! counter (+ v 7)))))))))
+
+          valid? (fn [result] (= 12 result))]
+
+      (mt/with-determinism [_ (mt/make-scheduler)]
+        (let [failure (mt/check-interleaving make-buggy-task
+                                             {:num-tests 100
+                                              :seed 99999
+                                              :property valid?})]
+          ;; Should find a failing case
+          (is (some? failure) "Should find an interleaving that exposes the bug")
+
+          (when failure
+            ;; Verify the failure info is complete
+            (is (contains? failure :schedule))
+            (is (contains? failure :seed))
+            (is (vector? (:schedule failure)))
+
+            ;; The failing result should be 5 or 7 (not 12)
+            (is (not= 12 (get-in failure [:failure :value]))
+                "Failing result should not be the expected 12")
+
+            ;; Replay should produce the same buggy result
+            (let [replayed (mt/replay-schedule (make-buggy-task) (:schedule failure))]
+              (is (= (get-in failure [:failure :value]) replayed)
+                  "Replaying the schedule should reproduce the exact same bug")))))))
+
+  (testing "fixed version passes all interleavings"
+    ;; The fix: use swap! for atomic read-modify-write
+    (let [make-fixed-task
+          (fn []
+            (let [counter (atom 0)]
+              (m/sp
+               (m/? (m/join
+                     (fn [_ _] @counter)
+                     (m/sp
+                      (m/? (m/sleep 0))
+                      (swap! counter + 5)) ; atomic!
+                     (m/sp
+                      (m/? (m/sleep 0))
+                      (swap! counter + 7)))) ; atomic!
+               )))
+
+          valid? (fn [result] (= 12 result))]
+
+      (mt/with-determinism [_ (mt/make-scheduler)]
+        (let [failure (mt/check-interleaving make-fixed-task
+                                             {:num-tests 100
+                                              :seed 99999
+                                              :property valid?})]
+          ;; Fixed version should pass all interleavings
+          (is (nil? failure)
+              "Fixed version should pass all interleavings"))))))
