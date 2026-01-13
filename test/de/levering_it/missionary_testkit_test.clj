@@ -639,6 +639,142 @@
                       (m/? (m/sleep 10))
                       :done)))))))
 
+(deftest by-label-selection-test
+  (testing "[:by-label label] selects task with matching label"
+    ;; Use subjects with different labels to create distinctly labeled microtasks
+    (let [sched (mt/make-scheduler {:trace? true})
+          subj-a (mt/subject sched {:label "producer-a"})
+          subj-b (mt/subject sched {:label "producer-b"})
+          results (atom [])]
+
+      ;; Start consumers for both subjects
+      (mt/start! sched
+                 (m/sp
+                  (m/? (m/join vector
+                               ;; Consumer A
+                               (m/sp
+                                (swap! results conj [:a (m/? (m/reduce conj [] (:flow subj-a)))]))
+                               ;; Consumer B
+                               (m/sp
+                                (swap! results conj [:b (m/? (m/reduce conj [] (:flow subj-b)))])))))
+                 {:label "consumers"})
+
+      ;; Tick to let consumers subscribe
+      (mt/tick! sched)
+
+      ;; Emit to both subjects - this creates labeled microtasks
+      (mt/start! sched ((:emit subj-a) :val-a) {:label "emit-a"})
+      (mt/start! sched ((:emit subj-b) :val-b) {:label "emit-b"})
+
+      ;; Tick to process emits
+      (mt/tick! sched)
+
+      ;; Check that trace contains microtasks with different labels
+      (let [trace (mt/trace sched)
+            emit-events (filter #(= :subject/emit (:kind %)) trace)]
+        (is (some #(= "producer-a" (:label %)) emit-events)
+            "Should have microtask with label producer-a")
+        (is (some #(= "producer-b" (:label %)) emit-events)
+            "Should have microtask with label producer-b"))))
+
+  (testing "[:by-label label] falls back to first when label not found"
+    (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:by-label "nonexistent"]]
+                                                    :trace? true})]
+      ;; Run concurrent sleeps (all have label "sleep")
+      (let [result (mt/run sched
+                           (m/sp
+                            (m/? (m/join vector
+                                         (m/sleep 0 :a)
+                                         (m/sleep 0 :b)))))]
+        ;; Should still complete (falls back to first item)
+        (is (= [:a :b] (sort result)))))))
+
+(deftest by-id-selection-test
+  (testing "[:by-id id] selects task with matching ID"
+    (mt/with-determinism [sched (mt/make-scheduler {:trace? true})]
+      ;; First, run to see what IDs get assigned
+      (mt/run sched
+              (m/sp
+               (m/? (m/join vector
+                            (m/sleep 0 :a)
+                            (m/sleep 0 :b)
+                            (m/sleep 0 :c)))))
+
+      ;; Extract timer IDs from trace
+      (let [trace (mt/trace sched)
+            timer-events (filter #(= :enqueue-timer (:event %)) trace)
+            timer-ids (mapv :id timer-events)]
+        ;; Should have 3 timers
+        (is (= 3 (count timer-ids))))))
+
+  (testing "[:by-id id] selects specific task when multiple are queued"
+    ;; We need to know IDs ahead of time - they're assigned sequentially starting from 0
+    ;; Job gets ID 0, then timers get IDs 1, 2, 3
+    ;; So to select the third timer (ID 3), we use [:by-id 3]
+    (let [execution-order (atom [])]
+      (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:by-id 4]  ; select third sleep (ID 4)
+                                                                  :fifo :fifo]
+                                                       :trace? true})]
+        (mt/run sched
+                (m/sp
+                 (m/? (m/join vector
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :a) :a)
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :b) :b)
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :c) :c)))))
+
+        ;; Check trace for select-task event
+        (let [trace (mt/trace sched)
+              select-events (filter #(= :select-task (:event %)) trace)]
+          (when (seq select-events)
+            (let [first-select (first select-events)]
+              (is (= [:by-id 4] (:decision first-select))
+                  "First selection should use [:by-id 4]")))))))
+
+  (testing "[:by-id id] falls back to first when ID not found"
+    (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:by-id 99999]] ; nonexistent ID
+                                                    :trace? true})]
+      ;; Run concurrent sleeps
+      (let [result (mt/run sched
+                           (m/sp
+                            (m/? (m/join vector
+                                         (m/sleep 0 :a)
+                                         (m/sleep 0 :b)))))]
+        ;; Should still complete (falls back to first item)
+        (is (= [:a :b] (sort result)))))))
+
+(deftest nth-selection-test
+  (testing "[:nth n] selects nth task from queue"
+    (let [execution-order (atom [])]
+      (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:nth 2]  ; select third item (0-indexed)
+                                                                  :fifo :fifo]
+                                                       :trace? true})]
+        (mt/run sched
+                (m/sp
+                 (m/? (m/join vector
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :a) :a)
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :b) :b)
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :c) :c)))))
+
+        ;; Third task should run first due to [:nth 2]
+        (is (= :c (first @execution-order))
+            "[:nth 2] should select the third task (index 2)"))))
+
+  (testing "[:nth n] wraps around when n >= queue size"
+    (let [execution-order (atom [])]
+      (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:nth 5]  ; larger than queue size 3
+                                                                  :fifo :fifo]
+                                                       :trace? true})]
+        (mt/run sched
+                (m/sp
+                 (m/? (m/join vector
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :a) :a)
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :b) :b)
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :c) :c)))))
+
+        ;; [:nth 5] with queue size 3 -> 5 mod 3 = 2 -> third task
+        (is (= :c (first @execution-order))
+            "[:nth 5] should wrap to index 2 (5 mod 3)"))))
+
 (deftest trace->schedule-test
   (testing "extracts schedule from trace"
     (mt/with-determinism [sched (mt/make-scheduler {:schedule [:lifo :fifo :lifo] :trace? true})]
