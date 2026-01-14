@@ -650,7 +650,7 @@
 
       ;; Replay should give same result
       (when-let [first-result (first (:results exploration))]
-        (let [replayed (mt/replay-schedule (make-task) (:micro-schedule first-result))]
+        (let [replayed (mt/replay-schedule make-task (:micro-schedule first-result))]
           (is (= (:result first-result) replayed)
               "Replaying schedule should produce same result")))))
 
@@ -684,7 +684,7 @@
           (is (vector? extracted-schedule))
 
           ;; Replay with extracted schedule should give identical result
-          (let [result2 (mt/replay-schedule (make-task) extracted-schedule)]
+          (let [result2 (mt/replay-schedule make-task extracted-schedule)]
             (is (= result1 result2)
                 "Replaying extracted schedule should reproduce exact same result")))))))
 
@@ -885,35 +885,34 @@
 
 (deftest replay-schedule-test
   (testing "replay produces same result with same schedule"
-    (mt/with-determinism [_ (mt/make-scheduler)]
-      (let [task (m/sp
-                  (m/? (m/join +
-                               (m/sleep 0 1)
-                               (m/sleep 0 2)
-                               (m/sleep 0 3))))
-            schedule [:fifo :fifo :fifo :fifo :fifo :fifo]
-            r1 (mt/replay-schedule task schedule)
-            r2 (mt/replay-schedule task schedule)]
-        (is (= r1 r2)))))
+    ;; replay-schedule takes a task-fn, not a task, to ensure creation inside with-determinism
+    (let [make-task (fn []
+                      (m/sp
+                       (m/? (m/join +
+                                    (m/sleep 0 1)
+                                    (m/sleep 0 2)
+                                    (m/sleep 0 3)))))
+          schedule [:fifo :fifo :fifo :fifo :fifo :fifo]
+          r1 (mt/replay-schedule make-task schedule)
+          r2 (mt/replay-schedule make-task schedule)]
+      (is (= r1 r2))))
 
   (testing "different schedules can produce different results"
     ;; This test uses a task where order matters
-    (mt/with-determinism [_ (mt/make-scheduler)]
-      (let [;; Task that records execution order
-            order (atom [])
-            make-task (fn []
-                        (reset! order [])
+    (let [;; Task factory that records execution order (fresh atom each time)
+          make-task (fn []
+                      (let [order (atom [])]
                         (m/sp
                          (m/? (m/join (fn [& args] @order)
                                       (m/sp (swap! order conj :a) :a)
                                       (m/sp (swap! order conj :b) :b)
-                                      (m/sp (swap! order conj :c) :c)))))]
-        ;; Run with different schedules
-        (let [r1 (mt/replay-schedule (make-task) [:fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo])
-              r2 (mt/replay-schedule (make-task) [:lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo])]
-          ;; Results should be vectors of the recorded order
-          (is (vector? r1))
-          (is (vector? r2)))))))
+                                      (m/sp (swap! order conj :c) :c))))))]
+      ;; Run with different schedules
+      (let [r1 (mt/replay-schedule make-task [:fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo])
+            r2 (mt/replay-schedule make-task [:lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo])]
+        ;; Results should be vectors of the recorded order
+        (is (vector? r1))
+        (is (vector? r2))))))
 
 (deftest seed->schedule-test
   (testing "generates schedule of correct length"
@@ -1124,7 +1123,7 @@
                 "Failing result should not be the expected 12")
 
             ;; Replay should produce the same buggy result
-            (let [replayed (mt/replay-schedule (make-buggy-task) (:micro-schedule failure))]
+            (let [replayed (mt/replay-schedule make-buggy-task (:micro-schedule failure))]
               (is (= (get-in failure [:failure :value]) replayed)
                   "Replaying the schedule should reproduce the exact same bug")))))))
 

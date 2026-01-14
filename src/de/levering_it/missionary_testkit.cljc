@@ -888,9 +888,26 @@
    (defmacro with-determinism
      "Scope deterministic behavior to a test body by rebinding/redefining Missionary vars.
 
-     Usage:
-       (with-determinism [sched (mt/make-scheduler {:strict? true})]
-         ...)
+     IMPORTANT: This macro is the entry point to deterministic behavior. All flows
+     and tasks under test MUST be created inside the macro body (or by factory
+     functions called from within the body). Tasks/flows created BEFORE or OUTSIDE
+     the macro will capture the real (non-virtual) primitives and will NOT be
+     deterministic.
+
+     Correct usage:
+       (with-determinism [sched (mt/make-scheduler)]
+         (mt/run sched
+           (m/sp (m/? (m/sleep 100)) :done)))  ; task created inside
+
+     Also correct (factory function called inside):
+       (defn make-task [] (m/sp (m/? (m/sleep 100)) :done))
+       (with-determinism [sched (mt/make-scheduler)]
+         (mt/run sched (make-task)))
+
+     WRONG (task created outside - will use real time!):
+       (def my-task (m/sp (m/? (m/sleep 100)) :done))  ; WRONG: created outside
+       (with-determinism [sched (mt/make-scheduler)]
+         (mt/run sched my-task))  ; m/sleep was NOT rebound when task was created
 
      JVM effects:
      - missionary.core/sleep    -> mt/sleep
@@ -1407,21 +1424,26 @@
                  decision)))))
 
 (defn replay-schedule
-  "Run a task with the exact schedule from a previous trace.
+  "Run a task-fn with the exact schedule from a previous trace.
   Returns the task result.
+
+  IMPORTANT: task-fn must be a 0-arg function that returns a task, NOT a task itself.
+  This ensures the task is created inside the deterministic context where m/sleep
+  and m/timeout are virtualized.
 
   Usage:
     (def original-trace (mt/trace sched))
-    (mt/replay-schedule task (mt/trace->schedule original-trace))"
-  ([task schedule]
-   (replay-schedule task schedule {}))
-  ([task schedule {:keys [trace? max-steps max-time-ms]
-                   :or {trace? true
-                        max-steps 100000
-                        max-time-ms 60000}}]
-   (with-determinism [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
-     (run sched task {:max-steps max-steps
-                      :max-time-ms max-time-ms}))))
+    (mt/replay-schedule make-task (mt/trace->schedule original-trace))"
+  ([task-fn schedule]
+   (replay-schedule task-fn schedule {}))
+  ([task-fn schedule {:keys [trace? max-steps max-time-ms]
+                      :or {trace? true
+                           max-steps 100000
+                           max-time-ms 60000}}]
+   (let [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
+     (with-determinism [sched sched]
+       (run sched (task-fn) {:max-steps max-steps
+                             :max-time-ms max-time-ms})))))
 
 (defn seed->schedule
   "Deterministically generate a schedule from a seed.

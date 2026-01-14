@@ -80,6 +80,38 @@ Add to your `deps.edn`:
 
 ## Core Concepts
 
+### The `with-determinism` Entry Point
+
+**IMPORTANT:** The `with-determinism` macro is the entry point to all deterministic behavior. All flows and tasks under test **must** be created inside the macro body (or by factory functions called from within the body).
+
+```clojure
+;; ✅ CORRECT: Task created inside with-determinism
+(mt/with-determinism [sched (mt/make-scheduler)]
+  (mt/run sched
+    (m/sp
+      (m/? (m/sleep 100))  ; Uses virtual time
+      :done)))
+
+;; ✅ CORRECT: Factory function called inside with-determinism
+(defn make-my-task []
+  (m/sp
+    (m/? (m/sleep 100))
+    :done))
+
+(mt/with-determinism [sched (mt/make-scheduler)]
+  (mt/run sched (make-my-task)))  ; Factory called inside macro
+
+;; ❌ WRONG: Task created BEFORE with-determinism
+(def my-task (m/sp (m/? (m/sleep 100)) :done))  ; Created outside!
+
+(mt/with-determinism [sched (mt/make-scheduler)]
+  (mt/run sched my-task))  ; m/sleep was captured at def time, NOT virtualized!
+```
+
+**Why this matters:** The `with-determinism` macro rebinds `m/sleep`, `m/timeout`, and the executors (`m/cpu`, `m/blk`) to their virtual-time equivalents. If you create a task *before* entering the macro, those tasks capture the *real* versions of these primitives, and your tests will use real time instead of virtual time—defeating the purpose of the testkit.
+
+The same applies to flows created with `mt/subject` and `mt/state`—they must be created inside `with-determinism` to be properly scheduled.
+
 ### TestScheduler
 
 The scheduler manages virtual time and a queue of pending tasks:
@@ -321,10 +353,11 @@ This is useful for:
 When `check-interleaving` finds a bug, you can replay the exact schedule:
 
 ```clojure
-;; Replay the failing case
-(mt/with-determinism [_ (mt/make-scheduler)]
-  (mt/replay-schedule failing-task (:micro-schedule result)))
+;; Replay the failing case (pass task-fn, not a task!)
+(mt/replay-schedule make-buggy-task (:micro-schedule result))
 ```
+
+**Note:** `replay-schedule` takes a task-fn (0-arg function returning a task), not a task itself. This ensures the task is created inside the deterministic context.
 
 ### Exploring All Outcomes
 
@@ -437,12 +470,12 @@ The scheduler automatically detects common problems:
 - `(blk-executor sched)` - deterministic blocking executor
 
 ### Integration Macro
-- `(with-determinism [sched expr] & body)` - rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`
+- `(with-determinism [sched expr] & body)` - rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point))
 
 ### Interleaving (Concurrency Testing)
 - `(check-interleaving task-fn opts)` - find failures across many interleavings (task-fn is a 0-arg function)
 - `(explore-interleavings task-fn opts)` - explore unique outcomes (task-fn is a 0-arg function)
-- `(replay-schedule task schedule)` - replay exact execution order
+- `(replay-schedule task-fn schedule)` - replay exact execution order (task-fn is a 0-arg function)
 - `(trace->schedule trace)` - extract schedule from trace
 - `(seed->schedule seed n)` - generate schedule from seed
 - `(selection-gen)` / `(schedule-gen n)` - test.check generators
