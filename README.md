@@ -112,6 +112,19 @@ Add to your `deps.edn`:
 
 The same applies to flows created with `mt/subject` and `mt/state`—they must be created inside `with-determinism` to be properly scheduled.
 
+### Checking Deterministic Mode
+
+You can check if code is running in deterministic mode using `*is-deterministic*`:
+
+```clojure
+(mt/*is-deterministic*)  ; => false (normal execution)
+
+(mt/with-determinism [sched (mt/make-scheduler)]
+  (mt/*is-deterministic*))  ; => true (inside determinism context)
+```
+
+This is useful for code that needs to behave differently in tests vs production.
+
 ### TestScheduler
 
 The scheduler manages virtual time and a queue of pending tasks:
@@ -465,12 +478,16 @@ The scheduler automatically detects common problems:
 
 ### Utilities
 - `(collect flow)` / `(collect flow opts)` - collect flow to vector task
-- `(executor sched)` - deterministic `java.util.concurrent.Executor`
-- `(cpu-executor sched)` - deterministic CPU executor
-- `(blk-executor sched)` - deterministic blocking executor
+- `(executor)` - deterministic `java.util.concurrent.Executor` (requires `*scheduler*` bound)
+- `(cpu-executor)` - deterministic CPU executor (requires `*scheduler*` bound)
+- `(blk-executor)` - deterministic blocking executor (requires `*scheduler*` bound)
+
+### Dynamic Vars
+- `*scheduler*` - the current TestScheduler (bound automatically by `with-determinism`)
+- `*is-deterministic*` - `true` when inside `with-determinism` scope
 
 ### Integration Macro
-- `(with-determinism [sched expr] & body)` - rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point))
+- `(with-determinism [sched expr] & body)` - rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`, bind `*scheduler*` and set `*is-deterministic*` to `true`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point))
 
 ### Interleaving (Concurrency Testing)
 - `(check-interleaving task-fn opts)` - find failures across many interleavings (task-fn is a 0-arg function)

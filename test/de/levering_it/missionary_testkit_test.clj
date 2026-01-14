@@ -338,6 +338,13 @@
 ;; =============================================================================
 
 (deftest with-determinism-test
+  (testing "*is-deterministic* is false outside with-determinism"
+    (is (false? mt/*is-deterministic*)))
+
+  (testing "*is-deterministic* is true inside with-determinism"
+    (mt/with-determinism [sched (mt/make-scheduler)]
+      (is (true? mt/*is-deterministic*))))
+
   (testing "rebinds m/sleep to virtual sleep"
     (is (= :done
            (mt/with-determinism [sched (mt/make-scheduler)]
@@ -480,30 +487,33 @@
 (deftest executor-test
   (testing "executor runs runnables as microtasks"
     (let [sched (mt/make-scheduler)
-          exec (mt/executor sched)
           result (atom nil)]
-      (.execute exec (fn [] (reset! result :executed)))
-      (is (nil? @result))
-      (mt/tick! sched)
-      (is (= :executed @result))))
+      (binding [mt/*scheduler* sched]
+        (let [exec (mt/executor)]
+          (.execute exec (fn [] (reset! result :executed)))
+          (is (nil? @result))
+          (mt/tick! sched)
+          (is (= :executed @result))))))
 
   (testing "cpu-executor runs on cpu lane"
     (let [sched (mt/make-scheduler {:trace? true})
-          exec (mt/cpu-executor sched)
           result (atom nil)]
-      (.execute exec (fn [] (reset! result :cpu-done)))
-      (mt/tick! sched)
-      (is (= :cpu-done @result))
-      (is (some #(= :cpu (:lane %)) (mt/trace sched)))))
+      (binding [mt/*scheduler* sched]
+        (let [exec (mt/cpu-executor)]
+          (.execute exec (fn [] (reset! result :cpu-done)))
+          (mt/tick! sched)
+          (is (= :cpu-done @result))
+          (is (some #(= :cpu (:lane %)) (mt/trace sched)))))))
 
   (testing "blk-executor runs on blk lane"
     (let [sched (mt/make-scheduler {:trace? true})
-          exec (mt/blk-executor sched)
           result (atom nil)]
-      (.execute exec (fn [] (reset! result :blk-done)))
-      (mt/tick! sched)
-      (is (= :blk-done @result))
-      (is (some #(= :blk (:lane %)) (mt/trace sched))))))
+      (binding [mt/*scheduler* sched]
+        (let [exec (mt/blk-executor)]
+          (.execute exec (fn [] (reset! result :blk-done)))
+          (mt/tick! sched)
+          (is (= :blk-done @result))
+          (is (some #(= :blk (:lane %)) (mt/trace sched))))))))
 
 ;; =============================================================================
 ;; Edge Cases and Error Handling
