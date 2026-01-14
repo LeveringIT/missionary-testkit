@@ -417,15 +417,17 @@
             q (:micro-q s)]
         (if (q-empty? q)
           idle
-          ;; Get schedule decision and select from queue
-          (let [[decision s-with-idx] (get-schedule-decision sched s)
-                q-size (count q) ; O(1) for PersistentQueue
-                rng-state (:rng-state s-with-idx)
-                ;; Only use schedule-based selection when queue has multiple items
+          (let [q-size (count q) ; O(1) for PersistentQueue
+                ;; Only get schedule decision when there's actually a choice to make
+                [decision s-after-decision] (if (> q-size 1)
+                                              (get-schedule-decision sched s)
+                                              [:fifo s])
+                rng-state (:rng-state s-after-decision)
+                ;; Select from queue (uses decision only when q-size > 1)
                 [mt q' new-rng] (if (> q-size 1)
                                   (select-from-queue q decision rng-state)
                                   [(q-peek q) (q-pop q) rng-state])
-                now (:now-ms s-with-idx)
+                now (:now-ms s-after-decision)
                 ;; Build trace event with selection info when queue had choices
                 select-trace (when (> q-size 1)
                                {:event :select-task
@@ -434,7 +436,7 @@
                                 :selected-id (:id mt)
                                 :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec q)))
                                 :now-ms now})
-                s' (-> s-with-idx
+                s' (-> s-after-decision
                        (assoc :micro-q q')
                        (assoc :rng-state new-rng)
                        (cond-> select-trace (maybe-trace-state select-trace))

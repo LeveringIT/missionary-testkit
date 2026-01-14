@@ -652,7 +652,41 @@
       (when-let [first-result (first (:results exploration))]
         (let [replayed (mt/replay-schedule (make-task) (:schedule first-result))]
           (is (= (:result first-result) replayed)
-              "Replaying schedule should produce same result"))))))
+              "Replaying schedule should produce same result")))))
+
+  (testing "schedule consumption only at branch points, not single-item steps"
+    ;; This test verifies that schedule decisions are only consumed when there's
+    ;; actually a choice to make (queue size > 1), not on every step.
+    ;; This ensures trace->schedule extraction matches actual schedule consumption.
+    (let [make-task (fn []
+                      (let [order (atom [])]
+                        (m/sp
+                         ;; Single sequential sleep (no branch, no schedule decision)
+                         (m/? (m/sleep 10))
+                         ;; Branch point: 3 concurrent tasks (needs schedule decisions)
+                         (m/? (m/join vector
+                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :a))
+                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :b))
+                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :c))))
+                         ;; Another single sleep (no branch)
+                         (m/? (m/sleep 10))
+                         @order)))
+          ;; Schedule with decisions only for actual branch points
+          schedule [:lifo :fifo :fifo]]
+      (mt/with-determinism [sched (mt/make-scheduler {:schedule schedule :trace? true})]
+        (let [result1 (mt/run sched (make-task))
+              trace (mt/trace sched)
+              extracted-schedule (mt/trace->schedule trace)]
+          ;; With LIFO first, :c should run first (last enqueued)
+          (is (= :c (first result1)) "LIFO should select last enqueued task first")
+
+          ;; Extracted schedule should match what trace recorded
+          (is (vector? extracted-schedule))
+
+          ;; Replay with extracted schedule should give identical result
+          (let [result2 (mt/replay-schedule (make-task) extracted-schedule)]
+            (is (= result1 result2)
+                "Replaying extracted schedule should reproduce exact same result")))))))
 
 (deftest schedule-selection-test
   (testing "FIFO selection maintains order"
