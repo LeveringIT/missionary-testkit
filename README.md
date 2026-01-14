@@ -85,11 +85,12 @@ Add to your `deps.edn`:
 The scheduler manages virtual time and a queue of pending tasks:
 
 ```clojure
-(def sched (mt/make-scheduler {:initial-ms 0      ; starting time
-                                :trace?     true   ; enable execution trace
-                                :strict?    true   ; thread safety checks (default on JVM)
-                                :policy     :fifo  ; task ordering
-                                :schedule   nil})) ; interleaving schedule (see Schedule Decisions)
+(def sched (mt/make-scheduler {:initial-ms      0       ; starting time
+                                :trace?          true    ; enable execution trace
+                                :strict?         true    ; thread safety checks (default on JVM)
+                                :timer-order     :fifo   ; timer tie-breaking (:fifo or :seeded)
+                                :rng-seed        42      ; seed for all RNG uses
+                                :micro-schedule  nil}))  ; microtask interleaving (see Schedule Decisions)
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
 (mt/pending sched)  ; => {:microtasks [...] :timers [...]}
@@ -312,7 +313,7 @@ This is useful for:
     (when result
       (println "Bug found!")
       (println "Seed:" (:seed result))
-      (println "Schedule:" (:schedule result)))))
+      (println "Schedule:" (:micro-schedule result)))))
 ```
 
 ### Replaying a Failing Schedule
@@ -322,7 +323,7 @@ When `check-interleaving` finds a bug, you can replay the exact schedule:
 ```clojure
 ;; Replay the failing case
 (mt/with-determinism [_ (mt/make-scheduler)]
-  (mt/replay-schedule failing-task (:schedule result)))
+  (mt/replay-schedule failing-task (:micro-schedule result)))
 ```
 
 ### Exploring All Outcomes
@@ -353,11 +354,11 @@ Schedules control task selection when the queue has multiple ready tasks:
 All targeted decisions fall back to the first task if no match is found.
 
 ```clojure
-;; Create scheduler with explicit schedule
-(mt/make-scheduler {:schedule [:lifo :fifo :lifo :fifo]})
+;; Create scheduler with explicit micro-schedule
+(mt/make-scheduler {:micro-schedule [:lifo :fifo :lifo :fifo]})
 
 ;; Mix basic and targeted decisions
-(mt/make-scheduler {:schedule [:fifo [:nth 2] :lifo [:by-label "producer"]]})
+(mt/make-scheduler {:micro-schedule [:fifo [:nth 2] :lifo [:by-label "producer"]]})
 
 ;; Generate schedule from seed (basic decisions only)
 (mt/seed->schedule 42 10) ; => [:lifo :fifo :random ...]

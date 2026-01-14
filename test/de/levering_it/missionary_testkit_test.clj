@@ -610,8 +610,8 @@
     ;; making results non-reproducible. Now it uses a proper LCG RNG.
     (let [run-task (fn [seed]
                      (let [order (atom [])]
-                       (mt/with-determinism [sched (mt/make-scheduler {:seed seed
-                                                                        :schedule [:random :random :random
+                       (mt/with-determinism [sched (mt/make-scheduler {:rng-seed seed
+                                                                        :micro-schedule [:random :random :random
                                                                                    :random :random :random]})]
                          (mt/run sched
                                  (m/sp
@@ -650,7 +650,7 @@
 
       ;; Replay should give same result
       (when-let [first-result (first (:results exploration))]
-        (let [replayed (mt/replay-schedule (make-task) (:schedule first-result))]
+        (let [replayed (mt/replay-schedule (make-task) (:micro-schedule first-result))]
           (is (= (:result first-result) replayed)
               "Replaying schedule should produce same result")))))
 
@@ -673,7 +673,7 @@
                          @order)))
           ;; Schedule with decisions only for actual branch points
           schedule [:lifo :fifo :fifo]]
-      (mt/with-determinism [sched (mt/make-scheduler {:schedule schedule :trace? true})]
+      (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule schedule :trace? true})]
         (let [result1 (mt/run sched (make-task))
               trace (mt/trace sched)
               extracted-schedule (mt/trace->schedule trace)]
@@ -691,7 +691,7 @@
 (deftest schedule-selection-test
   (testing "FIFO selection maintains order"
     (let [order (atom [])]
-      (mt/with-determinism [sched (mt/make-scheduler {:schedule [:fifo :fifo :fifo] :trace? true})]
+      (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [:fifo :fifo :fifo] :trace? true})]
         ;; Create a task that starts 3 concurrent sleeps at t=0
         (mt/run sched
                 (m/sp
@@ -703,7 +703,7 @@
       (is (= 3 (count @order)))))
 
   (testing "LIFO selection reverses order"
-    (mt/with-determinism [sched (mt/make-scheduler {:schedule [:lifo :lifo :lifo :lifo :lifo
+    (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [:lifo :lifo :lifo :lifo :lifo
                                                                :lifo :lifo :lifo :lifo :lifo]
                                                     :trace? true})]
       ;; Run a task - with LIFO the last enqueued task runs first
@@ -715,7 +715,7 @@
                             (m/sleep 0 :c)))))))
 
   (testing "schedule falls back to FIFO when exhausted"
-    (mt/with-determinism [sched (mt/make-scheduler {:schedule [:lifo] :trace? true})]
+    (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [:lifo] :trace? true})]
       ;; Schedule has only 1 decision, rest should use FIFO
       (is (= :done
              (mt/run sched
@@ -763,7 +763,7 @@
             "Should have microtask with label producer-b"))))
 
   (testing "[:by-label label] falls back to first when label not found"
-    (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:by-label "nonexistent"]]
+    (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [[:by-label "nonexistent"]]
                                                     :trace? true})]
       ;; Run concurrent sleeps (all have label "sleep")
       (let [result (mt/run sched
@@ -797,7 +797,7 @@
     ;; Job gets ID 0, then timers get IDs 1, 2, 3
     ;; So to select the third timer (ID 3), we use [:by-id 3]
     (let [execution-order (atom [])]
-      (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:by-id 4]  ; select third sleep (ID 4)
+      (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [[:by-id 4]  ; select third sleep (ID 4)
                                                                   :fifo :fifo]
                                                        :trace? true})]
         (mt/run sched
@@ -816,7 +816,7 @@
                   "First selection should use [:by-id 4]")))))))
 
   (testing "[:by-id id] falls back to first when ID not found"
-    (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:by-id 99999]] ; nonexistent ID
+    (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [[:by-id 99999]] ; nonexistent ID
                                                     :trace? true})]
       ;; Run concurrent sleeps
       (let [result (mt/run sched
@@ -830,7 +830,7 @@
 (deftest nth-selection-test
   (testing "[:nth n] selects nth task from queue"
     (let [execution-order (atom [])]
-      (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:nth 2]  ; select third item (0-indexed)
+      (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [[:nth 2]  ; select third item (0-indexed)
                                                                   :fifo :fifo]
                                                        :trace? true})]
         (mt/run sched
@@ -846,7 +846,7 @@
 
   (testing "[:nth n] wraps around when n >= queue size"
     (let [execution-order (atom [])]
-      (mt/with-determinism [sched (mt/make-scheduler {:schedule [[:nth 5]  ; larger than queue size 3
+      (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [[:nth 5]  ; larger than queue size 3
                                                                   :fifo :fifo]
                                                        :trace? true})]
         (mt/run sched
@@ -862,7 +862,7 @@
 
 (deftest trace->schedule-test
   (testing "extracts schedule from trace"
-    (mt/with-determinism [sched (mt/make-scheduler {:schedule [:lifo :fifo :lifo] :trace? true})]
+    (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [:lifo :fifo :lifo] :trace? true})]
       ;; Run something with concurrent tasks to trigger selection events
       (mt/run sched
               (m/sp
@@ -957,7 +957,7 @@
         (is (map? result))
         (is (contains? result :failure))
         (is (contains? result :seed))
-        (is (contains? result :schedule))
+        (is (contains? result :micro-schedule))
         (is (contains? result :iteration)))))
 
   (testing "returns failure info when task throws"
@@ -988,12 +988,12 @@
     (mt/with-determinism [_ (mt/make-scheduler)]
       (let [task-fn (fn [] (m/sp (m/? (m/sleep 0 :done))))
             result (mt/explore-interleavings task-fn {:num-samples 3 :seed 42})]
-        (is (every? #(contains? % :schedule) (:results result)))
+        (is (every? #(contains? % :micro-schedule) (:results result)))
         (is (every? #(contains? % :result) (:results result)))))))
 
 (deftest select-task-trace-event-test
   (testing "select-task events are traced when queue has multiple items"
-    (mt/with-determinism [sched (mt/make-scheduler {:schedule [:lifo :fifo] :trace? true})]
+    (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [:lifo :fifo] :trace? true})]
       ;; Run concurrent tasks that will queue up
       (mt/run sched
               (m/sp
@@ -1115,16 +1115,16 @@
 
           (when failure
             ;; Verify the failure info is complete
-            (is (contains? failure :schedule))
+            (is (contains? failure :micro-schedule))
             (is (contains? failure :seed))
-            (is (vector? (:schedule failure)))
+            (is (vector? (:micro-schedule failure)))
 
             ;; The failing result should be 5 or 7 (not 12)
             (is (not= 12 (get-in failure [:failure :value]))
                 "Failing result should not be the expected 12")
 
             ;; Replay should produce the same buggy result
-            (let [replayed (mt/replay-schedule (make-buggy-task) (:schedule failure))]
+            (let [replayed (mt/replay-schedule (make-buggy-task) (:micro-schedule failure))]
               (is (= (get-in failure [:failure :value]) replayed)
                   "Replaying the schedule should reproduce the exact same bug")))))))
 
@@ -1215,7 +1215,7 @@
 
   (testing "multiple yields create interleaving opportunities"
     (let [order (atom [])]
-      (mt/with-determinism [sched (mt/make-scheduler {:schedule [:fifo :fifo :fifo :fifo]})]
+      (mt/with-determinism [sched (mt/make-scheduler {:micro-schedule [:fifo :fifo :fifo :fifo]})]
         (mt/run sched
                 (m/sp
                  (m/? (m/join vector

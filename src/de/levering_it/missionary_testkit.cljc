@@ -65,7 +65,7 @@
 ;; -----------------------------------------------------------------------------
 
 (defrecord TestScheduler
-           [state policy seed strict? trace? schedule])
+           [state timer-order rng-seed strict? trace? micro-schedule])
 
 (defn- maybe-trace-state
   "If tracing enabled (state has non-nil :trace vector), append event."
@@ -78,24 +78,24 @@
   "Create a deterministic TestScheduler.
 
   Options:
-  {:initial-ms 0
-   :policy     :fifo | :seeded
-   :seed       42
-   :strict?    true|false  ; default true on JVM to catch cross-thread access
-   :trace?     true|false
-   :schedule   nil | vector of selection decisions for interleaving}
+  {:initial-ms     0
+   :timer-order    :fifo | :seeded     ; how timers with same due-time are ordered
+   :rng-seed       42                  ; seed for all RNG (timer tie-breaking, :random selection)
+   :strict?        true|false          ; default true on JVM to catch cross-thread access
+   :trace?         true|false
+   :micro-schedule nil | vector        ; selection decisions for microtask interleaving}
 
   Note: strict? defaults to true on JVM to detect accidental non-determinism
   from cross-thread callbacks. On CLJS it's ignored (single-threaded)."
   ([]
    (make-scheduler {}))
-  ([{:keys [initial-ms policy seed strict? trace? schedule]
+  ([{:keys [initial-ms timer-order rng-seed strict? trace? micro-schedule]
      :or {initial-ms 0
-          policy :fifo
-          seed 0
+          timer-order :fifo
+          rng-seed 0
           strict? #?(:clj true :cljs false)
           trace? false
-          schedule nil}}]
+          micro-schedule nil}}]
    (->TestScheduler
     (atom {:now-ms (long initial-ms)
            :next-id 0
@@ -106,11 +106,11 @@
            :trace (when trace? [])
            ;; JVM-only "driver thread" captured lazily under strict mode
            :driver-thread #?(:clj nil :cljs ::na)
-           ;; interleaving: schedule index (consumed as used)
+           ;; interleaving: micro-schedule index (consumed as used)
            :schedule-idx 0
            ;; deterministic RNG state for :random selection (LCG)
-           :rng-state (long seed)})
-    policy (long seed) (boolean strict?) (boolean trace?) schedule)))
+           :rng-state (long rng-seed)})
+    timer-order (long rng-seed) (boolean strict?) (boolean trace?) micro-schedule)))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -249,8 +249,8 @@
               (let [now (:now-ms s)
                     at-ms (+ now (long delay-ms))
                     order id
-                    tie (case (:policy sched)
-                          :seeded (seeded-tie (:seed sched) order)
+                    tie (case (:timer-order sched)
+                          :seeded (seeded-tie (:rng-seed sched) order)
                             ;; default/fallback
                           order)
                     k [at-ms tie order id]
@@ -373,7 +373,7 @@
   "Get the current schedule decision and advance the index.
   Returns [decision new-state]."
   [^TestScheduler sched s]
-  (if-let [schedule (:schedule sched)]
+  (if-let [schedule (:micro-schedule sched)]
     (let [idx (:schedule-idx s)]
       (if (< idx (count schedule))
         [(nth schedule idx) (update s :schedule-idx inc)]
@@ -1419,7 +1419,7 @@
                    :or {trace? true
                         max-steps 100000
                         max-time-ms 60000}}]
-   (with-determinism [sched (make-scheduler {:schedule schedule :trace? trace?})]
+   (with-determinism [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
      (run sched task {:max-steps max-steps
                       :max-time-ms max-time-ms}))))
 
@@ -1463,7 +1463,7 @@
   [task-fn {:keys [test-seed schedule-length max-steps max-time-ms]
             :or {max-time-ms 60000}}]
   (let [schedule (seed->schedule test-seed schedule-length)
-        sched (make-scheduler {:schedule schedule :trace? true :seed test-seed})
+        sched (make-scheduler {:micro-schedule schedule :trace? true :rng-seed test-seed})
         result (binding [*scheduler* sched]
                  (try
                    {:value (run sched (task-fn) {:max-steps max-steps
@@ -1472,7 +1472,7 @@
                      {:error e})))]
     {:result result
      :seed test-seed
-     :schedule (trace->schedule (trace sched))
+     :micro-schedule (trace->schedule (trace sched))
      :trace (trace sched)}))
 
 (defn check-interleaving
@@ -1489,14 +1489,14 @@
   - :property    - (fn [result] boolean) - returns true if result is valid
   - :max-steps   - max scheduler steps per run (default 10000)
   - :max-time-ms - max virtual time per run (default 60000)
-  - :schedule-length - length of generated schedules (default 100)
+  - :schedule-length - length of generated micro-schedules (default 100)
 
   Returns on failure:
-  {:failure    {:value v} or {:error e}
-   :seed       seed used for this iteration
-   :schedule   schedule that caused failure
-   :trace      full trace (if trace? was true)
-   :iteration  which iteration failed}"
+  {:failure        {:value v} or {:error e}
+   :seed           seed used for this iteration
+   :micro-schedule schedule that caused failure (for replay)
+   :trace          full trace (if trace? was true)
+   :iteration      which iteration failed}"
   [task-fn {:keys [num-tests seed property max-steps max-time-ms schedule-length]
             :or {num-tests 100
                  max-steps 10000
@@ -1510,12 +1510,12 @@
                                              :schedule-length schedule-length
                                              :max-steps max-steps
                                              :max-time-ms max-time-ms})
-              {:keys [result seed schedule trace]} run-result]
+              {:keys [result seed micro-schedule trace]} run-result]
           (if (or (:error result)
                   (and property (not (property (:value result)))))
             {:failure result
              :seed seed
-             :schedule schedule
+             :micro-schedule micro-schedule
              :trace trace
              :iteration i}
             (recur (inc i))))))))
@@ -1529,12 +1529,12 @@
   Options:
   - :num-samples     - number of different schedules to try (default 100)
   - :seed            - base seed for schedule generation
-  - :schedule-length - length of generated schedules (default 100)
+  - :schedule-length - length of generated micro-schedules (default 100)
   - :max-steps       - max scheduler steps per run (default 10000)
 
   Returns:
   {:unique-results - count of distinct results seen
-   :results        - vector of {:result r :schedule s} maps}"
+   :results        - vector of {:result r :micro-schedule s} maps}"
   [task-fn {:keys [num-samples seed schedule-length max-steps]
             :or {num-samples 100
                  schedule-length 100
@@ -1549,7 +1549,7 @@
                             r (let [res (:result run-result)]
                                 (if (:error res) res (:value res)))]]
                   {:result r
-                   :schedule (:schedule run-result)})]
+                   :micro-schedule (:micro-schedule run-result)})]
     {:unique-results (count (distinct (map :result results)))
      :results (vec results)}))
 
