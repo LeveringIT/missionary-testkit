@@ -1036,7 +1036,7 @@
             (ensure-driver-thread! sched "subject transfer")
             (binding [*scheduler* sched
                       *in-scheduler* true]
-              (let [{:keys [ready? terminated? cancelled? failed pending queue closed?]} @st]
+              (let [{:keys [ready? terminated? cancelled? failed pending]} @st]
                 (when terminated?
                   (throw (mt-ex illegal-transfer sched "Transfer after termination." {:label label})))
                 (when-not ready?
@@ -1495,7 +1495,7 @@
   Notes:
   - If :timeout-ms is provided, wraps with mt/timeout and returns ::mt/timeout on expiry."
   ([flow] (collect flow {}))
-  ([flow {:keys [xf timeout-ms label]
+  ([flow {:keys [xf timeout-ms]
           :or {xf nil}}]
    (let [f (if xf (m/eduction xf flow) flow)
          t (m/reduce conj [] f)
