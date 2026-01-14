@@ -1069,3 +1069,109 @@
           ;; Fixed version should pass all interleavings
           (is (nil? failure)
               "Fixed version should pass all interleavings"))))))
+
+;; =============================================================================
+;; Yield Tests
+;; =============================================================================
+
+(deftest yield-test
+  (testing "yield completes immediately in production (no scheduler)"
+    ;; Without a scheduler bound, yield should complete synchronously
+    (let [result (atom nil)
+          task (mt/yield :done)]
+      (task (fn [v] (reset! result v)) (fn [_]))
+      (is (= :done @result))))
+
+  (testing "yield with nil result in production"
+    (let [result (atom :not-set)
+          task (mt/yield)]
+      (task (fn [v] (reset! result v)) (fn [_]))
+      (is (nil? @result))))
+
+  (testing "yield creates scheduling point in test mode"
+    (let [sched (mt/make-scheduler)
+          job (mt/start! sched
+                         (binding [mt/*scheduler* sched]
+                           (mt/yield :done))
+                         {:label "yield-test"})]
+      ;; Job should not be done yet - needs tick to process microtask
+      (is (not (mt/done? job)))
+      (is (= 1 (count (:microtasks (mt/pending sched)))))
+      (mt/tick! sched)
+      (is (mt/done? job))
+      (is (= :done (mt/result job)))))
+
+  (testing "yield with nil result in test mode"
+    (let [sched (mt/make-scheduler)
+          job (mt/start! sched
+                         (binding [mt/*scheduler* sched]
+                           (mt/yield))
+                         {})]
+      (mt/tick! sched)
+      (is (mt/done? job))
+      (is (nil? (mt/result job)))))
+
+  (testing "cancelled yield throws Cancelled"
+    (let [sched (mt/make-scheduler)
+          job (mt/start! sched
+                         (binding [mt/*scheduler* sched]
+                           (mt/yield :done))
+                         {:label "cancel-test"})]
+      (mt/cancel! job)
+      (mt/tick! sched)
+      (is (mt/done? job))
+      (is (thrown? Cancelled (mt/result job)))))
+
+  (testing "yield works with with-determinism macro"
+    (is (= :done
+           (mt/with-determinism [sched (mt/make-scheduler)]
+             (mt/run sched
+                     (m/sp (m/? (mt/yield :done))))))))
+
+  (testing "multiple yields create interleaving opportunities"
+    (let [order (atom [])]
+      (mt/with-determinism [sched (mt/make-scheduler {:schedule [:fifo :fifo :fifo :fifo]})]
+        (mt/run sched
+                (m/sp
+                 (m/? (m/join vector
+                              (m/sp
+                               (swap! order conj :a1)
+                               (m/? (mt/yield))
+                               (swap! order conj :a2))
+                              (m/sp
+                               (swap! order conj :b1)
+                               (m/? (mt/yield))
+                               (swap! order conj :b2)))))))
+      ;; With FIFO scheduling, order should be deterministic
+      (is (= 4 (count @order)))))
+
+  (testing "yield enables interleaving exploration"
+    ;; This test demonstrates that yield creates real scheduling points
+    ;; that check-interleaving can explore
+    (let [make-task (fn []
+                      (let [order (atom [])]
+                        (m/sp
+                         (m/? (m/join (fn [_ _] @order)
+                                      (m/sp
+                                       (swap! order conj :a)
+                                       (m/? (mt/yield))
+                                       (swap! order conj :a2))
+                                      (m/sp
+                                       (swap! order conj :b)
+                                       (m/? (mt/yield))
+                                       (swap! order conj :b2)))))))
+          exploration (mt/with-determinism [_ (mt/make-scheduler)]
+                        (mt/explore-interleavings make-task
+                                                  {:num-samples 50
+                                                   :seed 12345}))]
+      ;; Should find multiple unique orderings due to yield points
+      (is (> (:unique-results exploration) 1)
+          "Yield should create multiple possible execution orders")))
+
+  (testing "yield is traced when tracing enabled"
+    (mt/with-determinism [sched (mt/make-scheduler {:trace? true})]
+      (mt/run sched (m/sp (m/? (mt/yield :done))))
+      (let [trace (mt/trace sched)]
+        (is (vector? trace))
+        (is (some #(= :yield (:kind %)) trace)
+            "Trace should contain yield events")))))

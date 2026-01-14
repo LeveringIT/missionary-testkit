@@ -230,6 +230,31 @@ Enable tracing to see exactly what happened:
 
 missionary-testkit can explore different task interleavings to find race conditions and concurrency bugs.
 
+### Yield Points
+
+Use `mt/yield` to create scheduling points that allow other tasks to interleave. Unlike `m/sleep`, yield does nothing in production - it only creates interleaving opportunities during testing:
+
+```clojure
+;; In production: completes immediately, returns :done
+(m/? (mt/yield :done))
+
+;; In tests: creates a scheduling point where other tasks can run
+(mt/with-determinism [sched (mt/make-scheduler)]
+  (let [order (atom [])]
+    (mt/run sched
+      (m/sp
+        (m/? (m/join vector
+               (m/sp (swap! order conj :a1) (m/? (mt/yield)) (swap! order conj :a2))
+               (m/sp (swap! order conj :b1) (m/? (mt/yield)) (swap! order conj :b2))))
+        @order))))
+;; Different schedules can produce [:a1 :b1 :a2 :b2], [:a1 :b1 :b2 :a2], etc.
+```
+
+This is useful for:
+- Testing concurrent code under different task orderings
+- Creating explicit interleaving points without artificial time delays
+- Code that should be order-independent in production but needs interleaving testing
+
 ### Finding Bugs with check-interleaving
 
 ```clojure
@@ -369,6 +394,7 @@ The scheduler automatically detects common problems:
 ### Virtual Time Primitives
 - `(mt/sleep ms)` / `(mt/sleep ms x)` - virtual sleep task
 - `(mt/timeout task ms)` / `(mt/timeout task ms x)` - virtual timeout wrapper
+- `(mt/yield)` / `(mt/yield x)` - yield point for interleaving (no-op in production)
 
 ### Utilities
 - `(collect flow)` / `(collect flow opts)` - collect flow to vector task
@@ -404,6 +430,7 @@ The testkit virtualizes **time-based primitives** only:
 |-----------|-------------|-------|
 | `m/sleep` | Yes | Uses virtual time |
 | `m/timeout` | Yes | Uses virtual time |
+| `mt/yield` | Yes | Scheduling point in tests, no-op in production |
 | `m/cpu` | Yes (JVM) | Deterministic executor |
 | `m/blk` | Yes (JVM) | Deterministic executor |
 | `m/race`, `m/join`, `m/amb=` | No (not needed) | Pure combinators, work correctly with virtualized primitives |

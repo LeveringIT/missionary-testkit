@@ -97,6 +97,7 @@ Task completes  → result delivered via microtask (deterministic ordering)
 ### Virtual Time Primitives
 - `(sleep ms)` / `(sleep ms x)` → task (requires `*scheduler*` binding)
 - `(timeout task ms)` / `(timeout task ms x)` → task
+- `(yield)` / `(yield x)` → task (no-op in production, scheduling point in tests)
 
 ### Integration
 - `(with-determinism [sched expr] & body)` → macro, rebinds `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`
@@ -247,9 +248,10 @@ clojure -T:build deploy
 
 ## Test Coverage
 
-26 tests, 125 assertions covering:
+31 tests, 158 assertions covering:
 - Scheduler creation and time control
 - Sleep and timeout behavior
+- Yield (production no-op, test scheduling point)
 - Job lifecycle
 - Subject (discrete flow)
 - State (continuous flow)

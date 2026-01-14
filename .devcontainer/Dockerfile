@@ -34,6 +34,8 @@ RUN sudo apt-get update && \
 # Prepare Claude state dir and persist ~/.claude.json by symlinking it into ~/.claude/
 # (so we only need to volume-mount ~/.claude, not the whole home directory)
 RUN mkdir -p /home/vscode/.claude \
+  && mkdir -p /home/vscode/.claude/local \
+  && ln -s /home/vscode/.local/bin/claude claude \
   && chown -R vscode:vscode /home/vscode/.claude \
   && ln -sf /home/vscode/.claude/claude.json /home/vscode/.claude.json \
   && chown -h vscode:vscode /home/vscode/.claude.json
@@ -42,6 +44,8 @@ RUN mkdir -p /home/vscode/.claude \
 USER vscode
 ENV PATH="/home/vscode/.local/bin:${PATH}"
 RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN git clone https://github.com/reifying/untethered.git
+
 
 # Back to a normal working directory
 WORKDIR /workspaces

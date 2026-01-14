@@ -578,6 +578,59 @@
   #?(:clj (Cancelled.)
      :cljs (Cancelled.)))
 
+(defn yield
+  "Yield point task for testing interleavings.
+
+  (mt/yield)
+  (mt/yield x)
+
+  In production (no scheduler bound): completes immediately with x (or nil).
+  In test mode (scheduler bound): creates a scheduling point that allows
+  other concurrent tasks to interleave, then completes with x.
+
+  This is useful for:
+  - Testing concurrent code under different task orderings
+  - Creating explicit interleaving points without time delays
+  - Simulating cooperative multitasking yield points
+
+  Example:
+    ;; In production, this just returns :done immediately
+    (m/? (mt/yield :done))
+
+    ;; In tests with check-interleaving, different orderings are explored
+    (mt/check-interleaving
+      (fn []
+        (let [result (atom [])]
+          (m/sp
+            (m/? (m/join vector
+                   (m/sp (swap! result conj :a) (m/? (mt/yield)) (swap! result conj :a2))
+                   (m/sp (swap! result conj :b) (m/? (mt/yield)) (swap! result conj :b2))))
+            @result)))
+      {:property (fn [r] (= 4 (count r)))})"
+  ([] (yield nil))
+  ([x]
+   (fn [s f]
+     (if-let [sched *scheduler*]
+       ;; Test mode: create a scheduling point via microtask
+       (let [done? (atom false)]
+         (enqueue-microtask!
+          sched
+          (fn []
+            (when (compare-and-set! done? false true)
+              (s x)))
+          {:kind :yield
+           :label "yield"})
+         (fn cancel []
+           (when (compare-and-set! done? false true)
+             (enqueue-microtask! sched (fn [] (f (cancelled-ex)))
+                                 {:kind :yield/cancel
+                                  :label "yield-cancel"}))
+           nil))
+       ;; Production mode: complete immediately
+       (do
+         (s x)
+         (fn cancel [] nil))))))
+
 (defn sleep
   "Virtual sleep task.
 
