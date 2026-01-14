@@ -27,8 +27,8 @@
 
   "mounts": [
     "source=untethered-claude-state,target=/home/vscode/.claude,type=volume",
-    "source=untethered-voice-code-state,target=/home/vscode/.voice-code,type=volume",
-    "source=untethered-m2-cache,target=/home/vscode/.m2,type=volume"
+    "source=untethered-m2-cache,target=/home/vscode/.m2,type=volume",
+    "source=untethered-api-key,target=/home/vscode/.untethered,type=volume"
   ],
 
   "customizations": {

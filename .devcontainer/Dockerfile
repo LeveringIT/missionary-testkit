@@ -45,7 +45,12 @@ USER vscode
 ENV PATH="/home/vscode/.local/bin:${PATH}"
 RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN git clone https://github.com/reifying/untethered.git
-
+RUN mv untethered /home/vscode/untethered && chown -R vscode:vscode /home/vscode/untethered
+RUN mkdir -p /home/vscode/.untethered \
+  && chown -R vscode:vscode /home/vscode/.untethered \
+  && chmod 700 /home/vscode/.untethered \
+  && touch /home/vscode/.untethered/.keep
+RUN chown -R vscode:vscode /home/vscode/.m2
 
 # Back to a normal working directory
 WORKDIR /workspaces
