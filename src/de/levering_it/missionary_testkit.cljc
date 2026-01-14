@@ -386,7 +386,7 @@
           idle
           ;; Get schedule decision and select from queue
           (let [[decision s-with-idx] (get-schedule-decision sched s)
-                q-size (count (q->vec q))
+                q-size (count q) ; O(1) for PersistentQueue
                 ;; Only use schedule-based selection when queue has multiple items
                 [mt q'] (if (> q-size 1)
                           (select-from-queue q decision (:seed sched))
@@ -745,51 +745,43 @@
 ;; -----------------------------------------------------------------------------
 
 #?(:clj
-   (defn executor
-     "Deterministic java.util.concurrent.Executor. Enqueues runnables as scheduler microtasks."
-     [^TestScheduler sched]
+   (defn- make-executor
+     "Factory for deterministic executors. Enqueues runnables as scheduler microtasks."
+     [^TestScheduler sched lane label]
      (reify Executor
        (execute [_ runnable]
          (enqueue-microtask!
           sched
-          (fn []
-            (.run ^Runnable runnable))
+          (fn [] (.run ^Runnable runnable))
           {:kind :executor
-           :lane :default
-           :label "executor"})))))
+           :lane lane
+           :label label})))))
+
+#?(:clj
+   (defn executor
+     "Deterministic java.util.concurrent.Executor. Enqueues runnables as scheduler microtasks."
+     [sched]
+     (make-executor sched :default "executor")))
 
 #?(:cljs
    (defn executor [_]
      (throw (ex-info "mt/executor is JVM-only." {:mt/kind ::unsupported}))))
 
 #?(:clj
-   (defn cpu-executor [sched]
-     ;; single-lane by default; lane label retained for introspection/trace
-     (reify Executor
-       (execute [_ runnable]
-         (enqueue-microtask!
-          sched
-          (fn []
-            (.run ^Runnable runnable))
-          {:kind :executor
-           :lane :cpu
-           :label "cpu-executor"})))))
+   (defn cpu-executor
+     "Deterministic CPU executor for m/via. Lane :cpu retained for introspection/trace."
+     [sched]
+     (make-executor sched :cpu "cpu-executor")))
 
 #?(:cljs
    (defn cpu-executor [_]
      (throw (ex-info "mt/cpu-executor is JVM-only." {:mt/kind ::unsupported}))))
 
 #?(:clj
-   (defn blk-executor [sched]
-     (reify Executor
-       (execute [_ runnable]
-         (enqueue-microtask!
-          sched
-          (fn []
-            (.run ^Runnable runnable))
-          {:kind :executor
-           :lane :blk
-           :label "blk-executor"})))))
+   (defn blk-executor
+     "Deterministic blocking executor for m/via. Lane :blk retained for introspection/trace."
+     [sched]
+     (make-executor sched :blk "blk-executor")))
 
 #?(:cljs
    (defn blk-executor [_]
@@ -1360,6 +1352,28 @@
 ;; Interleaving: test helpers
 ;; -----------------------------------------------------------------------------
 
+(defn- default-base-seed []
+  #?(:clj (System/currentTimeMillis)
+     :cljs (.getTime (js/Date.))))
+
+(defn- run-with-schedule
+  "Run task-fn once with a generated schedule. Returns map with result info.
+  Internal helper for check-interleaving and explore-interleavings."
+  [task-fn {:keys [test-seed schedule-length max-steps max-time-ms]
+            :or {max-time-ms 60000}}]
+  (let [schedule (seed->schedule test-seed schedule-length)
+        sched (make-scheduler {:schedule schedule :trace? true :seed test-seed})
+        result (binding [*scheduler* sched]
+                 (try
+                   {:value (run sched (task-fn) {:max-steps max-steps
+                                                 :max-time-ms max-time-ms})}
+                   (catch #?(:clj Throwable :cljs :default) e
+                     {:error e})))]
+    {:result result
+     :seed test-seed
+     :schedule (trace->schedule (trace sched))
+     :trace (trace sched)}))
+
 (defn check-interleaving
   "Run a task with many different interleavings to find failures.
   Returns nil if all pass, or a map with failure info including the schedule
@@ -1387,25 +1401,21 @@
                  max-steps 10000
                  max-time-ms 60000
                  schedule-length 100}}]
-  (let [base-seed (or seed #?(:clj (System/currentTimeMillis)
-                              :cljs (.getTime (js/Date.))))]
+  (let [base-seed (or seed (default-base-seed))]
     (loop [i 0]
       (when (< i num-tests)
-        (let [test-seed (+ base-seed i)
-              schedule (seed->schedule test-seed schedule-length)
-              sched (make-scheduler {:schedule schedule :trace? true :seed test-seed})
-              result (binding [*scheduler* sched]
-                       (try
-                         {:value (run sched (task-fn) {:max-steps max-steps
-                                                       :max-time-ms max-time-ms})}
-                         (catch #?(:clj Throwable :cljs :default) e
-                           {:error e})))]
+        (let [run-result (run-with-schedule task-fn
+                                            {:test-seed (+ base-seed i)
+                                             :schedule-length schedule-length
+                                             :max-steps max-steps
+                                             :max-time-ms max-time-ms})
+              {:keys [result seed schedule trace]} run-result]
           (if (or (:error result)
                   (and property (not (property (:value result)))))
             {:failure result
-             :seed test-seed
-             :schedule (trace->schedule (trace sched))
-             :trace (trace sched)
+             :seed seed
+             :schedule schedule
+             :trace trace
              :iteration i}
             (recur (inc i))))))))
 
@@ -1428,21 +1438,17 @@
             :or {num-samples 100
                  schedule-length 100
                  max-steps 10000}}]
-  (let [base-seed (or seed #?(:clj (System/currentTimeMillis)
-                              :cljs (.getTime (js/Date.))))
+  (let [base-seed (or seed (default-base-seed))
         results (for [i (range num-samples)
-                      :let [test-seed (+ base-seed i)
-                            schedule (seed->schedule test-seed schedule-length)
-                            sched (make-scheduler {:schedule schedule
-                                                   :trace? true
-                                                   :seed test-seed})
-                            r (binding [*scheduler* sched]
-                                (try
-                                  (run sched (task-fn) {:max-steps max-steps})
-                                  (catch #?(:clj Throwable :cljs :default) e
-                                    {:error e})))]]
+                      :let [run-result (run-with-schedule task-fn
+                                                          {:test-seed (+ base-seed i)
+                                                           :schedule-length schedule-length
+                                                           :max-steps max-steps})
+                            ;; Extract value or return error map
+                            r (let [res (:result run-result)]
+                                (if (:error res) res (:value res)))]]
                   {:result r
-                   :schedule (trace->schedule (trace sched))})]
+                   :schedule (:schedule run-result)})]
     {:unique-results (count (distinct (map :result results)))
      :results (vec results)}))
 
