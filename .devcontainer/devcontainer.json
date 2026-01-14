@@ -1,0 +1,43 @@
+{
+  "name": "untethered + claude-code + clojure (sandboxed)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+			"BASE_IMAGE": "temurin-21-tools-deps-jammy",
+		}
+  },
+  "remoteUser": "vscode",
+
+  "runArgs": [
+    "--init",
+    "--cap-drop=ALL",
+    "--security-opt",
+    "no-new-privileges:true",
+    "-p",
+    "8090:8080"
+  ],
+
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {
+      "label": "untethered backend server",
+      "onAutoForward": "notify"
+    }
+  },
+
+  "mounts": [
+    "source=untethered-claude-state,target=/home/vscode/.claude,type=volume",
+    "source=untethered-voice-code-state,target=/home/vscode/.voice-code,type=volume",
+    "source=untethered-m2-cache,target=/home/vscode/.m2,type=volume"
+  ],
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "betterthantomorrow.calva"
+      ]
+    }
+  },
+
+  "postCreateCommand": "clojure -Ttools install-latest :lib io.github.bhauman/clojure-mcp :as mcp && claude mcp add clojure-mcp -- clojure -Tmcp start :config-profile :cli-assist && clojure -P && echo 'Devcontainer ready. Run: claude (login) then clojure -M -m voice-code.server '"
+}
