@@ -108,22 +108,22 @@ Task completes  → result delivered via microtask (deterministic ordering)
 
 ### Interleaving (Concurrency Bug Testing)
 - `(trace->schedule trace)` → vector of selection decisions from trace
-- `(replay-schedule task schedule)` / `(replay-schedule task schedule opts)` → runs task with exact schedule
-- `(seed->schedule seed n)` → deterministically generates schedule of length n
+- `(replay-schedule task schedule)` / `(replay-schedule task schedule opts)` → runs task with exact schedule (task created inside `with-determinism`)
+- `(seed->schedule seed n)` → deterministically generates schedule of length n (cross-platform consistent LCG)
 - `(check-interleaving task-fn opts)` → runs task-fn with many interleavings, returns nil or failure info
 - `(explore-interleavings task-fn opts)` → explores interleavings, returns {:unique-results n :results [...]}
 - `(selection-gen)` → test.check generator for single selection decision
 - `(schedule-gen max-decisions)` → test.check generator for schedule vector
 
 Note: `check-interleaving` and `explore-interleavings` take a task-fn (0-arg function returning a task)
-to ensure fresh state for each iteration.
+to ensure fresh state for each iteration. `replay-schedule` takes a task directly.
 
 ## Dynamic Vars
 
 | Var | Purpose |
 |-----|---------|
 | `*scheduler*` | Currently bound TestScheduler. Required by `sleep`/`timeout`. |
-| `*in-scheduler*` | true while executing scheduler-driven work |
+| `*is-deterministic*` | true when inside `with-determinism` scope |
 
 ## Error Keywords (`:mt/kind` in ex-data)
 
@@ -237,7 +237,15 @@ clojure -T:build deploy
 ### Thread Safety (JVM)
 - Scheduler state is in an atom (thread-safe reads)
 - With `strict? true`, only one thread may drive (step/tick/advance/run/transfer)
-- Enqueuing from other threads is allowed even in strict mode
+- Off-thread callbacks in strict mode fail the job directly with `::off-scheduler-callback`
+- `run*` rechecks `done?` before throwing deadlock to handle off-thread callback race conditions
+
+### m/via Behavior
+- `m/via m/cpu` and `m/via m/blk` run synchronously on driver thread (executors rebound)
+- Real executors cause off-thread callbacks that break determinism
+- When via is cancelled before tick, via body runs with interrupt flag set
+- Blocking calls in cancelled via throw `InterruptedException`
+- Interrupt flag is cleared after via body completes (scheduler remains usable)
 
 ## Cross-Platform Notes
 
@@ -248,7 +256,7 @@ clojure -T:build deploy
 
 ## Test Coverage
 
-31 tests, 158 assertions covering:
+35 tests, 190 assertions covering:
 - Scheduler creation and time control
 - Sleep and timeout behavior
 - Yield (production no-op, test scheduling point)
@@ -259,6 +267,7 @@ clojure -T:build deploy
 - with-determinism macro
 - run budgets and deadlock detection
 - Executor operations
+- m/via with virtualized executors (interrupt behavior, cancellation)
 - Error handling
 - Interleaving (schedule selection, trace extraction, replay, check/explore)
 

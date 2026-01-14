@@ -366,11 +366,12 @@ This is useful for:
 When `check-interleaving` finds a bug, you can replay the exact schedule:
 
 ```clojure
-;; Replay the failing case (pass task-fn, not a task!)
-(mt/replay-schedule make-buggy-task (:micro-schedule result))
+;; Replay the failing case - create the task inside with-determinism
+(mt/with-determinism
+  (mt/replay-schedule (make-buggy-task) (:micro-schedule result)))
 ```
 
-**Note:** `replay-schedule` takes a task-fn (0-arg function returning a task), not a task itself. This ensures the task is created inside the deterministic context.
+**Note:** `replay-schedule` takes a task directly. The task must be created inside `with-determinism` to ensure virtual time primitives are properly rebound.
 
 ### Exploring All Outcomes
 
@@ -483,18 +484,20 @@ The scheduler automatically detects common problems:
 - `(blk-executor)` - deterministic blocking executor (requires `*scheduler*` bound)
 
 ### Dynamic Vars
-- `*scheduler*` - the current TestScheduler (bound automatically by `with-determinism`)
+- `*scheduler*` - the current TestScheduler (bound by `with-scheduler`)
 - `*is-deterministic*` - `true` when inside `with-determinism` scope
 
-### Integration Macro
-- `(with-determinism [sched expr] & body)` - rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`, bind `*scheduler*` and set `*is-deterministic*` to `true`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point))
+### Integration Macros
+- `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point))
+- `(with-scheduler [sched expr] & body)` - bind `*scheduler*` to `sched` for the body. Use inside `with-determinism`.
+- Legacy: `(with-determinism [sched expr] & body)` - combines both macros (still supported)
 
 ### Interleaving (Concurrency Testing)
 - `(check-interleaving task-fn opts)` - find failures across many interleavings (task-fn is a 0-arg function)
 - `(explore-interleavings task-fn opts)` - explore unique outcomes (task-fn is a 0-arg function)
-- `(replay-schedule task-fn schedule)` - replay exact execution order (task-fn is a 0-arg function)
+- `(replay-schedule task schedule)` - replay exact execution order (task created inside `with-determinism`)
 - `(trace->schedule trace)` - extract schedule from trace
-- `(seed->schedule seed n)` - generate schedule from seed
+- `(seed->schedule seed n)` - generate schedule from seed (cross-platform consistent)
 - `(selection-gen)` / `(schedule-gen n)` - test.check generators
 
 ## Running Tests
@@ -633,7 +636,29 @@ Missionary uses cooperative single-threaded execution by default. Tasks interlea
 2. **Task ordering** - Which ready task runs next (via schedule)
 3. **Built-in executors** - `m/cpu` and `m/blk` are rebound to deterministic executors
 
-Note: `m/via` with a custom executor is **not** automatically deterministic. Only `m/via m/cpu` and `m/via m/blk` are controlled because those executors are patched by `with-determinism`.
+### m/via Behavior
+
+`m/via m/cpu` and `m/via m/blk` work correctly because those executors are rebound by `with-determinism` to run work as scheduler microtasks. The via body executes synchronously on the driver thread.
+
+**Important:** Do NOT use real executors (e.g., `Executors/newFixedThreadPool`) inside `with-determinism` - they will cause off-thread callbacks that break determinism.
+
+**Interrupt behavior:** When a via task is cancelled before its microtask executes, the via body will run with `Thread.interrupted()` returning `true`. Blocking calls in the via body will throw `InterruptedException`. The interrupt flag is cleared after the via body completes, so the scheduler remains usable.
+
+```clojure
+;; CORRECT: m/via with virtualized executors
+(mt/with-determinism [sched (mt/make-scheduler)]
+  (mt/run sched
+    (m/sp
+      (m/? (m/via m/cpu (+ 1 2 3))))))  ; Works - runs on driver thread
+;; => 6
+
+;; WRONG: m/via with real executor
+(import '[java.util.concurrent Executors])
+(def real-exec (Executors/newSingleThreadExecutor))
+(mt/with-determinism [sched (mt/make-scheduler {:strict? true})]
+  (mt/run sched
+    (m/via real-exec (do-work))))  ; Fails - off-thread callback
+```
 
 ### Strict mode (JVM only)
 

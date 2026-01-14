@@ -61,37 +61,28 @@
 
 (deftest sleep-test
   (testing "sleep completes after virtual time advances"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/sleep 100 :done))
-                         {:label "sleep-test"})]
-      (is (not (mt/done? job)))
-      (is (= 1 (count (:timers (mt/pending sched)))))
-      (mt/advance-to! sched 100)
-      (is (mt/done? job))
-      (is (= :done (mt/result job)))))
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [job (mt/start! sched (mt/sleep 100 :done) {:label "sleep-test"})]
+        (is (not (mt/done? job)))
+        (is (= 1 (count (:timers (mt/pending sched)))))
+        (mt/advance-to! sched 100)
+        (is (mt/done? job))
+        (is (= :done (mt/result job))))))
 
   (testing "sleep with nil result"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/sleep 50))
-                         {})]
-      (mt/advance-to! sched 50)
-      (is (mt/done? job))
-      (is (nil? (mt/result job)))))
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [job (mt/start! sched (mt/sleep 50) {})]
+        (mt/advance-to! sched 50)
+        (is (mt/done? job))
+        (is (nil? (mt/result job))))))
 
   (testing "cancelled sleep throws Cancelled"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/sleep 100 :done))
-                         {:label "cancel-test"})]
-      (mt/cancel! job)
-      (mt/tick! sched)
-      (is (mt/done? job))
-      (is (thrown? Cancelled (mt/result job))))))
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [job (mt/start! sched (mt/sleep 100 :done) {:label "cancel-test"})]
+        (mt/cancel! job)
+        (mt/tick! sched)
+        (is (mt/done? job))
+        (is (thrown? Cancelled (mt/result job)))))))
 
 ;; =============================================================================
 ;; Timeout Tests
@@ -99,45 +90,39 @@
 
 (deftest timeout-test
   (testing "timeout passes through when inner task completes first"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/timeout (mt/sleep 50 :inner) 100 :timed-out))
-                         {:label "timeout-pass"})]
-      (mt/advance-to! sched 50)
-      (is (mt/done? job))
-      (is (= :inner (mt/result job)))))
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [job (mt/start! sched
+                           (mt/timeout (mt/sleep 50 :inner) 100 :timed-out)
+                           {:label "timeout-pass"})]
+        (mt/advance-to! sched 50)
+        (is (mt/done? job))
+        (is (= :inner (mt/result job))))))
 
   (testing "timeout fires when inner task takes too long"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/timeout (mt/sleep 200 :inner) 100 :timed-out))
-                         {:label "timeout-fire"})]
-      (mt/advance-to! sched 100)
-      (is (mt/done? job))
-      (is (= :timed-out (mt/result job)))))
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [job (mt/start! sched
+                           (mt/timeout (mt/sleep 200 :inner) 100 :timed-out)
+                           {:label "timeout-fire"})]
+        (mt/advance-to! sched 100)
+        (is (mt/done? job))
+        (is (= :timed-out (mt/result job))))))
 
   (testing "timeout with nil fallback"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/timeout (mt/sleep 200 :inner) 100))
-                         {})]
-      (mt/advance-to! sched 100)
-      (is (mt/done? job))
-      (is (nil? (mt/result job)))))
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [job (mt/start! sched (mt/timeout (mt/sleep 200 :inner) 100) {})]
+        (mt/advance-to! sched 100)
+        (is (mt/done? job))
+        (is (nil? (mt/result job))))))
 
   (testing "cancelling timeout cancels inner and throws Cancelled"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/timeout (mt/sleep 200 :inner) 100 :timed-out))
-                         {:label "timeout-cancel"})]
-      (mt/cancel! job)
-      (mt/tick! sched)
-      (is (mt/done? job))
-      (is (thrown? Cancelled (mt/result job))))))
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [job (mt/start! sched
+                           (mt/timeout (mt/sleep 200 :inner) 100 :timed-out)
+                           {:label "timeout-cancel"})]
+        (mt/cancel! job)
+        (mt/tick! sched)
+        (is (mt/done? job))
+        (is (thrown? Cancelled (mt/result job)))))))
 
 ;; =============================================================================
 ;; Job Management Tests
@@ -145,13 +130,10 @@
 
 (deftest job-lifecycle-test
   (testing "job starts pending"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/sleep 100 :done))
-                         {})]
-      (is (not (mt/done? job)))
-      (is (= ::mt/pending (mt/result job)))))
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [job (mt/start! sched (mt/sleep 100 :done) {})]
+        (is (not (mt/done? job)))
+        (is (= ::mt/pending (mt/result job))))))
 
   (testing "job success"
     (let [sched (mt/make-scheduler)
@@ -486,34 +468,93 @@
 
 (deftest executor-test
   (testing "executor runs runnables as microtasks"
-    (let [sched (mt/make-scheduler)
-          result (atom nil)]
-      (binding [mt/*scheduler* sched]
-        (let [exec (mt/executor)]
-          (.execute exec (fn [] (reset! result :executed)))
-          (is (nil? @result))
-          (mt/tick! sched)
-          (is (= :executed @result))))))
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [result (atom nil)
+            exec (mt/executor)]
+        (.execute exec (fn [] (reset! result :executed)))
+        (is (nil? @result))
+        (mt/tick! sched)
+        (is (= :executed @result)))))
 
   (testing "cpu-executor runs on cpu lane"
-    (let [sched (mt/make-scheduler {:trace? true})
-          result (atom nil)]
-      (binding [mt/*scheduler* sched]
-        (let [exec (mt/cpu-executor)]
-          (.execute exec (fn [] (reset! result :cpu-done)))
-          (mt/tick! sched)
-          (is (= :cpu-done @result))
-          (is (some #(= :cpu (:lane %)) (mt/trace sched)))))))
+    (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
+      (let [result (atom nil)
+            exec (mt/cpu-executor)]
+        (.execute exec (fn [] (reset! result :cpu-done)))
+        (mt/tick! sched)
+        (is (= :cpu-done @result))
+        (is (some #(= :cpu (:lane %)) (mt/trace sched))))))
 
   (testing "blk-executor runs on blk lane"
-    (let [sched (mt/make-scheduler {:trace? true})
-          result (atom nil)]
-      (binding [mt/*scheduler* sched]
-        (let [exec (mt/blk-executor)]
-          (.execute exec (fn [] (reset! result :blk-done)))
+    (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
+      (let [result (atom nil)
+            exec (mt/blk-executor)]
+        (.execute exec (fn [] (reset! result :blk-done)))
+        (mt/tick! sched)
+        (is (= :blk-done @result))
+        (is (some #(= :blk (:lane %)) (mt/trace sched)))))))
+
+;; =============================================================================
+;; m/via with Virtualized Executors
+;; =============================================================================
+
+(deftest via-with-virtualized-executors-test
+  (testing "m/via m/cpu runs deterministically on driver thread"
+    (mt/with-determinism [sched (mt/make-scheduler {:trace? true})]
+      (let [thread-id (atom nil)
+            driver-thread (Thread/currentThread)
+            result (mt/run sched
+                           (m/sp
+                            (m/? (m/via m/cpu
+                                        (reset! thread-id (Thread/currentThread))
+                                        (+ 1 2 3)))))]
+        (is (= 6 result))
+        (is (= driver-thread @thread-id)
+            "via body should run on driver thread"))))
+
+  (testing "m/via m/blk runs deterministically"
+    (mt/with-determinism [sched (mt/make-scheduler {:trace? true})]
+      (let [result (mt/run sched
+                           (m/sp
+                            (m/? (m/via m/blk
+                                        (* 2 3 4)))))]
+        (is (= 24 result)))))
+
+  (testing "cancelled via before tick sees interrupt flag"
+    (mt/with-determinism [sched (mt/make-scheduler)]
+      (let [saw-interrupt (atom false)
+            job (mt/start! sched
+                          (m/via m/cpu
+                                 (reset! saw-interrupt (.isInterrupted (Thread/currentThread)))
+                                 :done)
+                          {})]
+        (mt/cancel! job)
+        (mt/tick! sched)
+        (is @saw-interrupt "via body should see interrupt flag when cancelled before tick"))))
+
+  (testing "scheduler remains usable after cancelled via"
+    (mt/with-determinism [sched (mt/make-scheduler)]
+      (let [job1 (mt/start! sched (m/via m/cpu :done1) {})]
+        (mt/cancel! job1)
+        (mt/tick! sched)
+        ;; Start another job - should work fine
+        (let [job2 (mt/start! sched (m/via m/cpu :done2) {})]
           (mt/tick! sched)
-          (is (= :blk-done @result))
-          (is (some #(= :blk (:lane %)) (mt/trace sched))))))))
+          (is (= :done2 (mt/result job2)))
+          (is (not (.isInterrupted (Thread/currentThread)))
+              "driver thread should not be left interrupted")))))
+
+  (testing "via with blocking call throws InterruptedException when cancelled"
+    (mt/with-determinism [sched (mt/make-scheduler)]
+      (let [job (mt/start! sched
+                          (m/via m/cpu
+                                 (Thread/sleep 100)
+                                 :done)
+                          {})]
+        (mt/cancel! job)
+        (mt/tick! sched)
+        (is (mt/done? job))
+        (is (thrown? InterruptedException (mt/result job)))))))
 
 ;; =============================================================================
 ;; Edge Cases and Error Handling
@@ -644,25 +685,25 @@
 
   (testing ":random selection is deterministic in check-interleaving"
     ;; Verify that check-interleaving replay works correctly with :random
-    (let [make-task (fn []
-                      (let [order (atom [])]
-                        (m/sp
-                         (m/? (m/join (fn [& _] @order)
-                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :a))
-                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :b))
-                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :c)))))))
-          ;; Run with a seed that generates :random decisions
-          exploration (mt/with-determinism [_ (mt/make-scheduler)]
-                        (mt/explore-interleavings make-task {:num-samples 20
-                                                              :seed 12345}))]
-      ;; Should produce deterministic results - same seeds always give same outcomes
-      (is (pos? (:unique-results exploration)))
+    (mt/with-determinism
+      (let [make-task (fn []
+                        (let [order (atom [])]
+                          (m/sp
+                           (m/? (m/join (fn [& _] @order)
+                                        (m/sp (m/? (m/sleep 0)) (swap! order conj :a))
+                                        (m/sp (m/? (m/sleep 0)) (swap! order conj :b))
+                                        (m/sp (m/? (m/sleep 0)) (swap! order conj :c)))))))
+            ;; Run with a seed that generates :random decisions
+            exploration (mt/explore-interleavings make-task {:num-samples 20
+                                                              :seed 12345})]
+        ;; Should produce deterministic results - same seeds always give same outcomes
+        (is (pos? (:unique-results exploration)))
 
-      ;; Replay should give same result
-      (when-let [first-result (first (:results exploration))]
-        (let [replayed (mt/replay-schedule make-task (:micro-schedule first-result))]
-          (is (= (:result first-result) replayed)
-              "Replaying schedule should produce same result")))))
+        ;; Replay should give same result
+        (when-let [first-result (first (:results exploration))]
+          (let [replayed (mt/replay-schedule (make-task) (:micro-schedule first-result))]
+            (is (= (:result first-result) replayed)
+                "Replaying schedule should produce same result"))))))
 
   (testing "schedule consumption only at branch points, not single-item steps"
     ;; This test verifies that schedule decisions are only consumed when there's
@@ -694,7 +735,7 @@
           (is (vector? extracted-schedule))
 
           ;; Replay with extracted schedule should give identical result
-          (let [result2 (mt/replay-schedule make-task extracted-schedule)]
+          (let [result2 (mt/replay-schedule (make-task) extracted-schedule)]
             (is (= result1 result2)
                 "Replaying extracted schedule should reproduce exact same result")))))))
 
@@ -895,34 +936,36 @@
 
 (deftest replay-schedule-test
   (testing "replay produces same result with same schedule"
-    ;; replay-schedule takes a task-fn, not a task, to ensure creation inside with-determinism
-    (let [make-task (fn []
-                      (m/sp
-                       (m/? (m/join +
-                                    (m/sleep 0 1)
-                                    (m/sleep 0 2)
-                                    (m/sleep 0 3)))))
-          schedule [:fifo :fifo :fifo :fifo :fifo :fifo]
-          r1 (mt/replay-schedule make-task schedule)
-          r2 (mt/replay-schedule make-task schedule)]
-      (is (= r1 r2))))
+    ;; replay-schedule takes a task, which should be created inside with-determinism
+    (mt/with-determinism
+      (let [make-task (fn []
+                        (m/sp
+                         (m/? (m/join +
+                                      (m/sleep 0 1)
+                                      (m/sleep 0 2)
+                                      (m/sleep 0 3)))))
+            schedule [:fifo :fifo :fifo :fifo :fifo :fifo]
+            r1 (mt/replay-schedule (make-task) schedule)
+            r2 (mt/replay-schedule (make-task) schedule)]
+        (is (= r1 r2)))))
 
   (testing "different schedules can produce different results"
     ;; This test uses a task where order matters
-    (let [;; Task factory that records execution order (fresh atom each time)
-          make-task (fn []
-                      (let [order (atom [])]
-                        (m/sp
-                         (m/? (m/join (fn [& args] @order)
-                                      (m/sp (swap! order conj :a) :a)
-                                      (m/sp (swap! order conj :b) :b)
-                                      (m/sp (swap! order conj :c) :c))))))]
-      ;; Run with different schedules
-      (let [r1 (mt/replay-schedule make-task [:fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo])
-            r2 (mt/replay-schedule make-task [:lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo])]
-        ;; Results should be vectors of the recorded order
-        (is (vector? r1))
-        (is (vector? r2))))))
+    (mt/with-determinism
+      (let [;; Task factory that records execution order (fresh atom each time)
+            make-task (fn []
+                        (let [order (atom [])]
+                          (m/sp
+                           (m/? (m/join (fn [& args] @order)
+                                        (m/sp (swap! order conj :a) :a)
+                                        (m/sp (swap! order conj :b) :b)
+                                        (m/sp (swap! order conj :c) :c))))))]
+        ;; Run with different schedules
+        (let [r1 (mt/replay-schedule (make-task) [:fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo])
+              r2 (mt/replay-schedule (make-task) [:lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo])]
+          ;; Results should be vectors of the recorded order
+          (is (vector? r1))
+          (is (vector? r2)))))))
 
 (deftest seed->schedule-test
   (testing "generates schedule of correct length"
@@ -944,7 +987,7 @@
 
 (deftest check-interleaving-test
   (testing "returns nil when all tests pass"
-    (mt/with-determinism [_ (mt/make-scheduler)]
+    (mt/with-determinism
       (let [task-fn (fn [] (m/sp (m/? (m/sleep 10 :done))))
             result (mt/check-interleaving task-fn {:num-tests 10
                                                    :seed 42
@@ -952,32 +995,34 @@
         (is (nil? result)))))
 
   (testing "returns failure info when property fails"
-    ;; Task factory creates fresh atom each time
-    (let [make-task (fn []
-                      (let [counter (atom 0)]
-                        (m/sp
-                         (swap! counter inc)
-                         @counter)))
-          ;; Property that always fails (counter will be 1)
-          result (mt/check-interleaving make-task {:num-tests 10
-                                                   :seed 42
-                                                   :property (fn [v] (= v 0))})] ; fails: counter is 1
-      (when result
-        (is (map? result))
-        (is (contains? result :failure))
-        (is (contains? result :seed))
-        (is (contains? result :micro-schedule))
-        (is (contains? result :iteration)))))
+    (mt/with-determinism
+      ;; Task factory creates fresh atom each time
+      (let [make-task (fn []
+                        (let [counter (atom 0)]
+                          (m/sp
+                           (swap! counter inc)
+                           @counter)))
+            ;; Property that always fails (counter will be 1)
+            result (mt/check-interleaving make-task {:num-tests 10
+                                                     :seed 42
+                                                     :property (fn [v] (= v 0))})] ; fails: counter is 1
+        (when result
+          (is (map? result))
+          (is (contains? result :failure))
+          (is (contains? result :seed))
+          (is (contains? result :micro-schedule))
+          (is (contains? result :iteration))))))
 
   (testing "returns failure info when task throws"
-    (let [task-fn (fn [] (m/sp (throw (ex-info "intentional failure" {}))))
-          result (mt/check-interleaving task-fn {:num-tests 5 :seed 42})]
-      (is (map? result))
-      (is (contains? (:failure result) :error)))))
+    (mt/with-determinism
+      (let [task-fn (fn [] (m/sp (throw (ex-info "intentional failure" {}))))
+            result (mt/check-interleaving task-fn {:num-tests 5 :seed 42})]
+        (is (map? result))
+        (is (contains? (:failure result) :error))))))
 
 (deftest explore-interleavings-test
   (testing "explores multiple schedules"
-    (mt/with-determinism [_ (mt/make-scheduler)]
+    (mt/with-determinism
       (let [task-fn (fn [] (m/sp (m/? (m/sleep 10 :done))))
             result (mt/explore-interleavings task-fn {:num-samples 5
                                                       :seed 42})]
@@ -987,14 +1032,15 @@
         (is (= 5 (count (:results result)))))))
 
   (testing "counts unique results correctly"
-    ;; Task factory that always returns same value
-    (let [task-fn (fn [] (m/sp :constant))
-          result (mt/explore-interleavings task-fn {:num-samples 10
-                                                    :seed 42})]
-      (is (= 1 (:unique-results result)))))
+    (mt/with-determinism
+      ;; Task factory that always returns same value
+      (let [task-fn (fn [] (m/sp :constant))
+            result (mt/explore-interleavings task-fn {:num-samples 10
+                                                      :seed 42})]
+        (is (= 1 (:unique-results result))))))
 
   (testing "each result includes schedule"
-    (mt/with-determinism [_ (mt/make-scheduler)]
+    (mt/with-determinism
       (let [task-fn (fn [] (m/sp (m/? (m/sleep 0 :done))))
             result (mt/explore-interleavings task-fn {:num-samples 3 :seed 42})]
         (is (every? #(contains? % :micro-schedule) (:results result)))
@@ -1133,7 +1179,7 @@
                 "Failing result should not be the expected 12")
 
             ;; Replay should produce the same buggy result
-            (let [replayed (mt/replay-schedule make-buggy-task (:micro-schedule failure))]
+            (let [replayed (mt/replay-schedule (make-buggy-task) (:micro-schedule failure))]
               (is (= (get-in failure [:failure :value]) replayed)
                   "Replaying the schedule should reproduce the exact same bug")))))))
 
@@ -1183,38 +1229,32 @@
       (is (nil? @result))))
 
   (testing "yield creates scheduling point in test mode"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/yield :done))
-                         {:label "yield-test"})]
-      ;; Job should not be done yet - needs tick to process microtask
-      (is (not (mt/done? job)))
-      (is (= 1 (count (:microtasks (mt/pending sched)))))
-      (mt/tick! sched)
-      (is (mt/done? job))
-      (is (= :done (mt/result job)))))
+    (mt/with-determinism
+      (mt/with-scheduler [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched (mt/yield :done) {:label "yield-test"})]
+          ;; Job should not be done yet - needs tick to process microtask
+          (is (not (mt/done? job)))
+          (is (= 1 (count (:microtasks (mt/pending sched)))))
+          (mt/tick! sched)
+          (is (mt/done? job))
+          (is (= :done (mt/result job)))))))
 
   (testing "yield with nil result in test mode"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/yield))
-                         {})]
-      (mt/tick! sched)
-      (is (mt/done? job))
-      (is (nil? (mt/result job)))))
+    (mt/with-determinism
+      (mt/with-scheduler [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched (mt/yield) {})]
+          (mt/tick! sched)
+          (is (mt/done? job))
+          (is (nil? (mt/result job)))))))
 
   (testing "cancelled yield throws Cancelled"
-    (let [sched (mt/make-scheduler)
-          job (mt/start! sched
-                         (binding [mt/*scheduler* sched]
-                           (mt/yield :done))
-                         {:label "cancel-test"})]
-      (mt/cancel! job)
-      (mt/tick! sched)
-      (is (mt/done? job))
-      (is (thrown? Cancelled (mt/result job)))))
+    (mt/with-determinism
+      (mt/with-scheduler [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched (mt/yield :done) {:label "cancel-test"})]
+          (mt/cancel! job)
+          (mt/tick! sched)
+          (is (mt/done? job))
+          (is (thrown? Cancelled (mt/result job)))))))
 
   (testing "yield works with with-determinism macro"
     (is (= :done
@@ -1242,25 +1282,25 @@
   (testing "yield enables interleaving exploration"
     ;; This test demonstrates that yield creates real scheduling points
     ;; that check-interleaving can explore
-    (let [make-task (fn []
-                      (let [order (atom [])]
-                        (m/sp
-                         (m/? (m/join (fn [_ _] @order)
-                                      (m/sp
-                                       (swap! order conj :a)
-                                       (m/? (mt/yield))
-                                       (swap! order conj :a2))
-                                      (m/sp
-                                       (swap! order conj :b)
-                                       (m/? (mt/yield))
-                                       (swap! order conj :b2)))))))
-          exploration (mt/with-determinism [_ (mt/make-scheduler)]
-                        (mt/explore-interleavings make-task
+    (mt/with-determinism
+      (let [make-task (fn []
+                        (let [order (atom [])]
+                          (m/sp
+                           (m/? (m/join (fn [_ _] @order)
+                                        (m/sp
+                                         (swap! order conj :a)
+                                         (m/? (mt/yield))
+                                         (swap! order conj :a2))
+                                        (m/sp
+                                         (swap! order conj :b)
+                                         (m/? (mt/yield))
+                                         (swap! order conj :b2)))))))
+            exploration (mt/explore-interleavings make-task
                                                   {:num-samples 50
-                                                   :seed 12345}))]
-      ;; Should find multiple unique orderings due to yield points
-      (is (> (:unique-results exploration) 1)
-          "Yield should create multiple possible execution orders")))
+                                                   :seed 12345})]
+        ;; Should find multiple unique orderings due to yield points
+        (is (> (:unique-results exploration) 1)
+            "Yield should create multiple possible execution orders"))))
 
   (testing "yield is traced when tracing enabled"
     (mt/with-determinism [sched (mt/make-scheduler {:trace? true})]

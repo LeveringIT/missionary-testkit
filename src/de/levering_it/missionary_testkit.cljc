@@ -37,10 +37,6 @@
   "Dynamically bound to the current TestScheduler in deterministic tests."
   nil)
 
-(def ^:dynamic *in-scheduler*
-  "True while executing scheduler-driven work (microtasks, transfers, etc)."
-  false)
-
 (def ^:dynamic *is-deterministic*
   "True when inside with-determinism scope. Use this to check if deterministic
   mode is active (m/sleep, m/timeout, m/cpu, m/blk are virtualized)."
@@ -125,16 +121,16 @@
 (defn clock
   "Returns the current time in milliseconds.
 
-   - Production (no scheduler): System/currentTimeMillis (JVM) or js/Date.now (CLJS)
-   - Test mode (with-determinism): virtual time from the scheduler
+   - Production (outside with-determinism): System/currentTimeMillis (JVM) or js/Date.now (CLJS)
+   - Test mode (inside with-determinism): virtual time from the scheduler
 
    Use this in production code that needs timestamps, so tests can control time:
 
    (defn log-with-timestamp [msg]
      {:time (mt/clock) :msg msg})"
   []
-  (if-let [sched *scheduler*]
-    (now-ms sched)
+  (if *is-deterministic*
+    (now-ms (require-scheduler!))
     #?(:clj (System/currentTimeMillis)
        :cljs (js/Date.now))))
 
@@ -456,13 +452,11 @@
                                            :now-ms now}))]
             (if (compare-and-set! state-atom s s')
               (do
-                (binding [*scheduler* sched
-                          *in-scheduler* true]
-                  (try
-                    ((:f mt))
-                    (catch #?(:clj Throwable :cljs :default) e
-                      ;; Re-throw user exceptions untouched (so tests can assert on them).
-                      (throw e))))
+                (try
+                  ((:f mt))
+                  (catch #?(:clj Throwable :cljs :default) e
+                    ;; Re-throw user exceptions untouched (so tests can assert on them).
+                    (throw e)))
                 (dissoc mt :f))
               (recur))))))))
 
@@ -550,43 +544,53 @@
                                    st))))
                       {:label label
                        :kind :job/complete
-                       :lane :default}))]
+                       :lane :default}))
+
+         ;; Fail job directly without scheduler (for off-thread callback errors).
+         ;; This avoids deadlock when ensure-driver-thread! would throw in enqueue-microtask!.
+         fail-directly! (fn [ex]
+                          (swap! job-state
+                                 (fn [st]
+                                   (if (= :pending (:status st))
+                                     (assoc st :status :failure :error ex)
+                                     st))))]
 
      ;; Start task immediately (but its completion is always delivered through scheduler microtasks).
-     (binding [*scheduler* sched]
-       (try
-         (let [cancel
-               (task
-                (fn [v]
+     (try
+       (let [cancel
+             (task
+              (fn [v]
                   ;; strict: detect off-driver-thread callback (JVM only)
-                  #?(:clj
-                     (if (and (:strict? sched)
-                              (let [owner (:driver-thread @(:state sched))]
-                                (and owner (not= owner (Thread/currentThread)))))
-                       (complete! :failure
-                                  (mt-ex off-scheduler-callback sched
-                                         "Task success callback invoked off scheduler thread."
-                                         {:label label}))
-                       (complete! :success v))
-                     :cljs
-                     (complete! :success v)))
-                (fn [e]
-                  #?(:clj
-                     (if (and (:strict? sched)
-                              (let [owner (:driver-thread @(:state sched))]
-                                (and owner (not= owner (Thread/currentThread)))))
-                       (complete! :failure
-                                  (mt-ex off-scheduler-callback sched
-                                         "Task failure callback invoked off scheduler thread."
-                                         {:label label
-                                          :mt/original-error (pr-str e)}))
-                       (complete! :failure e))
-                     :cljs
-                     (complete! :failure e))))]
-           (reset! cancel-cell (or cancel (fn [] nil))))
-         (catch #?(:clj Throwable :cljs :default) e
-           (complete! :failure e)
-           (reset! cancel-cell (fn [] nil)))))
+                #?(:clj
+                   (if (and (:strict? sched)
+                            (let [owner (:driver-thread @(:state sched))]
+                              (and owner (not= owner (Thread/currentThread)))))
+                     ;; Off-thread: fail directly to avoid deadlock
+                     (fail-directly!
+                      (mt-ex off-scheduler-callback sched
+                             "Task success callback invoked off scheduler thread."
+                             {:label label}))
+                     (complete! :success v))
+                   :cljs
+                   (complete! :success v)))
+              (fn [e]
+                #?(:clj
+                   (if (and (:strict? sched)
+                            (let [owner (:driver-thread @(:state sched))]
+                              (and owner (not= owner (Thread/currentThread)))))
+                     ;; Off-thread: fail directly to avoid deadlock
+                     (fail-directly!
+                      (mt-ex off-scheduler-callback sched
+                             "Task failure callback invoked off scheduler thread."
+                             {:label label
+                              :mt/original-error (pr-str e)}))
+                     (complete! :failure e))
+                   :cljs
+                   (complete! :failure e))))]
+         (reset! cancel-cell (or cancel (fn [] nil))))
+       (catch #?(:clj Throwable :cljs :default) e
+         (complete! :failure e)
+         (reset! cancel-cell (fn [] nil))))
 
      (->Job sched id label job-state cancel-cell))))
 
@@ -625,8 +629,8 @@
   (mt/yield)
   (mt/yield x)
 
-  In production (no scheduler bound): completes immediately with x (or nil).
-  In test mode (scheduler bound): creates a scheduling point that allows
+  In production (outside with-determinism): completes immediately with x (or nil).
+  In test mode (inside with-determinism): creates a scheduling point that allows
   other concurrent tasks to interleave, then completes with x.
 
   This is useful for:
@@ -651,9 +655,10 @@
   ([] (yield nil))
   ([x]
    (fn [s f]
-     (if-let [sched *scheduler*]
+     (if *is-deterministic*
        ;; Test mode: create a scheduling point via microtask
-       (let [done? (atom false)]
+       (let [sched (require-scheduler!)
+             done? (atom false)]
          (enqueue-microtask!
           sched
           (fn []
@@ -803,9 +808,12 @@
         (if (done? job)
           (result job)
           (if-not auto-advance?
-            (throw (mt-ex deadlock sched
-                          "Deadlock: task not done after draining microtasks, and auto-advance? is false."
-                          {:label label}))
+            ;; Recheck done? to handle off-thread callbacks that may have completed the job
+            (if (done? job)
+              (result job)
+              (throw (mt-ex deadlock sched
+                            "Deadlock: task not done after draining microtasks, and auto-advance? is false."
+                            {:label label})))
             (if-let [t-next (next-timer-time sched)]
               (do
                 ;; enforce time budget even if we jump forward
@@ -818,9 +826,12 @@
                                  :mt/max-time-ms max-time-ms})))
                 (let [steps (+ steps (advance-to! sched t-next))]
                   (recur steps)))
-              (throw (mt-ex deadlock sched
-                            "Deadlock: no microtasks, no timers, and task still pending."
-                            {:label label})))))))))
+              ;; Recheck done? to handle off-thread callbacks that may have completed the job
+              (if (done? job)
+                (result job)
+                (throw (mt-ex deadlock sched
+                              "Deadlock: no microtasks, no timers, and task still pending."
+                              {:label label}))))))))))
 
 (defn run
   "Run task deterministically to completion (or throw).
@@ -891,8 +902,26 @@
      (throw (ex-info "mt/blk-executor is JVM-only." {:mt/kind ::unsupported}))))
 
 ;; -----------------------------------------------------------------------------
-;; Integration macro: with-determinism
+;; Integration macros: with-determinism, with-scheduler
 ;; -----------------------------------------------------------------------------
+
+#?(:clj
+   (defmacro with-scheduler
+     "Bind *scheduler* to a scheduler for the duration of body.
+
+     Usage:
+       (with-determinism
+         (with-scheduler [sched (mt/make-scheduler)]
+           (mt/run sched (m/sp ...))))
+
+     This is a convenience macro equivalent to:
+       (let [sched (mt/make-scheduler)]
+         (binding [mt/*scheduler* sched]
+           ...))"
+     [[sched-sym sched-expr] & body]
+     `(let [~sched-sym ~sched-expr]
+        (binding [*scheduler* ~sched-sym]
+          ~@body))))
 
 #?(:clj
    (defmacro with-determinism
@@ -904,95 +933,93 @@
      the macro will capture the real (non-virtual) primitives and will NOT be
      deterministic.
 
-     The scheduler must be explicitly created inside the body and bound to *scheduler*:
-
-     Correct usage:
+     Usage (preferred - explicit scheduler binding):
        (with-determinism
-         (let [sched (mt/make-scheduler)]
-           (binding [mt/*scheduler* sched]
-             (mt/run sched
-               (m/sp (m/? (m/sleep 100)) :done)))))  ; task created inside
+         (with-scheduler [sched (mt/make-scheduler)]
+           (mt/run sched
+             (m/sp (m/? (m/sleep 100)) :done))))
+
+     Legacy usage (still supported):
+       (with-determinism [sched (mt/make-scheduler)]
+         (mt/run sched (m/sp ...)))
 
      Also correct (factory function called inside):
        (defn make-task [] (m/sp (m/? (m/sleep 100)) :done))
        (with-determinism
-         (let [sched (mt/make-scheduler)]
-           (binding [mt/*scheduler* sched]
-             (mt/run sched (make-task)))))
+         (with-scheduler [sched (mt/make-scheduler)]
+           (mt/run sched (make-task))))
 
      WRONG (task created outside - will use real time!):
        (def my-task (m/sp (m/? (m/sleep 100)) :done))  ; WRONG: created outside
        (with-determinism
-         (let [sched (mt/make-scheduler)]
-           (binding [mt/*scheduler* sched]
-             (mt/run sched my-task))))  ; m/sleep was NOT rebound when task was created
+         (with-scheduler [sched (mt/make-scheduler)]
+           (mt/run sched my-task)))  ; m/sleep was NOT rebound when task was created
 
      Effects:
      - Sets *is-deterministic* to true
-     - Binds *scheduler* to the scheduler (if using binding form)
      - missionary.core/sleep    -> mt/sleep
      - missionary.core/timeout  -> mt/timeout
      - missionary.core/cpu      -> deterministic executor (JVM only)
-     - missionary.core/blk      -> deterministic executor (JVM only)"
+     - missionary.core/blk      -> deterministic executor (JVM only)
+
+     NOTE: m/via with m/cpu or m/blk works correctly because these executors
+     are rebound to run work as scheduler microtasks. Do NOT use real executors
+     (e.g., Executors/newFixedThreadPool) inside with-determinism.
+
+     INTERRUPT BEHAVIOR: When a via task is cancelled before its microtask executes,
+     the via body will run with Thread.interrupted() returning true. Blocking calls
+     in the via body will throw InterruptedException. The interrupt flag is cleared
+     after the via body completes, so the scheduler remains usable."
      [& args]
      (let [cljs? (boolean &env)
-           ;; Detect if first arg is a binding vector [sched expr]
+           ;; Detect if first arg is a binding vector [sched expr] (legacy syntax)
            [binding-form body] (if (and (vector? (first args))
                                         (= 2 (count (first args))))
                                  [(first args) (rest args)]
                                  [nil args])
            [sched-sym sched-expr] binding-form]
        (if binding-form
-         ;; Old syntax: (with-determinism [sched (make-scheduler)] body...)
-         `(let [~sched-sym ~sched-expr]
-            (binding [*scheduler* ~sched-sym
-                      *is-deterministic* true]
-              (with-redefs
-                [missionary.core/sleep sleep
-                 missionary.core/timeout timeout
-                 ~@(when-not cljs?
-                     `[missionary.core/cpu (cpu-executor)
-                       missionary.core/blk (blk-executor)])]
-                ~@body)))
-         ;; New syntax: (with-determinism body...) - user binds *scheduler* themselves
+         ;; Legacy syntax: (with-determinism [sched (make-scheduler)] body...)
+         ;; Expands to use with-scheduler internally
          `(binding [*is-deterministic* true]
             (with-redefs
-              [missionary.core/sleep sleep
-               missionary.core/timeout timeout
-               ~@(when-not cljs?
-                   `[missionary.core/cpu (cpu-executor)
-                     missionary.core/blk (blk-executor)])]
+             [missionary.core/sleep sleep
+              missionary.core/timeout timeout
+              ~@(when-not cljs?
+                  `[missionary.core/cpu (cpu-executor)
+                    missionary.core/blk (blk-executor)])]
+              (with-scheduler [~sched-sym ~sched-expr]
+                ~@body)))
+         ;; New syntax: (with-determinism body...) - user uses with-scheduler explicitly
+         `(binding [*is-deterministic* true]
+            (with-redefs
+             [missionary.core/sleep sleep
+              missionary.core/timeout timeout
+              ~@(when-not cljs?
+                  `[missionary.core/cpu (cpu-executor)
+                    missionary.core/blk (blk-executor)])]
               ~@body))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Flow determinism: scheduled-flow + spawn-flow!
 ;; -----------------------------------------------------------------------------
 
-(defn- on-scheduler-context?
-  "True if currently executing scheduler-driven work for sched."
-  [^TestScheduler sched]
-  (and *in-scheduler* (identical? *scheduler* sched)))
-
 (defn scheduled-flow
   "Wrap a flow to marshal readiness/termination signals through the scheduler.
 
-  (mt/scheduled-flow sched flow {:mode :async|:inline-when-on-scheduler :label ...})"
+  (mt/scheduled-flow sched flow {:label ...})"
   ([^TestScheduler sched flow]
    (scheduled-flow sched flow {}))
-  ([^TestScheduler sched flow {:keys [mode label]
-                               :or {mode :async}}]
+  ([^TestScheduler sched flow {:keys [label]}]
    (fn [n t]
      (let [wrap (fn [thunk kind]
                   (fn []
-                    (if (and (= mode :inline-when-on-scheduler)
-                             (on-scheduler-context? sched))
-                      (thunk)
-                      (enqueue-microtask!
-                       sched
-                       (fn [] (thunk))
-                       {:kind kind
-                        :label label
-                        :lane :default}))))]
+                    (enqueue-microtask!
+                     sched
+                     (fn [] (thunk))
+                     {:kind kind
+                      :label label
+                      :lane :default})))]
        (flow (wrap n :flow/notifier)
              (wrap t :flow/terminator))))))
 
@@ -1001,13 +1028,11 @@
   ICancellable
   (-cancel! [_]
     (ensure-driver-thread! sched "flow cancel!")
-    (binding [*scheduler* sched
-              *in-scheduler* true]
-      (swap! state assoc :cancelled? true)
-      (when (and process (ifn? process))
-        (try
-          (process) ;; dispose/cancel if supported
-          (catch #?(:clj Throwable :cljs :default) _ nil))))
+    (swap! state assoc :cancelled? true)
+    (when (and process (ifn? process))
+      (try
+        (process) ;; dispose/cancel if supported
+        (catch #?(:clj Throwable :cljs :default) _ nil)))
     nil))
 
 (defn spawn-flow!
@@ -1029,7 +1054,7 @@
          n* (fn [] (swap! st assoc :ready? true))
          t* (fn [] (swap! st assoc :terminated? true :ready? false))
          f* (scheduled-flow sched flow {:mode :async :label label})
-         proc (binding [*scheduler* sched] (f* n* t*))]
+         proc (f* n* t*)]
      (->FlowProcess sched label st proc))))
 
 (defn ready? [^FlowProcess p] (:ready? @(:state p)))
@@ -1042,22 +1067,20 @@
   (let [sched (:sched p)
         label (:label p)]
     (ensure-driver-thread! sched "transfer!")
-    (binding [*scheduler* sched
-              *in-scheduler* true]
-      (let [{:keys [ready? terminated? cancelled?]} @(:state p)]
-        (cond
-          terminated?
-          (throw (mt-ex illegal-transfer sched "Illegal transfer: flow already terminated."
-                        {:label label}))
+    (let [{:keys [ready? terminated? cancelled?]} @(:state p)]
+      (cond
+        terminated?
+        (throw (mt-ex illegal-transfer sched "Illegal transfer: flow already terminated."
+                      {:label label}))
 
-          (not ready?)
-          (throw (mt-ex illegal-transfer sched "Illegal transfer: flow not ready."
-                        {:label label}))
+        (not ready?)
+        (throw (mt-ex illegal-transfer sched "Illegal transfer: flow not ready."
+                      {:label label}))
 
-          :else
-          (do
-            (swap! (:state p) assoc :ready? false)
-            (deref (:process p))))))))
+        :else
+        (do
+          (swap! (:state p) assoc :ready? false)
+          (deref (:process p)))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Deterministic flow sources: subject (discrete) and state (continuous)
@@ -1178,52 +1201,48 @@
           #?(:clj clojure.lang.IDeref :cljs cljs.core/IDeref)
           (#?(:clj deref :cljs -deref) [_]
             (ensure-driver-thread! sched "subject transfer")
-            (binding [*scheduler* sched
-                      *in-scheduler* true]
-              (let [{:keys [ready? terminated? cancelled? failed pending]} @st]
-                (when terminated?
-                  (throw (mt-ex illegal-transfer sched "Transfer after termination." {:label label})))
-                (when-not ready?
-                  (throw (mt-ex illegal-transfer sched "Transfer attempted when not ready." {:label label})))
-                ;; consume readiness
-                (swap! st assoc :ready? false)
-                (cond
-                  cancelled?
-                  (throw (cancelled-ex))
+            (let [{:keys [ready? terminated? cancelled? failed pending]} @st]
+              (when terminated?
+                (throw (mt-ex illegal-transfer sched "Transfer after termination." {:label label})))
+              (when-not ready?
+                (throw (mt-ex illegal-transfer sched "Transfer attempted when not ready." {:label label})))
+              ;; consume readiness
+              (swap! st assoc :ready? false)
+              (cond
+                cancelled?
+                (throw (cancelled-ex))
 
-                  failed
-                  (throw failed)
+                failed
+                (throw failed)
 
-                  pending
-                  (let [v (:v pending)]
-                    ;; mark pending consumed
-                    (swap! st assoc :pending nil)
-                    (complete-entry-success! pending)
-                    ;; promote next queued value if any
-                    (when-let [next (first (:queue @st))]
-                      (swap! st (fn [s] (-> s
-                                            (assoc :pending next)
-                                            (update :queue subvec 1)))))
-                    ;; after consuming, either signal next ready or terminate
-                    (signal-ready!)
-                    (signal-terminate!)
-                    v)
+                pending
+                (let [v (:v pending)]
+                  ;; mark pending consumed
+                  (swap! st assoc :pending nil)
+                  (complete-entry-success! pending)
+                  ;; promote next queued value if any
+                  (when-let [next (first (:queue @st))]
+                    (swap! st (fn [s] (-> s
+                                          (assoc :pending next)
+                                          (update :queue subvec 1)))))
+                  ;; after consuming, either signal next ready or terminate
+                  (signal-ready!)
+                  (signal-terminate!)
+                  v)
 
-                  :else
-                  (throw (mt-ex illegal-transfer sched
-                                "Ready signaled but no pending transfer."
-                                {:label label}))))))
+                :else
+                (throw (mt-ex illegal-transfer sched
+                              "Ready signaled but no pending transfer."
+                              {:label label})))))
           #?(:clj clojure.lang.IFn :cljs cljs.core/IFn)
           (#?(:clj invoke :cljs -invoke) [_]
             ;; cancel/dispose
             (ensure-driver-thread! sched "subject cancel")
-            (binding [*scheduler* sched
-                      *in-scheduler* true]
-              (swap! st assoc :cancelled? true :closed? true :failed (cancelled-ex)
-                     :pending nil :queue [] :ready? false)
-              ;; wake consumer to observe cancellation via transfer error
-              (signal-ready!)
-              nil))))
+            (swap! st assoc :cancelled? true :closed? true :failed (cancelled-ex)
+                   :pending nil :queue [] :ready? false)
+            ;; wake consumer to observe cancellation via transfer error
+            (signal-ready!)
+            nil)))
 
       :emit
       (fn [v]
@@ -1386,27 +1405,23 @@
           #?(:clj clojure.lang.IDeref :cljs cljs.core/IDeref)
           (#?(:clj deref :cljs -deref) [_]
             (ensure-driver-thread! sched "state transfer")
-            (binding [*scheduler* sched
-                      *in-scheduler* true]
-              (let [{:keys [ready? terminated? cancelled? failed value]} @st]
-                (when terminated?
-                  (throw (mt-ex illegal-transfer sched "Transfer after termination." {:label label})))
-                (when-not ready?
-                  (throw (mt-ex illegal-transfer sched "Transfer attempted when not ready." {:label label})))
-                (swap! st assoc :ready? false)
-                (cond
-                  cancelled? (throw (cancelled-ex))
-                  failed (throw failed)
-                  :else value))))
+            (let [{:keys [ready? terminated? cancelled? failed value]} @st]
+              (when terminated?
+                (throw (mt-ex illegal-transfer sched "Transfer after termination." {:label label})))
+              (when-not ready?
+                (throw (mt-ex illegal-transfer sched "Transfer attempted when not ready." {:label label})))
+              (swap! st assoc :ready? false)
+              (cond
+                cancelled? (throw (cancelled-ex))
+                failed (throw failed)
+                :else value)))
           #?(:clj clojure.lang.IFn :cljs cljs.core/IFn)
           (#?(:clj invoke :cljs -invoke) [_]
             ;; cancel/dispose => fail with Cancelled and wake consumer
             (ensure-driver-thread! sched "state cancel")
-            (binding [*scheduler* sched
-                      *in-scheduler* true]
-              (swap! st assoc :cancelled? true :failed (cancelled-ex) :closed? true :ready? false)
-              (signal-ready!)
-              nil))))
+            (swap! st assoc :cancelled? true :failed (cancelled-ex) :closed? true :ready? false)
+            (signal-ready!)
+            nil)))
 
       :set
       (fn [v]
@@ -1459,53 +1474,44 @@
                  decision)))))
 
 (defn replay-schedule
-  "Run a task-fn with the exact schedule from a previous trace.
+  "Run a task with the exact schedule from a previous trace.
   Returns the task result.
 
-  IMPORTANT: task-fn must be a 0-arg function that returns a task, NOT a task itself.
-  This ensures the task is created inside the deterministic context where m/sleep
-  and m/timeout are virtualized.
+  IMPORTANT: Must be called inside a with-determinism body.
 
   Usage:
     (def original-trace (mt/trace sched))
-    (mt/replay-schedule make-task (mt/trace->schedule original-trace))"
-  ([task-fn schedule]
-   (replay-schedule task-fn schedule {}))
-  ([task-fn schedule {:keys [trace? max-steps max-time-ms]
-                      :or {trace? true
-                           max-steps 100000
-                           max-time-ms 60000}}]
-   (with-determinism
-     (let [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
-       (binding [*scheduler* sched]
-         (run sched (task-fn) {:max-steps max-steps
-                               :max-time-ms max-time-ms}))))))
+    (with-determinism
+      (mt/replay-schedule (make-task) (mt/trace->schedule original-trace)))"
+  ([task schedule]
+   (replay-schedule task schedule {}))
+  ([task schedule {:keys [trace? max-steps max-time-ms]
+                   :or {trace? true
+                        max-steps 100000
+                        max-time-ms 60000}}]
+   (with-scheduler [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
+     (run sched task {:max-steps max-steps
+                      :max-time-ms max-time-ms}))))
 
 (defn seed->schedule
   "Deterministically generate a schedule from a seed.
-  Creates a schedule of the given length with random FIFO/LIFO/random decisions."
+  Creates a schedule of the given length with random FIFO/LIFO/random decisions.
+  Uses the same LCG algorithm on both CLJ and CLJS for cross-platform consistency."
   [seed num-decisions]
-  #?(:clj
-     (let [rng (java.util.Random. seed)]
-       (vec (repeatedly num-decisions
-                        #(case (.nextInt rng 3)
-                           0 :fifo
-                           1 :lifo
-                           2 :random))))
-     :cljs
-     (let [;; Simple LCG for CLJS
-           lcg (fn [s] (mod (+ (* 1103515245 s) 12345) 2147483648))]
-       (loop [s seed
-              result []
-              i 0]
-         (if (>= i num-decisions)
-           result
-           (let [next-s (lcg s)
-                 decision (case (mod next-s 3)
-                            0 :fifo
-                            1 :lifo
-                            2 :random)]
-             (recur next-s (conj result decision) (inc i))))))))
+  ;; Use consistent LCG across platforms (same as lcg-next but with different parameters
+  ;; to avoid confusion with the internal RNG used for :random selection)
+  (let [lcg (fn [s] (mod (+ (* 1103515245 (long s)) 12345) 2147483648))]
+    (loop [s (long seed)
+           result []
+           i 0]
+      (if (>= i num-decisions)
+        result
+        (let [next-s (lcg s)
+              decision (case (mod next-s 3)
+                         0 :fifo
+                         1 :lifo
+                         2 :random)]
+          (recur next-s (conj result decision) (inc i)))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Interleaving: test helpers
@@ -1516,28 +1522,29 @@
      :cljs (.getTime (js/Date.))))
 
 (defn- run-with-schedule
-  "Run task-fn once with a generated schedule. Returns map with result info.
-  Internal helper for check-interleaving and explore-interleavings."
-  [task-fn {:keys [test-seed schedule-length max-steps max-time-ms]
-            :or {max-time-ms 60000}}]
-  (with-determinism
-    (let [schedule (seed->schedule test-seed schedule-length)
-          sched (make-scheduler {:micro-schedule schedule :trace? true :rng-seed test-seed})
-          result (binding [*scheduler* sched]
-                   (try
-                     {:value (run sched (task-fn) {:max-steps max-steps
-                                                   :max-time-ms max-time-ms})}
+  "Run a task once with a generated schedule. Returns map with result info.
+  Internal helper for check-interleaving and explore-interleavings.
+  Must be called inside a with-determinism body."
+  [task {:keys [test-seed schedule-length max-steps max-time-ms]
+         :or {max-time-ms 60000}}]
+  (let [schedule (seed->schedule test-seed schedule-length)]
+    (with-scheduler [sched (make-scheduler {:micro-schedule schedule :trace? true :rng-seed test-seed})]
+      (let [result (try
+                     {:value (run sched task {:max-steps max-steps
+                                              :max-time-ms max-time-ms})}
                      (catch #?(:clj Throwable :cljs :default) e
-                       {:error e})))]
-      {:result result
-       :seed test-seed
-       :micro-schedule (trace->schedule (trace sched))
-       :trace (trace sched)})))
+                       {:error e}))]
+        {:result result
+         :seed test-seed
+         :micro-schedule (trace->schedule (trace sched))
+         :trace (trace sched)}))))
 
 (defn check-interleaving
   "Run a task with many different interleavings to find failures.
   Returns nil if all pass, or a map with failure info including the schedule
   that caused the failure.
+
+  IMPORTANT: Must be called inside a with-determinism body.
 
   task-fn should be a 0-arg function that returns a fresh task for each test.
   This ensures mutable state (like atoms) is reset between iterations.
@@ -1564,7 +1571,7 @@
   (let [base-seed (or seed (default-base-seed))]
     (loop [i 0]
       (when (< i num-tests)
-        (let [run-result (run-with-schedule task-fn
+        (let [run-result (run-with-schedule (task-fn)
                                             {:test-seed (+ base-seed i)
                                              :schedule-length schedule-length
                                              :max-steps max-steps
@@ -1581,6 +1588,8 @@
 
 (defn explore-interleavings
   "Explore different interleavings of a task and return a summary.
+
+  IMPORTANT: Must be called inside a with-determinism body.
 
   task-fn should be a 0-arg function that returns a fresh task for each test.
   This ensures mutable state (like atoms) is reset between iterations.
@@ -1600,7 +1609,7 @@
                  max-steps 10000}}]
   (let [base-seed (or seed (default-base-seed))
         results (for [i (range num-samples)
-                      :let [run-result (run-with-schedule task-fn
+                      :let [run-result (run-with-schedule (task-fn)
                                                           {:test-seed (+ base-seed i)
                                                            :schedule-length schedule-length
                                                            :max-steps max-steps})
