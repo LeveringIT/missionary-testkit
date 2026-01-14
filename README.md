@@ -96,6 +96,35 @@ The scheduler manages virtual time and a queue of pending tasks:
 (mt/trace sched)    ; => [{:event :enqueue-timer ...} ...]
 ```
 
+### Using Clock in Production Code
+
+The `mt/clock` function returns the current time in milliseconds. It automatically uses:
+- **Virtual time** when inside `with-determinism` (for tests)
+- **Real time** (`System/currentTimeMillis` or `js/Date.now`) otherwise (for production)
+
+This allows you to write time-aware code that works in both contexts:
+
+```clojure
+;; Production code - uses mt/clock for timestamps
+(defn record-event [event]
+  {:timestamp (mt/clock)
+   :event event})
+
+;; In production: uses real system time
+(record-event :user-login)
+;; => {:timestamp 1704067200000 :event :user-login}
+
+;; In tests: uses virtual time, runs instantly
+(mt/with-determinism [sched (mt/make-scheduler {:initial-ms 1000})]
+  (mt/run sched
+    (m/sp
+      (let [e1 (record-event :start)]
+        (m/? (m/sleep 5000))  ; "sleeps" 5 seconds instantly
+        (let [e2 (record-event :end)]
+          (- (:timestamp e2) (:timestamp e1)))))))
+;; => 5000 (deterministic, executes in microseconds)
+```
+
 ### Time Control
 
 ```clojure
@@ -367,7 +396,8 @@ The scheduler automatically detects common problems:
 - `(make-scheduler)` / `(make-scheduler opts)` - create a scheduler
 
 ### Time Inspection
-- `(now-ms sched)` - current virtual time in milliseconds
+- `(now-ms sched)` - current virtual time in milliseconds (requires scheduler)
+- `(clock)` - current time: virtual when scheduler bound, real otherwise (for production code)
 - `(pending sched)` - queued microtasks and timers
 - `(trace sched)` - execution trace (if enabled)
 
@@ -433,6 +463,7 @@ The testkit virtualizes **time-based primitives** only:
 |-----------|-------------|-------|
 | `m/sleep` | Yes | Uses virtual time |
 | `m/timeout` | Yes | Uses virtual time |
+| `mt/clock` | Yes | Returns virtual time in tests, real time in production |
 | `mt/yield` | Yes | Scheduling point in tests, no-op in production |
 | `m/cpu` | Yes (JVM) | Deterministic executor |
 | `m/blk` | Yes (JVM) | Deterministic executor |

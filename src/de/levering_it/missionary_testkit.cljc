@@ -112,6 +112,22 @@
   [^TestScheduler sched]
   (:now-ms @(:state sched)))
 
+(defn clock
+  "Returns the current time in milliseconds.
+
+   - Production (no scheduler): System/currentTimeMillis (JVM) or js/Date.now (CLJS)
+   - Test mode (with-determinism): virtual time from the scheduler
+
+   Use this in production code that needs timestamps, so tests can control time:
+
+   (defn log-with-timestamp [msg]
+     {:time (mt/clock) :msg msg})"
+  []
+  (if-let [sched *scheduler*]
+    (now-ms sched)
+    #?(:clj (System/currentTimeMillis)
+       :cljs (js/Date.now))))
+
 (defn trace
   "Vector of trace events if enabled, else nil."
   [^TestScheduler sched]

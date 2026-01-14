@@ -1175,3 +1175,73 @@
         (is (vector? trace))
         (is (some #(= :yield (:kind %)) trace)
             "Trace should contain yield events")))))
+
+;; =============================================================================
+;; Clock Tests
+;; =============================================================================
+
+(deftest clock-test
+  (testing "clock returns real time when no scheduler bound"
+    (let [before (System/currentTimeMillis)
+          clock-time (mt/clock)
+          after (System/currentTimeMillis)]
+      (is (<= before clock-time after))
+      (is (pos? clock-time))))
+
+  (testing "clock returns virtual time within with-determinism"
+    (mt/with-determinism [sched (mt/make-scheduler {:initial-ms 1000})]
+      (is (= 1000 (mt/clock)))
+      (mt/run sched
+              (m/sp
+               (is (= 1000 (mt/clock)))
+               (m/? (m/sleep 500))
+               (is (= 1500 (mt/clock)))
+               (m/? (m/sleep 200))
+               (is (= 1700 (mt/clock)))))))
+
+  (testing "clock tracks time across multiple sleeps"
+    (let [times (atom [])]
+      (mt/with-determinism [sched (mt/make-scheduler)]
+        (mt/run sched
+                (m/sp
+                 (swap! times conj (mt/clock))
+                 (m/? (m/sleep 100))
+                 (swap! times conj (mt/clock))
+                 (m/? (m/sleep 250))
+                 (swap! times conj (mt/clock)))))
+      (is (= [0 100 350] @times))))
+
+  (testing "clock returns consistent time within concurrent tasks"
+    (mt/with-determinism [sched (mt/make-scheduler)]
+      (let [result (mt/run sched
+                           (m/sp
+                            (m/? (m/join vector
+                                         (m/sp
+                                          (m/? (m/sleep 100))
+                                          (mt/clock))
+                                         (m/sp
+                                          (m/? (m/sleep 200))
+                                          (mt/clock))))))]
+        (is (= [100 200] result)))))
+
+  (testing "clock is useful for timestamping in production-like code"
+    ;; Simulate production code that uses clock for timestamps
+    (let [record-event (fn [event] {:time (mt/clock) :event event})]
+      (mt/with-determinism [sched (mt/make-scheduler {:initial-ms 1000})]
+        (let [events (mt/run sched
+                             (m/sp
+                              (let [e1 (record-event :start)]
+                                (m/? (m/sleep 5000))
+                                (let [e2 (record-event :end)]
+                                  [e1 e2]))))]
+          (is (= {:time 1000 :event :start} (first events)))
+          (is (= {:time 6000 :event :end} (second events)))
+          (is (= 5000 (- (:time (second events)) (:time (first events))))))))))
+
+(deftest clock-vs-now-ms-test
+  (testing "clock equals now-ms when scheduler bound"
+    (mt/with-determinism [sched (mt/make-scheduler {:initial-ms 42})]
+      (is (= (mt/now-ms sched) (mt/clock)))
+      (mt/advance! sched 100)
+      (is (= (mt/now-ms sched) (mt/clock)))
+      (is (= 142 (mt/clock))))))
