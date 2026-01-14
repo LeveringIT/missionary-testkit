@@ -1,5 +1,7 @@
 # missionary-testkit
 
+[![Tests](https://github.com/levering-it/missionary-testkit/actions/workflows/test.yml/badge.svg)](https://github.com/levering-it/missionary-testkit/actions/workflows/test.yml)
+
 A deterministic testing toolkit for [Missionary](https://github.com/leonoel/missionary) - the functional effect and streaming library for Clojure/ClojureScript.
 
 ## The Problem
