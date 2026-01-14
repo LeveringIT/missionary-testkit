@@ -390,6 +390,158 @@ The scheduler automatically detects common problems:
 clojure -X:test cognitect.test-runner.api/test
 ```
 
+## Limitations
+
+### What is virtualized
+
+The testkit virtualizes **time-based primitives** only:
+
+| Primitive | Virtualized | Notes |
+|-----------|-------------|-------|
+| `m/sleep` | Yes | Uses virtual time |
+| `m/timeout` | Yes | Uses virtual time |
+| `m/cpu` | Yes (JVM) | Deterministic executor |
+| `m/blk` | Yes (JVM) | Deterministic executor |
+| `m/race`, `m/join`, `m/amb=` | No (not needed) | Pure combinators, work correctly with virtualized primitives |
+
+### What is NOT virtualized
+
+- **Real I/O** - HTTP requests, file operations, database calls execute in real time
+- **Real `m/observe` callbacks** - External event sources (DOM, network) are not controlled
+- **Real `m/watch` on atoms** - Changes from external threads are not controlled
+
+**Solution:** Use `mt/subject` (discrete) and `mt/state` (continuous) for deterministic flow sources in tests.
+
+```clojure
+;; Instead of m/observe with real callbacks, use mt/subject
+(mt/with-determinism [sched (mt/make-scheduler)]
+  (let [{:keys [flow emit close]} (mt/subject sched)]
+    (mt/run sched
+      (m/sp
+        (m/? (m/join (fn [_ v] v)
+               ;; Producer - simulates external events
+               (m/sp
+                 (m/? (emit :click))
+                 (m/? (emit :scroll))
+                 (m/? (close)))
+               ;; Consumer
+               (mt/collect flow)))))))
+;; => [:click :scroll]
+
+;; Instead of m/watch on a real atom, use mt/state
+(mt/with-determinism [sched (mt/make-scheduler)]
+  (let [{:keys [flow set close]} (mt/state sched {:initial 0})]
+    (mt/run sched
+      (m/sp
+        (m/? (m/join (fn [_ v] v)
+               ;; Producer - simulates atom changes
+               (m/sp
+                 (m/? (m/sleep 10))
+                 (set 1)
+                 (m/? (m/sleep 10))
+                 (set 2)
+                 (m/? (m/sleep 10))
+                 (close))
+               ;; Consumer - samples the continuous flow
+               (mt/collect flow)))))))
+;; => [0 1 2]
+```
+
+#### Why use `mt/subject` and `mt/state` instead of `m/observe` and `m/watch`?
+
+You can use Missionary's built-in `m/observe` and `m/watch` if you control all emissions/modifications from within the scheduled code. However, the testkit versions provide two key advantages:
+
+**1. Full traceability** - All events appear in `(mt/trace sched)`:
+
+```clojure
+;; m/observe / m/watch: events are invisible to the scheduler
+{:total-events 2, :subject-events []}
+
+;; mt/subject / mt/state: events appear in trace with timestamps
+{:total-events 18,
+ :subject-events [{:kind :subject/notifier, :now-ms 0}
+                  {:kind :subject/emit-success, :now-ms 0}
+                  {:kind :subject/terminator, :now-ms 0}
+                  ...]}
+```
+
+**2. Strict mode catches off-thread access**:
+
+```clojure
+;; m/observe: off-thread emit is NOT caught
+(mt/with-determinism [sched (mt/make-scheduler {:strict? true})]
+  (let [emit-fn (atom nil)
+        flow (m/observe (fn [emit!] (reset! emit-fn emit!) #()))]
+    (mt/step! sched)
+    @(future (@emit-fn :value))   ; off-thread - NOT caught!
+    :no-error))
+;; => :no-error (silently non-deterministic!)
+
+;; mt/subject: off-thread emit IS caught
+(mt/with-determinism [sched (mt/make-scheduler {:strict? true})]
+  (let [{:keys [emit]} (mt/subject sched)]
+    (mt/step! sched)
+    @(future ((emit :value) identity identity))))  ; off-thread - CAUGHT!
+;; => throws "Scheduler driven from multiple threads (enqueue-microtask!)"
+```
+
+The same applies to `m/watch` vs `mt/state`:
+
+```clojure
+;; m/watch: off-thread reset! is NOT caught
+@(future (reset! my-atom 42))
+;; => :no-error (silently non-deterministic!)
+
+;; mt/state: off-thread set IS caught
+@(future (set 42))
+;; => throws "Scheduler driven from multiple threads (state set)"
+```
+
+**Summary:**
+
+| Aspect | `m/observe` / `m/watch` | `mt/subject` / `mt/state` |
+|--------|------------------------|---------------------------|
+| Events in trace | No | Yes |
+| Strict mode catches off-thread | No | Yes |
+| Works for simple tests | Yes | Yes |
+
+**Use testkit versions** when you want full traceability or strict mode protection. **Use Missionary built-ins** for simple tests where you control all modifications from within scheduled code.
+
+### Threading model
+
+Missionary uses cooperative single-threaded execution by default. Tasks interleave at `m/?` suspension points, not truly in parallel. The testkit controls:
+
+1. **Virtual time** - Which sleeps/timeouts complete first
+2. **Task ordering** - Which ready task runs next (via schedule)
+3. **Built-in executors** - `m/cpu` and `m/blk` are rebound to deterministic executors
+
+Note: `m/via` with a custom executor is **not** automatically deterministic. Only `m/via m/cpu` and `m/via m/blk` are controlled because those executors are patched by `with-determinism`.
+
+### Strict mode (JVM only)
+
+When `{:strict? true}`, the scheduler detects off-thread access to catch accidental non-determinism:
+
+```clojure
+;; This will throw in strict mode if called from wrong thread
+(future ((:emit subject) :value))
+;; => "Scheduler driven from multiple threads (enqueue-microtask!)"
+```
+
+Strict mode is unavailable in ClojureScript (single-threaded environment).
+
+### Flow forking
+
+`m/amb` and `m/amb=` require a forking context (`m/ap` with `m/?>`):
+
+```clojure
+;; Won't work - no forking context
+(m/sp (m/? (m/reduce conj [] (m/amb= flow1 flow2))))
+
+;; Works - m/ap provides forking via m/?>
+(m/sp (m/? (m/reduce conj []
+             (m/ap (m/?> (m/amb= flow1 flow2))))))
+```
+
 ## License
 
 Copyright 2026 Levering IT GmbH
