@@ -239,14 +239,18 @@ missionary-testkit can explore different task interleavings to find race conditi
                     (let [shared (atom 0)]
                       (m/sp
                        (m/? (m/join (fn [& _] @shared)
-                                   (m/sp (swap! shared + 10))
-                                   (m/sp (swap! shared * 2)))))))
+                                   (m/sp
+                                     (m/? (m/sleep 0))  ; suspension point
+                                     (swap! shared + 10))
+                                   (m/sp
+                                     (m/? (m/sleep 0))  ; suspension point
+                                     (swap! shared * 2)))))))
 
         ;; Check if any interleaving produces unexpected results
         result (mt/check-interleaving make-task
                  {:num-tests 100
                   :seed 42
-                  :property (fn [v] (#{20 12} v))})]  ; only valid results
+                  :property (fn [v] (#{20 10} v))})]  ; only valid results
 
     (when result
       (println "Bug found!")
@@ -472,7 +476,9 @@ You can use Missionary's built-in `m/observe` and `m/watch` if you control all e
 (mt/with-determinism [sched (mt/make-scheduler {:strict? true})]
   (let [emit-fn (atom nil)
         flow (m/observe (fn [emit!] (reset! emit-fn emit!) #()))]
-    (mt/step! sched)
+    ;; Start consuming the flow so emit-fn gets set
+    (mt/start! sched (m/reduce (fn [_ x] x) nil flow) {})
+    (mt/tick! sched)
     @(future (@emit-fn :value))   ; off-thread - NOT caught!
     :no-error))
 ;; => :no-error (silently non-deterministic!)
