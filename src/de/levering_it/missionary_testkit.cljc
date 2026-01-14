@@ -298,40 +298,41 @@
   - [:by-id id] - select item with matching id"
   [q decision seed]
   (when-not (q-empty? q)
-    (let [v (q->vec q)
-          n (count v)]
-      (case decision
-        :fifo
-        [(first v) (vec->q (subvec v 1))]
+    ;; Fast path for FIFO - no conversion needed
+    (if (= decision :fifo)
+      [(q-peek q) (q-pop q)]
+      ;; Other decisions need indexed access
+      (let [v (q->vec q)
+            n (count v)]
+        (case decision
+          :lifo
+          [(peek v) (vec->q (pop v))]
 
-        :lifo
-        [(peek v) (vec->q (pop v))]
-
-        :random
-        (let [idx (mod (Math/abs (hash [seed (first v)])) n)]
-          [(nth v idx) (vec->q (remove-nth v idx))])
-
-        ;; default: check for vector decisions
-        (cond
-          (and (vector? decision) (= :nth (first decision)))
-          (let [idx (mod (second decision) n)]
+          :random
+          (let [idx (mod (Math/abs (hash [seed (first v)])) n)]
             [(nth v idx) (vec->q (remove-nth v idx))])
 
-          (and (vector? decision) (= :by-label (first decision)))
-          (let [label (second decision)
-                idx (or (first (keep-indexed (fn [i item] (when (= label (:label item)) i)) v))
-                        0)]
-            [(nth v idx) (vec->q (remove-nth v idx))])
+          ;; default: check for vector decisions
+          (cond
+            (and (vector? decision) (= :nth (first decision)))
+            (let [idx (mod (second decision) n)]
+              [(nth v idx) (vec->q (remove-nth v idx))])
 
-          (and (vector? decision) (= :by-id (first decision)))
-          (let [target-id (second decision)
-                idx (or (first (keep-indexed (fn [i item] (when (= target-id (:id item)) i)) v))
-                        0)]
-            [(nth v idx) (vec->q (remove-nth v idx))])
+            (and (vector? decision) (= :by-label (first decision)))
+            (let [label (second decision)
+                  idx (or (first (keep-indexed (fn [i item] (when (= label (:label item)) i)) v))
+                          0)]
+              [(nth v idx) (vec->q (remove-nth v idx))])
 
-          ;; fallback to FIFO
-          :else
-          [(first v) (vec->q (subvec v 1))])))))
+            (and (vector? decision) (= :by-id (first decision)))
+            (let [target-id (second decision)
+                  idx (or (first (keep-indexed (fn [i item] (when (= target-id (:id item)) i)) v))
+                          0)]
+              [(nth v idx) (vec->q (remove-nth v idx))])
+
+            ;; fallback to FIFO
+            :else
+            [(q-peek q) (q-pop q)]))))))
 
 (defn- get-schedule-decision
   "Get the current schedule decision and advance the index.
@@ -344,9 +345,19 @@
         [:fifo s])) ; default to FIFO when schedule exhausted
     [:fifo s]))
 
+(defn- finalize-timer-promotion
+  "Finalize state after promoting timers, adding trace event if any were promoted."
+  [s timers micro ids now]
+  (cond-> (assoc s :timers timers :micro-q micro)
+    (seq ids)
+    (maybe-trace-state {:event :promote-timers
+                        :ids ids
+                        :count (count ids)
+                        :now-ms now})))
+
 (defn- promote-due-timers-in-state
   "Move all timers with at-ms <= now-ms into the microtask queue, in timer order."
-  [^TestScheduler sched s]
+  [^TestScheduler _sched s]
   (let [now (:now-ms s)]
     (loop [timers (:timers s)
            micro (:micro-q s)
@@ -356,18 +367,8 @@
           (recur (dissoc timers k)
                  (q-conj micro (assoc t :from :timer))
                  (conj ids (:id t)))
-          (cond-> (assoc s :timers timers :micro-q micro)
-            (seq ids)
-            (maybe-trace-state {:event :promote-timers
-                                :ids ids
-                                :count (count ids)
-                                :now-ms now})))
-        (cond-> (assoc s :timers timers :micro-q micro)
-          (seq ids)
-          (maybe-trace-state {:event :promote-timers
-                              :ids ids
-                              :count (count ids)
-                              :now-ms now}))))))
+          (finalize-timer-promotion s timers micro ids now))
+        (finalize-timer-promotion s timers micro ids now)))))
 
 (defn- next-timer-time
   [^TestScheduler sched]
