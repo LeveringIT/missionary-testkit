@@ -773,7 +773,7 @@
 
         ;; [:nth 5] with queue size 3 -> 5 mod 3 = 2 -> third task
         (is (= :c (first @execution-order))
-            "[:nth 5] should wrap to index 2 (5 mod 3)"))))
+            "[:nth 5] should wrap to index 2 (5 mod 3)")))))
 
 (deftest trace->schedule-test
   (testing "extracts schedule from trace"

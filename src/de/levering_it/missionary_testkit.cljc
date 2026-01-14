@@ -161,8 +161,8 @@
 
 #?(:clj
    (defn- ensure-driver-thread!
-     "In strict mode, enforce that driving operations are performed by a single thread.
-      Enqueues from other threads are allowed; only *driving* (step/tick/advance/run/transfer) is checked."
+     "In strict mode, enforce that ALL scheduler operations are performed by a single thread.
+      This includes driving (step/tick/advance/run), enqueuing, timers, and flow control."
      [^TestScheduler sched op-label]
      (when (:strict? sched)
        (let [state-atom (:state sched)
@@ -192,6 +192,7 @@
   ([^TestScheduler sched f {:keys [label kind lane]
                             :or {kind :microtask
                                  lane :default}}]
+   (ensure-driver-thread! sched "enqueue-microtask!")
    (let [id (next-id! sched)]
      (swap! (:state sched)
             (fn [s]
@@ -219,6 +220,7 @@
   ([^TestScheduler sched delay-ms f {:keys [label kind lane]
                                      :or {kind :timer
                                           lane :default}}]
+   (ensure-driver-thread! sched "schedule-timer!")
    (let [id (next-id! sched)
          token (atom nil)]
      (swap! (:state sched)
@@ -252,6 +254,7 @@
 
 (defn- cancel-timer!
   [^TestScheduler sched timer-token]
+  (ensure-driver-thread! sched "cancel-timer!")
   (when timer-token
     (swap! (:state sched)
            (fn [s]
@@ -1122,6 +1125,7 @@
 
       :offer
       (fn [v]
+        (ensure-driver-thread! sched "subject offer")
         ;; best-effort: succeed only with no backlog
         (let [accepted? (atom false)]
           (swap! st
@@ -1265,6 +1269,7 @@
 
       :set
       (fn [v]
+        (ensure-driver-thread! sched "state set")
         (swap! st assoc :value v)
         ;; Only schedule readiness if no transfer pending
         (let [should-signal? (atom false)]
@@ -1283,12 +1288,14 @@
 
       :fail
       (fn [ex]
+        (ensure-driver-thread! sched "state fail")
         (swap! st assoc :failed ex :closed? true)
         (signal-ready!) ; wake consumer to observe error
         nil)
 
       :close
       (fn []
+        (ensure-driver-thread! sched "state close")
         (swap! st assoc :closed? true)
         (signal-terminate!)
         nil)})))
@@ -1299,11 +1306,16 @@
 
 (defn trace->schedule
   "Extract the sequence of selection decisions from a trace.
-  Returns a vector of decisions that can be used to replay the same execution order."
+  Returns a vector of decisions that can be used to replay the same execution order.
+
+  For :random decisions, emits [:by-id selected-id] to ensure exact replay."
   [trace]
   (->> trace
        (filter #(= :select-task (:event %)))
-       (mapv :decision)))
+       (mapv (fn [{:keys [decision selected-id]}]
+               (if (= :random decision)
+                 [:by-id selected-id]
+                 decision)))))
 
 (defn replay-schedule
   "Run a task with the exact schedule from a previous trace.
