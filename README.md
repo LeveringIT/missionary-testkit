@@ -87,7 +87,7 @@ The scheduler manages virtual time and a queue of pending tasks:
 ```clojure
 (def sched (mt/make-scheduler {:initial-ms 0      ; starting time
                                 :trace?     true   ; enable execution trace
-                                :strict?    false  ; thread safety checks
+                                :strict?    true   ; thread safety checks (default on JVM)
                                 :policy     :fifo  ; task ordering
                                 :schedule   nil})) ; interleaving schedule (see Schedule Decisions)
 
@@ -586,12 +586,15 @@ Note: `m/via` with a custom executor is **not** automatically deterministic. Onl
 
 ### Strict mode (JVM only)
 
-When `{:strict? true}`, the scheduler detects off-thread access to catch accidental non-determinism:
+Strict mode detects off-thread access to catch accidental non-determinism. It is **enabled by default** on the JVM:
 
 ```clojure
-;; This will throw in strict mode if called from wrong thread
+;; This throws because it's called from wrong thread
 (future ((:emit subject) :value))
 ;; => "Scheduler driven from multiple threads (enqueue-microtask!)"
+
+;; To disable strict mode (not recommended):
+(mt/make-scheduler {:strict? false})
 ```
 
 Strict mode is unavailable in ClojureScript (single-threaded environment).

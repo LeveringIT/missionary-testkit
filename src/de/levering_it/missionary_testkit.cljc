@@ -81,16 +81,19 @@
   {:initial-ms 0
    :policy     :fifo | :seeded
    :seed       42
-   :strict?    true|false
+   :strict?    true|false  ; default true on JVM to catch cross-thread access
    :trace?     true|false
-   :schedule   nil | vector of selection decisions for interleaving}"
+   :schedule   nil | vector of selection decisions for interleaving}
+
+  Note: strict? defaults to true on JVM to detect accidental non-determinism
+  from cross-thread callbacks. On CLJS it's ignored (single-threaded)."
   ([]
    (make-scheduler {}))
   ([{:keys [initial-ms policy seed strict? trace? schedule]
      :or {initial-ms 0
           policy :fifo
           seed 0
-          strict? false
+          strict? #?(:clj true :cljs false)
           trace? false
           schedule nil}}]
    (->TestScheduler
