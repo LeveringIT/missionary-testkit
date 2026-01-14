@@ -104,7 +104,9 @@
            ;; JVM-only "driver thread" captured lazily under strict mode
            :driver-thread #?(:clj nil :cljs ::na)
            ;; interleaving: schedule index (consumed as used)
-           :schedule-idx 0})
+           :schedule-idx 0
+           ;; deterministic RNG state for :random selection (LCG)
+           :rng-state (long seed)})
     policy (long seed) (boolean strict?) (boolean trace?) schedule)))
 
 (defn now-ms
@@ -304,54 +306,65 @@
   [v n]
   (into (subvec v 0 n) (subvec v (inc n))))
 
+(defn- lcg-next
+  "Linear Congruential Generator step. Returns next RNG state.
+  Uses parameters that work well within 32-bit range for CLJS compatibility."
+  [rng-state]
+  (let [;; LCG parameters (same as MINSTD)
+        a 48271
+        m 2147483647 ; 2^31 - 1
+        next-state (mod (* a (long rng-state)) m)]
+    (if (zero? next-state) 1 next-state)))
+
 (defn- select-from-queue
   "Select an item from the queue based on the decision.
-  Returns [selected-item remaining-queue] or nil if queue is empty.
+  Returns [selected-item remaining-queue new-rng-state] or nil if queue is empty.
 
   Decisions:
   - :fifo - first in, first out (default)
   - :lifo - last in, first out
-  - :random - random selection (uses seed for determinism)
+  - :random - random selection (uses RNG state for determinism)
   - [:nth n] - select nth item (wraps if n >= queue size)
   - [:by-label label] - select first item with matching label
   - [:by-id id] - select item with matching id"
-  [q decision seed]
+  [q decision rng-state]
   (when-not (q-empty? q)
     ;; Fast path for FIFO - no conversion needed
     (if (= decision :fifo)
-      [(q-peek q) (q-pop q)]
+      [(q-peek q) (q-pop q) rng-state]
       ;; Other decisions need indexed access
       (let [v (q->vec q)
             n (count v)]
         (case decision
           :lifo
-          [(peek v) (vec->q (pop v))]
+          [(peek v) (vec->q (pop v)) rng-state]
 
           :random
-          (let [idx (mod (Math/abs (hash [seed (first v)])) n)]
-            [(nth v idx) (vec->q (remove-nth v idx))])
+          (let [next-rng (lcg-next rng-state)
+                idx (mod next-rng n)]
+            [(nth v idx) (vec->q (remove-nth v idx)) next-rng])
 
           ;; default: check for vector decisions
           (cond
             (and (vector? decision) (= :nth (first decision)))
             (let [idx (mod (second decision) n)]
-              [(nth v idx) (vec->q (remove-nth v idx))])
+              [(nth v idx) (vec->q (remove-nth v idx)) rng-state])
 
             (and (vector? decision) (= :by-label (first decision)))
             (let [label (second decision)
                   idx (or (first (keep-indexed (fn [i item] (when (= label (:label item)) i)) v))
                           0)]
-              [(nth v idx) (vec->q (remove-nth v idx))])
+              [(nth v idx) (vec->q (remove-nth v idx)) rng-state])
 
             (and (vector? decision) (= :by-id (first decision)))
             (let [target-id (second decision)
                   idx (or (first (keep-indexed (fn [i item] (when (= target-id (:id item)) i)) v))
                           0)]
-              [(nth v idx) (vec->q (remove-nth v idx))])
+              [(nth v idx) (vec->q (remove-nth v idx)) rng-state])
 
             ;; fallback to FIFO
             :else
-            [(q-peek q) (q-pop q)]))))))
+            [(q-peek q) (q-pop q) rng-state]))))))
 
 (defn- get-schedule-decision
   "Get the current schedule decision and advance the index.
@@ -407,10 +420,11 @@
           ;; Get schedule decision and select from queue
           (let [[decision s-with-idx] (get-schedule-decision sched s)
                 q-size (count q) ; O(1) for PersistentQueue
+                rng-state (:rng-state s-with-idx)
                 ;; Only use schedule-based selection when queue has multiple items
-                [mt q'] (if (> q-size 1)
-                          (select-from-queue q decision (:seed sched))
-                          [(q-peek q) (q-pop q)])
+                [mt q' new-rng] (if (> q-size 1)
+                                  (select-from-queue q decision rng-state)
+                                  [(q-peek q) (q-pop q) rng-state])
                 now (:now-ms s-with-idx)
                 ;; Build trace event with selection info when queue had choices
                 select-trace (when (> q-size 1)
@@ -422,6 +436,7 @@
                                 :now-ms now})
                 s' (-> s-with-idx
                        (assoc :micro-q q')
+                       (assoc :rng-state new-rng)
                        (cond-> select-trace (maybe-trace-state select-trace))
                        (maybe-trace-state {:event :run-microtask
                                            :id (:id mt)
@@ -1399,10 +1414,9 @@
                    :or {trace? true
                         max-steps 100000
                         max-time-ms 60000}}]
-   (let [sched (make-scheduler {:schedule schedule :trace? trace?})]
-     (binding [*scheduler* sched]
-       (run sched task {:max-steps max-steps
-                        :max-time-ms max-time-ms})))))
+   (with-determinism [sched (make-scheduler {:schedule schedule :trace? trace?})]
+     (run sched task {:max-steps max-steps
+                      :max-time-ms max-time-ms}))))
 
 (defn seed->schedule
   "Deterministically generate a schedule from a seed.

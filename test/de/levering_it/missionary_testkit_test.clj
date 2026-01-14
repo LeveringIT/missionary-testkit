@@ -603,6 +603,57 @@
 ;; Interleaving Tests
 ;; =============================================================================
 
+(deftest random-selection-determinism-test
+  (testing ":random selection is deterministic with same seed across runs"
+    ;; This test verifies the fix for non-deterministic :random selection.
+    ;; Previously, :random used (hash task-map) which included function objects,
+    ;; making results non-reproducible. Now it uses a proper LCG RNG.
+    (let [run-task (fn [seed]
+                     (let [order (atom [])]
+                       (mt/with-determinism [sched (mt/make-scheduler {:seed seed
+                                                                        :schedule [:random :random :random
+                                                                                   :random :random :random]})]
+                         (mt/run sched
+                                 (m/sp
+                                  (m/? (m/join vector
+                                               (m/sp (m/? (m/sleep 0)) (swap! order conj :a) :a)
+                                               (m/sp (m/? (m/sleep 0)) (swap! order conj :b) :b)
+                                               (m/sp (m/? (m/sleep 0)) (swap! order conj :c) :c))))))
+                       @order))]
+      ;; Same seed should produce same order every time
+      (let [result1 (run-task 42)
+            result2 (run-task 42)
+            result3 (run-task 42)]
+        (is (= result1 result2) "Same seed should produce same execution order")
+        (is (= result2 result3) "Same seed should produce same execution order"))
+
+      ;; Different seeds should (likely) produce different orders
+      (let [results (set (map run-task (range 10)))]
+        (is (> (count results) 1)
+            "Different seeds should produce different execution orders"))))
+
+  (testing ":random selection is deterministic in check-interleaving"
+    ;; Verify that check-interleaving replay works correctly with :random
+    (let [make-task (fn []
+                      (let [order (atom [])]
+                        (m/sp
+                         (m/? (m/join (fn [& _] @order)
+                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :a))
+                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :b))
+                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :c)))))))
+          ;; Run with a seed that generates :random decisions
+          exploration (mt/with-determinism [_ (mt/make-scheduler)]
+                        (mt/explore-interleavings make-task {:num-samples 20
+                                                              :seed 12345}))]
+      ;; Should produce deterministic results - same seeds always give same outcomes
+      (is (pos? (:unique-results exploration)))
+
+      ;; Replay should give same result
+      (when-let [first-result (first (:results exploration))]
+        (let [replayed (mt/replay-schedule (make-task) (:schedule first-result))]
+          (is (= (:result first-result) replayed)
+              "Replaying schedule should produce same result"))))))
+
 (deftest schedule-selection-test
   (testing "FIFO selection maintains order"
     (let [order (atom [])]
