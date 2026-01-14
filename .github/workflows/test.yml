@@ -35,4 +35,4 @@ jobs:
             ${{ runner.os }}-clojure-
 
       - name: Run tests
-        run: clojure -M:test -m cognitect.test-runner
+        run: clojure -T:build ci
