@@ -1,6 +1,7 @@
 # missionary-testkit
 
-[![Tests](https://github.com/levering-it/missionary-testkit/actions/workflows/test.yml/badge.svg)](https://github.com/levering-it/missionary-testkit/actions/workflows/test.yml)
+[![Clojars Project](https://img.shields.io/clojars/v/de.levering-it/missionary-testkit.svg)](https://clojars.org/de.levering-it/missionary-testkit)
+![Tests](https://github.com/LeveringIt/missionary-testkit/actions/workflows/test.yaml/badge.svg?branch=main)
 
 A deterministic testing toolkit for [Missionary](https://github.com/leonoel/missionary) - the functional effect and streaming library for Clojure/ClojureScript.
 
