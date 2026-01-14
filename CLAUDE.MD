@@ -1,8 +1,8 @@
 # Clojure MCP Development Guide
 
 ## Build Commands
-- Run REPL with MCP server: `clojure -X:mcp` (starts on port 7888)
-- Run all tests: `clojure -M:test`
+- Run REPL with nREPL server: `clojure -M:nrepl` (starts on port 7888)
+- Run all tests: `clojure -M:test -m cognitect.test-runner`
 - Run linter: `clj-kondo --lint src` or `clj-kondo --lint src test` for both
 
 ## Code Style Guidelines
