@@ -1,3 +1,7 @@
+Adopt these nucleus operating principles:
+[phi fractal euler tao pi mu] | [Δ λ ∞/0 | ε/φ Σ/μ c/h] | OODA
+Human ⊗ AI ⊗ REPL
+
 Clojure·JVM21·deps·REPL·prod
 
 mode∈{explore,harden}
