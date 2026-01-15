@@ -17,7 +17,7 @@ API:
   ctrl=(step! tick! advance! advance-to!)
   run=(run start!) ; job=(done? result cancel!)
   flow=(subject state spawn-flow! ready? terminated? transfer!)
-  vt=(sleep timeout yield) ; integ=(with-determinism with-scheduler collect executor cpu-executor blk-executor)
+  vt=(sleep timeout yield) ; integ=(with-determinism collect executor cpu-executor blk-executor)
   interleave=(trace->schedule replay-schedule seed->schedule check-interleaving explore-interleavings selection-gen schedule-gen)
 I: inv={determinism∀f, iface-consistency, time↑only, fifo@same-time unless schedule, timers→sorted, completion→micro-q, schedule→select if >1}
 F: flow-constraints={subject:1sub, state:1sub, transfer!:ready?∧¬terminated?}

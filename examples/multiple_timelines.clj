@@ -120,14 +120,14 @@
 
   ;; You can also replay with tracing to debug
   (mt/with-determinism
-    (mt/with-scheduler [sched (mt/make-scheduler
-                                {:micro-schedule (:micro-schedule failure-result)
-                                 :trace? true})]
-      (let [result (mt/run sched (make-buggy-counter-task))]
-        (println "\nResult:" result)
-        (println "\nDetailed trace:")
-        (doseq [event (mt/trace sched)]
-          (println " " event)))))
+    (let [sched (mt/make-scheduler
+                  {:micro-schedule (:micro-schedule failure-result)
+                   :trace? true})
+          result (mt/run sched (make-buggy-counter-task))]
+      (println "\nResult:" result)
+      (println "\nDetailed trace:")
+      (doseq [event (mt/trace sched)]
+        (println " " event))))
   )
 
 ;; =============================================================================
@@ -240,6 +240,6 @@
 ;;    - No-op in production, only affects test scheduling
 ;;    - Essential for testing concurrent code with interleaving
 ;;
-;; 5. mt/with-scheduler + :trace? true - Debug execution order
+;; 5. mt/make-scheduler + :trace? true - Debug execution order
 ;;    - See exactly which tasks ran in what order
 ;;    - Understand why a particular outcome occurred

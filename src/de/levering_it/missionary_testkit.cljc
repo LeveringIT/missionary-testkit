@@ -839,7 +839,7 @@
   "Run task deterministically to completion (or throw).
 
   Automatically binds *scheduler* to sched for the duration of execution,
-  so m/via with m/cpu or m/blk works without explicit with-scheduler.
+  so m/via with m/cpu or m/blk works correctly.
 
   JVM: returns value or throws.
   CLJS: returns a js/Promise that resolves/rejects."
@@ -909,7 +909,7 @@
      (throw (ex-info "mt/blk-executor is JVM-only." {:mt/kind ::unsupported}))))
 
 ;; -----------------------------------------------------------------------------
-;; Integration macros: with-determinism, with-scheduler
+;; Integration macro: with-determinism
 ;; -----------------------------------------------------------------------------
 
 #?(:clj
@@ -968,30 +968,6 @@
      nil))
 
 #?(:clj
-   (defmacro with-scheduler
-     "Bind *scheduler* to a scheduler for the duration of body.
-
-     NOTE: Usually not needed. mt/run and mt/start! automatically bind *scheduler*.
-     Only use this macro when you need *scheduler* bound outside of run/start!,
-     e.g., for calling mt/clock or mt/executor directly.
-
-     Usage:
-       (with-determinism
-         (let [sched (mt/make-scheduler)]
-           (with-scheduler [_ sched]  ; bind for clock
-             (println \"Time:\" (mt/clock)))
-           (mt/run sched (m/sp ...))))  ; run binds automatically
-
-     Equivalent to:
-       (let [sched (mt/make-scheduler)]
-         (binding [mt/*scheduler* sched]
-           ...))"
-     [[sched-sym sched-expr] & body]
-     `(let [~sched-sym ~sched-expr]
-        (binding [*scheduler* ~sched-sym]
-          ~@body))))
-
-#?(:clj
    (defmacro with-determinism
      "Scope deterministic behavior to a test body by rebinding/redefining Missionary vars.
 
@@ -1003,20 +979,20 @@
 
      Usage:
        (with-determinism
-         (with-scheduler [sched (mt/make-scheduler)]
+         (let [sched (mt/make-scheduler)]
            (mt/run sched
              (m/sp (m/? (m/sleep 100)) :done))))
 
      Also correct (factory function called inside):
        (defn make-task [] (m/sp (m/? (m/sleep 100)) :done))
        (with-determinism
-         (with-scheduler [sched (mt/make-scheduler)]
+         (let [sched (mt/make-scheduler)]
            (mt/run sched (make-task))))
 
      WRONG (task created outside - will use real time!):
        (def my-task (m/sp (m/? (m/sleep 100)) :done))  ; WRONG: created outside
        (with-determinism
-         (with-scheduler [sched (mt/make-scheduler)]
+         (let [sched (mt/make-scheduler)]
            (mt/run sched my-task)))  ; m/sleep was NOT rebound when task was created
 
      Effects:
@@ -1029,6 +1005,9 @@
      NOTE: m/via with m/cpu or m/blk works correctly because these executors
      are rebound to run work as scheduler microtasks. Do NOT use real executors
      (e.g., Executors/newFixedThreadPool) inside with-determinism.
+
+     NOTE: mt/run and mt/start! automatically bind *scheduler* to sched, so you
+     don't need any explicit binding - just pass the scheduler as an argument.
 
      INTERRUPT BEHAVIOR: When a via task is cancelled before its microtask executes,
      the via body will run with Thread.interrupted() returning true. Blocking calls
@@ -1547,7 +1526,7 @@
    (when-not *is-deterministic*
      (throw (ex-info "replay-schedule must be called inside with-determinism body"
                      {:mt/kind ::replay-without-determinism})))
-   (with-scheduler [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
+   (let [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
      (run sched task {:max-steps max-steps
                       :max-time-ms max-time-ms}))))
 
@@ -1586,17 +1565,17 @@
   Must be called inside a with-determinism body."
   [task {:keys [test-seed schedule-length max-steps max-time-ms]
          :or {max-time-ms 60000}}]
-  (let [schedule (seed->schedule test-seed schedule-length)]
-    (with-scheduler [sched (make-scheduler {:micro-schedule schedule :trace? true :rng-seed test-seed})]
-      (let [result (try
-                     {:value (run sched task {:max-steps max-steps
-                                              :max-time-ms max-time-ms})}
-                     (catch #?(:clj Throwable :cljs :default) e
-                       {:error e}))]
-        {:result result
-         :seed test-seed
-         :micro-schedule (trace->schedule (trace sched))
-         :trace (trace sched)}))))
+  (let [schedule (seed->schedule test-seed schedule-length)
+        sched (make-scheduler {:micro-schedule schedule :trace? true :rng-seed test-seed})
+        result (try
+                 {:value (run sched task {:max-steps max-steps
+                                          :max-time-ms max-time-ms})}
+                 (catch #?(:clj Throwable :cljs :default) e
+                   {:error e}))]
+    {:result result
+     :seed test-seed
+     :micro-schedule (trace->schedule (trace sched))
+     :trace (trace sched)}))
 
 (defn check-interleaving
   "Run a task with many different interleavings to find failures.

@@ -506,9 +506,8 @@ The scheduler automatically detects common problems:
 - `*scheduler*` - the current TestScheduler (bound automatically by `run` and `start!`)
 - `*is-deterministic*` - `true` when inside `with-determinism` scope
 
-### Integration Macros
-- `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point))
-- `(with-scheduler [sched expr] & body)` - bind `*scheduler*` to `sched` for the body. Usually not needed since `run` and `start!` bind it automatically. Use only for direct `clock` or `executor` calls outside `run`.
+### Integration Macro
+- `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point)). `run` and `start!` automatically bind `*scheduler*` to the passed scheduler.
 
 ### Interleaving (Concurrency Testing)
 - `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:success true :seed s ...}` or `{:failure ... :seed s ...}`.
