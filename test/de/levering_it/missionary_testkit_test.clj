@@ -986,13 +986,15 @@
       (is (every? #{:fifo :lifo :random} schedule)))))
 
 (deftest check-interleaving-test
-  (testing "returns nil when all tests pass"
+  (testing "returns success map with seed when all tests pass"
     (mt/with-determinism
       (let [task-fn (fn [] (m/sp (m/? (m/sleep 10 :done))))
             result (mt/check-interleaving task-fn {:num-tests 10
                                                    :seed 42
                                                    :property (fn [v] (= v :done))})]
-        (is (nil? result)))))
+        (is (:success result))
+        (is (= 42 (:seed result)))
+        (is (= 10 (:iterations-run result))))))
 
   (testing "returns failure info when property fails"
     (mt/with-determinism
@@ -1202,12 +1204,12 @@
           valid? (fn [result] (= 12 result))]
 
       (mt/with-determinism [_ (mt/make-scheduler)]
-        (let [failure (mt/check-interleaving make-fixed-task
-                                             {:num-tests 100
-                                              :seed 99999
-                                              :property valid?})]
+        (let [result (mt/check-interleaving make-fixed-task
+                                            {:num-tests 100
+                                             :seed 99999
+                                             :property valid?})]
           ;; Fixed version should pass all interleavings
-          (is (nil? failure)
+          (is (:success result)
               "Fixed version should pass all interleavings"))))))
 
 ;; =============================================================================

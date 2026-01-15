@@ -1488,6 +1488,9 @@
                    :or {trace? true
                         max-steps 100000
                         max-time-ms 60000}}]
+   (when-not *is-deterministic*
+     (throw (ex-info "replay-schedule must be called inside with-determinism body"
+                     {:mt/kind ::replay-without-determinism})))
    (with-scheduler [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
      (run sched task {:max-steps max-steps
                       :max-time-ms max-time-ms}))))
@@ -1541,8 +1544,6 @@
 
 (defn check-interleaving
   "Run a task with many different interleavings to find failures.
-  Returns nil if all pass, or a map with failure info including the schedule
-  that caused the failure.
 
   IMPORTANT: Must be called inside a with-determinism body.
 
@@ -1556,6 +1557,11 @@
   - :max-steps   - max scheduler steps per run (default 10000)
   - :max-time-ms - max virtual time per run (default 60000)
   - :schedule-length - length of generated micro-schedules (default 100)
+
+  Returns on success:
+  {:success        true
+   :seed           base seed used (for reproducibility)
+   :iterations-run number of iterations completed}
 
   Returns on failure:
   {:failure        {:value v} or {:error e}
@@ -1573,7 +1579,8 @@
                  schedule-length 100}}]
   (let [base-seed (or seed (default-base-seed))]
     (loop [i 0]
-      (when (< i num-tests)
+      (if (>= i num-tests)
+        {:success true :seed base-seed :iterations-run num-tests}
         (let [run-result (run-with-schedule (task-fn)
                                             {:test-seed (+ base-seed i)
                                              :schedule-length schedule-length

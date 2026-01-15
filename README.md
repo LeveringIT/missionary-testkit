@@ -498,8 +498,8 @@ The scheduler automatically detects common problems:
 - Legacy: `(with-determinism [sched expr] & body)` - combines both macros (still supported)
 
 ### Interleaving (Concurrency Testing)
-- `(check-interleaving task-fn opts)` - find failures across many interleavings (task-fn is a 0-arg function). Always specify `:seed` for reproducibility.
-- `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`. Always specify `:seed` for reproducibility.
+- `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:success true :seed s ...}` or `{:failure ... :seed s ...}`.
+- `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`.
 - `(replay-schedule task schedule)` - replay exact execution order (task created inside `with-determinism`)
 - `(trace->schedule trace)` - extract schedule from trace
 - `(seed->schedule seed n)` - generate schedule from seed (cross-platform consistent)

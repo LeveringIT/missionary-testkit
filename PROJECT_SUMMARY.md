@@ -110,7 +110,7 @@ Task completes  → result delivered via microtask (deterministic ordering)
 - `(trace->schedule trace)` → vector of selection decisions from trace
 - `(replay-schedule task schedule)` / `(replay-schedule task schedule opts)` → runs task with exact schedule (task created inside `with-determinism`)
 - `(seed->schedule seed n)` → deterministically generates schedule of length n (cross-platform consistent LCG)
-- `(check-interleaving task-fn opts)` → runs task-fn with many interleavings, returns nil or failure info
+- `(check-interleaving task-fn opts)` → runs task-fn with many interleavings, returns {:success true :seed s} or {:failure ... :seed s}
 - `(explore-interleavings task-fn opts)` → explores interleavings, returns {:unique-results n :results [...] :seed s}
 - `(selection-gen)` → test.check generator for single selection decision
 - `(schedule-gen max-decisions)` → test.check generator for schedule vector
@@ -118,8 +118,7 @@ Task completes  → result delivered via microtask (deterministic ordering)
 Note: `check-interleaving` and `explore-interleavings` take a task-fn (0-arg function returning a task)
 to ensure fresh state for each iteration. `replay-schedule` takes a task directly.
 
-**Reproducibility:** Always specify `:seed` in opts for reproducible tests. Without it, the current
-system time is used. `explore-interleavings` returns the seed used in its result map.
+**Reproducibility:** Both functions always return `:seed` in the result map for reproducibility.
 
 ## Dynamic Vars
 
