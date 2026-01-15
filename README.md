@@ -137,9 +137,10 @@ The scheduler manages virtual time and a queue of pending tasks:
 
 ```clojure
 (def sched (mt/make-scheduler {:initial-ms      0       ; starting time
+                                :seed            42      ; unified seed (sets rng + timer-order :seeded)
                                 :trace?          true    ; enable execution trace
-                                :timer-order     :fifo   ; timer tie-breaking (:fifo or :seeded)
-                                :rng-seed        42      ; seed for all RNG uses
+                                :timer-order     :fifo   ; explicit override (:fifo or :seeded)
+                                :rng-seed        42      ; explicit RNG override (defaults to :seed)
                                 :micro-schedule  nil}))  ; microtask interleaving (see Schedule Decisions)
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
@@ -365,10 +366,10 @@ This is useful for:
                   :seed 42  ; Always specify for reproducibility
                   :property (fn [v] (#{20 10} v))})]  ; only valid results
 
-    (when result
+    (when-not (:ok? result)
       (println "Bug found!")
       (println "Seed:" (:seed result))
-      (println "Schedule:" (:micro-schedule result)))))
+      (println "Schedule:" (:schedule result)))))
 ```
 
 **Note:** For reproducible tests, always specify `:seed`. Without it, the current system time is used, making failures harder to reproduce.
@@ -378,12 +379,16 @@ This is useful for:
 When `check-interleaving` finds a bug, you can replay the exact schedule:
 
 ```clojure
-;; Replay the failing case - create the task inside with-determinism
+;; Replay using the failure bundle directly
 (mt/with-determinism
-  (mt/replay-schedule (make-buggy-task) (:micro-schedule result)))
+  (mt/replay make-buggy-task result))
+
+;; Or extract the schedule manually
+(mt/with-determinism
+  (mt/replay-schedule (make-buggy-task) (:schedule result)))
 ```
 
-**Note:** `replay-schedule` takes a task directly. The task must be created inside `with-determinism` to ensure virtual time primitives are properly rebound.
+**Note:** `replay` takes a task factory and the failure bundle. `replay-schedule` takes a task instance directly. Both must be called inside `with-determinism`.
 
 ### Exploring All Outcomes
 
@@ -465,6 +470,7 @@ The scheduler automatically detects common problems:
 - `(now-ms sched)` - current virtual time in milliseconds (requires scheduler)
 - `(clock)` - current time: virtual when scheduler bound, real otherwise (for production code)
 - `(pending sched)` - queued microtasks and timers
+- `(next-event sched)` - what would execute next: `{:type :microtask ...}`, `{:type :timer ...}`, or `nil`
 - `(trace sched)` - execution trace (if enabled)
 
 ### Time Control
@@ -509,8 +515,9 @@ The scheduler automatically detects common problems:
 - `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point)). `run` and `start!` automatically bind `*scheduler*` to the passed scheduler.
 
 ### Interleaving (Concurrency Testing)
-- `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:success true :seed s ...}` or `{:failure ... :seed s ...}`.
+- `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:ok? true :seed s ...}` or `{:ok? false :kind ... :schedule ... :seed s ...}`.
 - `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`.
+- `(replay task-fn failure)` - replay a failure bundle from `check-interleaving`
 - `(replay-schedule task schedule)` - replay exact execution order (task created inside `with-determinism`)
 - `(trace->schedule trace)` - extract schedule from trace
 - `(seed->schedule seed n)` - generate schedule from seed (cross-platform consistent)
