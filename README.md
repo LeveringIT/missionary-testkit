@@ -648,6 +648,116 @@ The same applies to `m/watch` vs `mt/state`:
 
 **Use testkit versions** when you want full traceability or thread safety protection. **Use Missionary built-ins** for simple tests where you control all modifications from within scheduled code.
 
+### Cancellation Semantics
+
+The testkit implements Missionary's documented cancellation behavior: **"cancelling sleep makes it fail immediately"**.
+
+#### What happens when a task is cancelled
+
+When a task is cancelled (e.g., the loser of `m/race` or a task that exceeds `m/timeout`):
+
+1. **Pending sleeps throw `missionary.Cancelled`** - The sleep does NOT deliver its value
+2. **Cancellation is immediate** - Happens at the winner's time, not the sleep's scheduled time
+3. **`finally` blocks execute** - Cleanup code runs as expected
+4. **Catch blocks can handle `Cancelled`** - The task can recover and continue
+
+```clojure
+(mt/with-determinism
+  (let [sched (mt/make-scheduler {:trace? true})]
+    (mt/run sched
+      (m/sp
+        (m/? (m/race
+               (m/sp
+                 (try
+                   (m/? (m/sleep 500 :never-delivered))  ; scheduled for t=500
+                   (catch missionary.Cancelled _
+                     :was-cancelled)))                   ; this runs instead
+               (m/sleep 100 :winner)))))))              ; wins at t=100
+;; => :winner (the race returns the winner's value)
+;; The losing task's catch block runs at t=100, not t=500
+```
+
+#### Execution order during cancellation
+
+When a race is decided, the execution order is:
+
+1. Winner's continuation runs
+2. Loser's cancellation is processed (via microtask)
+3. Loser's `catch`/`finally` blocks run
+4. Code after the race continues
+
+```clojure
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        events (atom [])]
+    (mt/run sched
+      (m/sp
+        (let [result (m/? (m/race
+                           (m/sp
+                             (try
+                               (m/? (m/sleep 200))
+                               (finally
+                                 (swap! events conj :loser-cleanup))))
+                           (m/sp
+                             (m/? (m/sleep 100))
+                             (swap! events conj :winner-done)
+                             :fast)))]
+          (swap! events conj :after-race)
+          result)))
+    @events))
+;; => [:winner-done :loser-cleanup :after-race]
+```
+
+#### Comparison with real Missionary
+
+The testkit's cancellation semantics match real Missionary:
+
+| Behavior | Testkit | Real Missionary |
+|----------|---------|-----------------|
+| `Cancelled` exception thrown | ✓ | ✓ |
+| Immediate cancellation | ✓ | ✓ |
+| Sleep value not delivered | ✓ | ✓ |
+| `finally` blocks run | ✓ | ✓ |
+| Nested cancellation propagates | ✓ | ✓ |
+
+**One subtle difference:** The testkit delivers `Cancelled` via microtask for deterministic ordering. Real Missionary may deliver it synchronously. This ensures reproducible execution order in tests but means the testkit always processes cancellation in a specific order relative to other pending work.
+
+#### Testing cancellation scenarios
+
+Use the testkit to verify your code handles cancellation correctly:
+
+```clojure
+;; Test that resources are cleaned up on cancellation
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        resource-released? (atom false)]
+    (mt/run sched
+      (m/sp
+        (m/? (m/timeout
+               (m/sp
+                 (try
+                   (m/? (m/sleep 1000))
+                   (finally
+                     (reset! resource-released? true))))
+               100
+               :timed-out))))
+    (is @resource-released?)))
+
+;; Test that catch blocks can recover from cancellation
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)]
+    (is (= :recovered
+           (mt/run sched
+             (m/sp
+               (m/? (m/race
+                      (m/sp
+                        (try
+                          (m/? (m/sleep 200))
+                          (catch missionary.Cancelled _
+                            :recovered)))
+                      (m/sleep 100 :winner)))))))))
+```
+
 ### Threading model
 
 Missionary uses cooperative single-threaded execution by default. Tasks interleave at `m/?` suspension points, not truly in parallel. The testkit controls:
