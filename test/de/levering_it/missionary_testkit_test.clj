@@ -794,16 +794,18 @@
                               (m/sleep 0 :b)
                               (m/sleep 0 :c))))))))
 
-  (testing "schedule falls back to FIFO when exhausted"
+  (testing "schedule exhaustion throws error"
     (mt/with-determinism
       (let [sched (mt/make-scheduler {:micro-schedule [:lifo] :trace? true})]
-        ;; Schedule has only 1 decision, rest should use FIFO
-        (is (= :done
-               (mt/run sched
-                       (m/sp
-                        (m/? (m/sleep 10))
-                        (m/? (m/sleep 10))
-                        :done))))))))
+        ;; Schedule has only 1 decision but 3 concurrent tasks need 2 decisions
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"Schedule exhausted"
+                              (mt/run sched
+                                      (m/sp
+                                       (m/? (m/join vector
+                                                    (m/sleep 0 :a)
+                                                    (m/sleep 0 :b)
+                                                    (m/sleep 0 :c)))))))))))
 
 (deftest by-label-selection-test
   (testing "[:by-label label] selects task with matching label"

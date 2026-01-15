@@ -25,6 +25,7 @@
 (def ^:const deadlock ::deadlock)
 (def ^:const budget-exceeded ::budget-exceeded)
 (def ^:const off-scheduler-callback ::off-scheduler-callback)
+(def ^:const schedule-exhausted ::schedule-exhausted)
 
 (def ^:const illegal-blocking-emission ::illegal-blocking-emission)
 (def ^:const illegal-transfer ::illegal-transfer)
@@ -370,13 +371,17 @@
 
 (defn- get-schedule-decision
   "Get the current schedule decision and advance the index.
-  Returns [decision new-state]."
+  Returns [decision new-state].
+  Throws if schedule is exhausted (explicit schedule provided but ran out)."
   [^TestScheduler sched s]
   (if-let [schedule (:micro-schedule sched)]
     (let [idx (:schedule-idx s)]
       (if (< idx (count schedule))
         [(nth schedule idx) (update s :schedule-idx inc)]
-        [:fifo s])) ; default to FIFO when schedule exhausted
+        (throw (mt-ex schedule-exhausted sched
+                      "Schedule exhausted; increase schedule-length"
+                      {:schedule-length (count schedule)
+                       :decisions-used idx}))))
     [:fifo s]))
 
 (defn- finalize-timer-promotion
