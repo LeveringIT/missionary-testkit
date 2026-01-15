@@ -34,6 +34,36 @@
     (let [sched (mt/make-scheduler)]
       (is (= 0 (mt/tick! sched))))))
 
+(deftest next-event-test
+  (testing "returns nil when idle"
+    (let [sched (mt/make-scheduler)]
+      (is (nil? (mt/next-event sched)))))
+
+  (testing "returns microtask info when microtask queued"
+    (let [sched (mt/make-scheduler)]
+      (mt/start! sched (mt/yield :done) {:label "test-yield"})
+      (let [ev (mt/next-event sched)]
+        (is (= :microtask (:type ev)))
+        (is (some? (:kind ev)))
+        (is (some? (:id ev))))))
+
+  (testing "returns timer info when only timer pending"
+    (let [sched (mt/make-scheduler)]
+      (mt/start! sched (mt/sleep 100 :done) {:label "test-sleep"})
+      (let [ev (mt/next-event sched)]
+        (is (= :timer (:type ev)))
+        (is (= :sleep (:kind ev)))
+        (is (= 100 (:at-ms ev))))))
+
+  (testing "prefers microtask over timer"
+    (let [sched (mt/make-scheduler)]
+      ;; Start a sleep then add a yield - both pending
+      (mt/start! sched (mt/sleep 100 :done) {})
+      (mt/start! sched (mt/yield :immediate) {})
+      ;; Should show microtask (yield), not timer
+      (let [ev (mt/next-event sched)]
+        (is (= :microtask (:type ev)))))))
+
 (deftest advance-test
   (testing "advance-to! moves time forward"
     (let [sched (mt/make-scheduler)]

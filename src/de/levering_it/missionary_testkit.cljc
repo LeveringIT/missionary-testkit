@@ -185,6 +185,36 @@
      (mapv (fn [[_ t]] (select-keys t [:id :kind :label :at-ms :lane]))
            timers)}))
 
+(defn next-event
+  "Returns info about what would execute next, or nil if idle.
+
+  Useful for stepwise debugging and agent introspection.
+
+  Returns:
+  - {:type :microtask :id ... :kind ... :label ... :lane ...}
+    when a microtask is ready to run
+  - {:type :timer :id ... :kind ... :label ... :at-ms ... :lane ...}
+    when no microtasks but a timer is pending
+  - nil when scheduler is idle (no work pending)
+
+  Note: This reflects FIFO order for microtasks. Actual selection may differ
+  if a micro-schedule with non-FIFO decisions is configured."
+  [^TestScheduler sched]
+  (let [{:keys [micro-q timers]} @(:state sched)]
+    (if-let [mt (peek micro-q)]
+      {:type :microtask
+       :id (:id mt)
+       :kind (:kind mt)
+       :label (:label mt)
+       :lane (:lane mt)}
+      (when-let [[_ t] (first timers)]
+        {:type :timer
+         :id (:id t)
+         :kind (:kind t)
+         :label (:label t)
+         :at-ms (:at-ms t)
+         :lane (:lane t)}))))
+
 (defn- diag
   ([sched] (diag sched nil))
   ([^TestScheduler sched label]
