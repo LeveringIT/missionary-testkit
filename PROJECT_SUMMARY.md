@@ -23,7 +23,8 @@ I: inv={determinism∀f, iface-consistency, time↑only, fifo@same-time unless s
 DC: det-yes={sleep,timeout,yield,race,join,amb,amb=,seed,sample,relieve,sem,rdv,mbx,dfv,subject,state,via(cpu|blk)} ; det-no={publisher,stream,signal,via(custom),real-IO,observe(ext),watch(ext)}
 F: flow-constraints={subject:1sub, state:1sub, transfer!:ready?∧¬terminated?}
 TS: strict⇒drive-only-one-thread ; off-thread-cb⇒fail(::off-scheduler-callback) ; atom⇒safe-reads ; with-determinism⇒global-lock(parallel-safe)
-via: m/via(cpu|blk)⇒sync-on-driver ; real-exec⇒break-determinism ; cancel⇒interrupt ; InterruptedException possible ; flag-cleared-after
+via: m/via(cpu|blk)⇒sync-on-driver ; real-exec⇒break-determinism ; cancel⇒interrupt ; InterruptedException possible
+INT: step!⇒clear-before+after ; trace:interrupt-cleared{:before :after :id :now-ms} ; scheduler-thread-stable
 XP: .cljc ; JVM-only={Executor fns} ; CLJS={with-determinism patches sleep/timeout only, run⇒Promise} ; JVM run⇒value
 CFG: deps-alias{:test,:nrepl(7888),:build} ; env{CLOJARS_USERNAME,CLOJARS_PASSWORD} ; mcp-config=.clojure-mcp/config.edn start-nrepl=["clojure","-M:nrepl"]
 CMD: repl=clojure -M:nrepl ; build=clojure -T:build ci ; deploy=clojure -T:build deploy

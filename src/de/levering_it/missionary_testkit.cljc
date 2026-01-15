@@ -485,11 +485,32 @@
                                              :now-ms now}))]
               (if (compare-and-set! state-atom s s')
                 (do
-                  (try
-                    ((:f mt))
-                    (catch #?(:clj Throwable :cljs :default) e
-                      ;; Re-throw user exceptions untouched (so tests can assert on them).
-                      (throw e)))
+                  #?(:clj
+                     ;; Clear any pending interrupt before executing microtask.
+                     ;; This prevents stale interrupt state from leaking into the task
+                     ;; and affecting blocking operations unexpectedly.
+                     (let [was-interrupted (Thread/interrupted)]
+                       (try
+                         ((:f mt))
+                         (catch Throwable e
+                           (throw e))
+                         (finally
+                           ;; Clear interrupt flag after execution to keep scheduler stable.
+                           ;; Record in trace if interrupt occurred during or before execution.
+                           (let [interrupted-after (Thread/interrupted)]
+                             (when (and (:trace? sched) (or was-interrupted interrupted-after))
+                               (swap! state-atom
+                                      maybe-trace-state
+                                      {:event :interrupt-cleared
+                                       :id (:id mt)
+                                       :before was-interrupted
+                                       :after interrupted-after
+                                       :now-ms now}))))))
+                     :cljs
+                     (try
+                       ((:f mt))
+                       (catch :default e
+                         (throw e))))
                   (dissoc mt :f))
                 (recur)))))))))
 
