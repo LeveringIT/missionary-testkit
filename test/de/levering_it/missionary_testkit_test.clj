@@ -1006,6 +1006,39 @@
           (is (vector? r1))
           (is (vector? r2)))))))
 
+(deftest replay-test
+  (testing "replay accepts failure bundle directly"
+    (mt/with-determinism
+      (let [make-task (fn []
+                        (let [counter (atom 0)]
+                          (m/sp
+                           (m/? (m/join
+                                 (fn [_ _] @counter)
+                                 (m/sp
+                                  (let [v @counter]
+                                    (m/? (m/sleep 0))
+                                    (reset! counter (+ v 5))))
+                                 (m/sp
+                                  (let [v @counter]
+                                    (m/? (m/sleep 0))
+                                    (reset! counter (+ v 7)))))))))
+            failure (mt/check-interleaving make-task
+                                           {:num-tests 100
+                                            :seed 99999
+                                            :property (fn [v] (= 12 v))})]
+        ;; Should find a failure
+        (is (false? (:ok? failure)))
+
+        ;; replay should reproduce the same result
+        (let [replayed (mt/replay make-task failure)]
+          (is (= (:value failure) replayed))))))
+
+  (testing "replay throws on missing schedule"
+    (mt/with-determinism
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"missing :schedule"
+                            (mt/replay (fn [] (m/sp :done)) {:ok? false}))))))
+
 (deftest seed->schedule-test
   (testing "generates schedule of correct length"
     (let [schedule (mt/seed->schedule 42 10)]
@@ -1223,9 +1256,9 @@
               "Failing result should not be the expected 12")
 
           ;; Replay should produce the same buggy result
-          (let [replayed (mt/replay-schedule (make-buggy-task) (:schedule failure))]
+          (let [replayed (mt/replay make-buggy-task failure)]
             (is (= (:value failure) replayed)
-                "Replaying the schedule should reproduce the exact same bug"))))))
+                "Replaying the failure bundle should reproduce the exact same bug"))))))
 
   (testing "fixed version passes all interleavings"
     ;; The fix: use swap! for atomic read-modify-write

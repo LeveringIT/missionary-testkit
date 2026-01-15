@@ -1606,6 +1606,34 @@
      (run sched task {:max-steps max-steps
                       :max-time-ms max-time-ms}))))
 
+(defn replay
+  "Replay a failure from check-interleaving.
+
+  IMPORTANT: Must be called inside a with-determinism body.
+
+  Takes a failure bundle (from check-interleaving) and a task factory,
+  re-runs the task with the same schedule that caused the failure.
+
+  Usage:
+    (let [result (mt/check-interleaving make-task {:seed 42 :property valid?})]
+      (when-not (:ok? result)
+        (mt/replay make-task result)))
+
+  Options (merged with failure bundle):
+  - :trace?      - whether to record trace (default true)
+  - :max-steps   - max scheduler steps (default 100000)
+  - :max-time-ms - max virtual time (default 60000)
+
+  Returns the task result (same as replay-schedule)."
+  ([task-fn failure]
+   (replay task-fn failure {}))
+  ([task-fn failure opts]
+   (let [schedule (or (:schedule failure)
+                      (throw (ex-info "Failure bundle missing :schedule"
+                                      {:mt/kind ::invalid-failure-bundle
+                                       :failure failure})))]
+     (replay-schedule (task-fn) schedule opts))))
+
 (defn seed->schedule
   "Deterministically generate a schedule from a seed.
   Creates a schedule of the given length with random FIFO/LIFO/random decisions.
