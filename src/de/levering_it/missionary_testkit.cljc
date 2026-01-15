@@ -1672,16 +1672,19 @@
   - :schedule-length - length of generated micro-schedules (default 100)
 
   Returns on success:
-  {:success        true
+  {:ok?            true
    :seed           base seed used (for reproducibility)
    :iterations-run number of iterations completed}
 
   Returns on failure:
-  {:failure        {:value v} or {:error e}
-   :seed           seed used for this iteration
-   :micro-schedule schedule that caused failure (for replay)
-   :trace          full trace (if trace? was true)
-   :iteration      which iteration failed}
+  {:ok?       false
+   :kind      :exception | :property-failed
+   :seed      seed used for this iteration
+   :schedule  schedule that caused failure (for replay)
+   :trace     full trace
+   :iteration which iteration failed
+   :error     exception (present when :kind is :exception)
+   :value     result value (present when :kind is :property-failed)}
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
@@ -1693,20 +1696,26 @@
   (let [base-seed (or seed (default-base-seed))]
     (loop [i 0]
       (if (>= i num-tests)
-        {:success true :seed base-seed :iterations-run num-tests}
+        {:ok? true :seed base-seed :iterations-run num-tests}
         (let [run-result (run-with-schedule (task-fn)
                                             {:test-seed (+ base-seed i)
                                              :schedule-length schedule-length
                                              :max-steps max-steps
                                              :max-time-ms max-time-ms})
-              {:keys [result seed micro-schedule trace]} run-result]
-          (if (or (:error result)
-                  (and property (not (property (:value result)))))
-            {:failure result
+              {:keys [result seed micro-schedule trace]} run-result
+              exception? (some? (:error result))
+              property-failed? (and property
+                                    (not exception?)
+                                    (not (property (:value result))))]
+          (if (or exception? property-failed?)
+            {:ok? false
+             :kind (if exception? :exception :property-failed)
              :seed seed
-             :micro-schedule micro-schedule
+             :schedule micro-schedule
              :trace trace
-             :iteration i}
+             :iteration i
+             :error (when exception? (:error result))
+             :value (when-not exception? (:value result))}
             (recur (inc i))))))))
 
 (defn explore-interleavings

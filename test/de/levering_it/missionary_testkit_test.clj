@@ -1031,7 +1031,7 @@
             result (mt/check-interleaving task-fn {:num-tests 10
                                                    :seed 42
                                                    :property (fn [v] (= v :done))})]
-        (is (:success result))
+        (is (:ok? result))
         (is (= 42 (:seed result)))
         (is (= 10 (:iterations-run result))))))
 
@@ -1047,19 +1047,20 @@
             result (mt/check-interleaving make-task {:num-tests 10
                                                      :seed 42
                                                      :property (fn [v] (= v 0))})] ; fails: counter is 1
-        (when result
-          (is (map? result))
-          (is (contains? result :failure))
-          (is (contains? result :seed))
-          (is (contains? result :micro-schedule))
-          (is (contains? result :iteration))))))
+        (is (false? (:ok? result)))
+        (is (= :property-failed (:kind result)))
+        (is (= 1 (:value result)))
+        (is (contains? result :seed))
+        (is (contains? result :schedule))
+        (is (contains? result :iteration)))))
 
   (testing "returns failure info when task throws"
     (mt/with-determinism
       (let [task-fn (fn [] (m/sp (throw (ex-info "intentional failure" {}))))
             result (mt/check-interleaving task-fn {:num-tests 5 :seed 42})]
-        (is (map? result))
-        (is (contains? (:failure result) :error))))))
+        (is (false? (:ok? result)))
+        (is (= :exception (:kind result)))
+        (is (some? (:error result)))))))
 
 (deftest explore-interleavings-test
   (testing "explores multiple schedules"
@@ -1209,22 +1210,22 @@
                                               :seed 99999
                                               :property valid?})]
           ;; Should find a failing case
-          (is (some? failure) "Should find an interleaving that exposes the bug")
+          (is (false? (:ok? failure)) "Should find an interleaving that exposes the bug")
+          (is (= :property-failed (:kind failure)))
 
-          (when failure
-            ;; Verify the failure info is complete
-            (is (contains? failure :micro-schedule))
-            (is (contains? failure :seed))
-            (is (vector? (:micro-schedule failure)))
+          ;; Verify the failure info is complete
+          (is (contains? failure :schedule))
+          (is (contains? failure :seed))
+          (is (vector? (:schedule failure)))
 
-            ;; The failing result should be 5 or 7 (not 12)
-            (is (not= 12 (get-in failure [:failure :value]))
-                "Failing result should not be the expected 12")
+          ;; The failing result should be 5 or 7 (not 12)
+          (is (not= 12 (:value failure))
+              "Failing result should not be the expected 12")
 
-            ;; Replay should produce the same buggy result
-            (let [replayed (mt/replay-schedule (make-buggy-task) (:micro-schedule failure))]
-              (is (= (get-in failure [:failure :value]) replayed)
-                  "Replaying the schedule should reproduce the exact same bug")))))))
+          ;; Replay should produce the same buggy result
+          (let [replayed (mt/replay-schedule (make-buggy-task) (:schedule failure))]
+            (is (= (:value failure) replayed)
+                "Replaying the schedule should reproduce the exact same bug"))))))
 
   (testing "fixed version passes all interleavings"
     ;; The fix: use swap! for atomic read-modify-write
@@ -1250,7 +1251,7 @@
                                              :seed 99999
                                              :property valid?})]
           ;; Fixed version should pass all interleavings
-          (is (:success result)
+          (is (:ok? result)
               "Fixed version should pass all interleavings"))))))
 
 ;; =============================================================================
