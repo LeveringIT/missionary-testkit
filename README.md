@@ -523,6 +523,36 @@ The scheduler automatically detects common problems:
 clojure -X:test cognitect.test-runner.api/test
 ```
 
+## Determinism Contract
+
+The testkit provides deterministic execution guarantees under specific conditions.
+
+**Supported deterministically:**
+
+| Primitive | Deterministic? | Notes |
+|-----------|---------------|-------|
+| `m/sleep`, `m/timeout` | ✓ | Virtual time, fully controlled |
+| `mt/yield` | ✓ | Scheduling points for interleaving |
+| `m/race`, `m/join`, `m/amb`, `m/amb=` | ✓ | Under single-threaded scheduler driving |
+| `m/seed`, `m/sample` | ✓ | Under single-threaded scheduler driving |
+| `m/relieve`, `m/sem`, `m/rdv`, `m/mbx`, `m/dfv` | ✓ | Under single-threaded scheduler driving |
+| `mt/subject`, `mt/state` | ✓ | Deterministic flow sources |
+| `m/via` with `m/cpu` or `m/blk` | ✓ | JVM only; executors rebound to scheduler microtasks |
+
+**Explicitly NOT supported (non-deterministic):**
+
+| Primitive | Why |
+|-----------|-----|
+| `m/publisher`, `m/stream`, `m/signal` | Reactive-streams subsystem; external threading |
+| `m/via` with custom executors | Work runs on uncontrolled threads |
+| Real I/O (HTTP, file, database) | Actual wall-clock time, external systems |
+| `m/observe` with external callbacks | Events arrive from outside the scheduler |
+| `m/watch` on atoms modified externally | Modifications from other threads |
+
+**Thread control requirement:** Determinism is guaranteed only when the scheduler drives execution from a single thread. All task completions, flow transfers, and timer callbacks must occur on the scheduler's driver thread. Off-thread callbacks (e.g., from real executors or external event sources) will either throw `::mt/off-scheduler-callback` or silently break determinism.
+
+**Custom executors:** If you must use `m/via` with a custom executor, you fully control that executor's threads and accept that those sections are non-deterministic. The testkit cannot virtualize work scheduled on arbitrary thread pools.
+
 ## Limitations
 
 ### What is virtualized

@@ -17,6 +17,33 @@
 ;;
 
 ;; -----------------------------------------------------------------------------
+;; Determinism Contract
+;; -----------------------------------------------------------------------------
+;;
+;; SUPPORTED DETERMINISTICALLY (under single-threaded scheduler driving):
+;;   - m/sleep, m/timeout             ; virtual time, fully controlled
+;;   - mt/yield                       ; scheduling points for interleaving
+;;   - m/race, m/join, m/amb, m/amb=  ; combinators work with virtualized primitives
+;;   - m/seed, m/sample               ; flow combinators
+;;   - m/relieve, m/sem, m/rdv, m/mbx, m/dfv  ; coordination primitives
+;;   - mt/subject, mt/state           ; deterministic flow sources
+;;   - m/via with m/cpu or m/blk (JVM); executors rebound to scheduler microtasks
+;;
+;; EXPLICITLY NOT SUPPORTED (non-deterministic):
+;;   - m/publisher, m/stream, m/signal  ; reactive-streams subsystem, external threading
+;;   - m/via with custom executors      ; work runs on uncontrolled threads
+;;   - Real I/O (HTTP, file, database)  ; actual wall-clock time, external systems
+;;   - m/observe with external callbacks; events arrive from outside the scheduler
+;;   - m/watch on externally-modified atoms
+;;
+;; THREAD CONTROL: Determinism is guaranteed only when the scheduler drives
+;; execution from a single thread. Off-thread callbacks throw ::off-scheduler-callback
+;; or silently break determinism. If you use m/via with a custom executor, you
+;; accept that those sections are non-deterministic.
+;;
+;; -----------------------------------------------------------------------------
+
+;; -----------------------------------------------------------------------------
 ;; Public keywords / kinds
 ;; -----------------------------------------------------------------------------
 

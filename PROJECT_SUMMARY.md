@@ -20,6 +20,7 @@ API:
   vt=(sleep timeout yield) ; integ=(with-determinism collect executor cpu-executor blk-executor)
   interleave=(trace->schedule replay-schedule seed->schedule check-interleaving explore-interleavings selection-gen schedule-gen)
 I: inv={determinism∀f, iface-consistency, time↑only, fifo@same-time unless schedule, timers→sorted, completion→micro-q, schedule→select if >1}
+DC: det-yes={sleep,timeout,yield,race,join,amb,amb=,seed,sample,relieve,sem,rdv,mbx,dfv,subject,state,via(cpu|blk)} ; det-no={publisher,stream,signal,via(custom),real-IO,observe(ext),watch(ext)}
 F: flow-constraints={subject:1sub, state:1sub, transfer!:ready?∧¬terminated?}
 TS: strict⇒drive-only-one-thread ; off-thread-cb⇒fail(::off-scheduler-callback) ; atom⇒safe-reads ; with-determinism⇒global-lock(parallel-safe)
 via: m/via(cpu|blk)⇒sync-on-driver ; real-exec⇒break-determinism ; cancel⇒interrupt ; InterruptedException possible ; flag-cleared-after
