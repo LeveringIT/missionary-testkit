@@ -4,16 +4,16 @@
      (:import (java.util.concurrent Executor)
               (missionary Cancelled))))
 
-;; missionary/missionary-testkit
+;; missionary-testkit
 ;;
-;; Primary namespace: missionary.testkit  (suggested alias: mt)
+;; Primary namespace: de.levering-it.missionary-testkit  (suggested alias: mt)
 ;;
 ;; NOTE on macros (ClojureScript):
 ;; - `with-determinism` is a macro defined on the CLJ (macro) side.
 ;;   In CLJS you typically require it like:
 ;;     (ns your.test
-;;       (:require [missionary.testkit :as mt])
-;;       (:require-macros [missionary.testkit :refer [with-determinism]]))
+;;       (:require [de.levering-it.missionary-testkit :as mt])
+;;       (:require-macros [de.levering-it.missionary-testkit :refer [with-determinism]]))
 ;;
 
 ;; -----------------------------------------------------------------------------
@@ -108,36 +108,45 @@
 
   Options:
   {:initial-ms     0
-   :timer-order    :fifo | :seeded     ; how timers with same due-time are ordered
-   :rng-seed       42                  ; seed for all RNG (timer tie-breaking, :random selection)
+   :seed           42                  ; unified seed for timer tie-breaking and RNG
+                                       ; when provided, timer-order defaults to :seeded
+   :timer-order    :fifo | :seeded     ; explicit override for timer ordering
+   :rng-seed       42                  ; explicit override for RNG seed (defaults to :seed)
    :trace?         true|false
    :micro-schedule nil | vector        ; selection decisions for microtask interleaving}
+
+  The :seed option is the primary way to control determinism. It automatically:
+  - Sets :rng-seed (for :random selection decisions)
+  - Sets :timer-order to :seeded (for timer tie-breaking)
+
+  Use explicit :timer-order or :rng-seed only if you need different values for each.
 
   Thread safety: On JVM, all scheduler operations must be performed from a single
   thread. Cross-thread callbacks will throw an error to catch accidental nondeterminism."
   ([]
    (make-scheduler {}))
-  ([{:keys [initial-ms timer-order rng-seed trace? micro-schedule]
+  ([{:keys [initial-ms seed timer-order rng-seed trace? micro-schedule]
      :or {initial-ms 0
-          timer-order :fifo
-          rng-seed 0
           trace? false
           micro-schedule nil}}]
-   (->TestScheduler
-    (atom {:now-ms (long initial-ms)
-           :next-id 0
-           :micro-q empty-queue
-           ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
-           :timers (sorted-map)
-           ;; trace is either nil or vector
-           :trace (when trace? [])
-           ;; JVM-only "driver thread" captured lazily for thread safety enforcement
-           :driver-thread #?(:clj nil :cljs ::na)
-           ;; interleaving: micro-schedule index (consumed as used)
-           :schedule-idx 0
-           ;; deterministic RNG state for :random selection (LCG)
-           :rng-state (long rng-seed)})
-    timer-order (long rng-seed) (boolean trace?) micro-schedule)))
+   ;; Derive effective values from :seed with explicit overrides
+   (let [effective-rng-seed (or rng-seed seed 0)
+         effective-timer-order (or timer-order (when seed :seeded) :fifo)]
+     (->TestScheduler
+      (atom {:now-ms (long initial-ms)
+             :next-id 0
+             :micro-q empty-queue
+             ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
+             :timers (sorted-map)
+             ;; trace is either nil or vector
+             :trace (when trace? [])
+             ;; JVM-only "driver thread" captured lazily for thread safety enforcement
+             :driver-thread #?(:clj nil :cljs ::na)
+             ;; interleaving: micro-schedule index (consumed as used)
+             :schedule-idx 0
+             ;; deterministic RNG state for :random selection (LCG)
+             :rng-state (long effective-rng-seed)})
+      effective-timer-order (long effective-rng-seed) (boolean trace?) micro-schedule))))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -1635,8 +1644,7 @@
   (let [schedule (seed->schedule test-seed schedule-length)
         sched (make-scheduler {:micro-schedule schedule
                                :trace? true
-                               :rng-seed test-seed
-                               :timer-order :seeded})
+                               :seed test-seed})
         result (try
                  {:value (run sched task {:max-steps max-steps
                                           :max-time-ms max-time-ms})}

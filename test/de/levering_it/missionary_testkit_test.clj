@@ -687,9 +687,9 @@
     (let [run-task (fn [seed]
                      (let [order (atom [])]
                        (mt/with-determinism
-                         (let [sched (mt/make-scheduler {:rng-seed seed
-                                                                       :micro-schedule [:random :random :random
-                                                                                        :random :random :random]})]
+                         (let [sched (mt/make-scheduler {:seed seed
+                                                        :micro-schedule [:random :random :random
+                                                                         :random :random :random]})]
                            (mt/run sched
                                    (m/sp
                                     (m/? (m/join vector
