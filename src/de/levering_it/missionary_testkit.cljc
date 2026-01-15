@@ -932,15 +932,11 @@
      the macro will capture the real (non-virtual) primitives and will NOT be
      deterministic.
 
-     Usage (preferred - explicit scheduler binding):
+     Usage:
        (with-determinism
          (with-scheduler [sched (mt/make-scheduler)]
            (mt/run sched
              (m/sp (m/? (m/sleep 100)) :done))))
-
-     Legacy usage (still supported):
-       (with-determinism [sched (mt/make-scheduler)]
-         (mt/run sched (m/sp ...)))
 
      Also correct (factory function called inside):
        (defn make-task [] (m/sp (m/? (m/sleep 100)) :done))
@@ -969,35 +965,16 @@
      the via body will run with Thread.interrupted() returning true. Blocking calls
      in the via body will throw InterruptedException. The interrupt flag is cleared
      after the via body completes, so the scheduler remains usable."
-     [& args]
-     (let [cljs? (boolean &env)
-           ;; Detect if first arg is a binding vector [sched expr] (legacy syntax)
-           [binding-form body] (if (and (vector? (first args))
-                                        (= 2 (count (first args))))
-                                 [(first args) (rest args)]
-                                 [nil args])
-           [sched-sym sched-expr] binding-form]
-       (if binding-form
-         ;; Legacy syntax: (with-determinism [sched (make-scheduler)] body...)
-         ;; Expands to use with-scheduler internally
-         `(binding [*is-deterministic* true]
-            (with-redefs
-             [missionary.core/sleep sleep
-              missionary.core/timeout timeout
-              ~@(when-not cljs?
-                  `[missionary.core/cpu (cpu-executor)
-                    missionary.core/blk (blk-executor)])]
-              (with-scheduler [~sched-sym ~sched-expr]
-                ~@body)))
-         ;; New syntax: (with-determinism body...) - user uses with-scheduler explicitly
-         `(binding [*is-deterministic* true]
-            (with-redefs
-             [missionary.core/sleep sleep
-              missionary.core/timeout timeout
-              ~@(when-not cljs?
-                  `[missionary.core/cpu (cpu-executor)
-                    missionary.core/blk (blk-executor)])]
-              ~@body))))))
+     [& body]
+     (let [cljs? (boolean &env)]
+       `(binding [*is-deterministic* true]
+          (with-redefs
+           [missionary.core/sleep sleep
+            missionary.core/timeout timeout
+            ~@(when-not cljs?
+                `[missionary.core/cpu (cpu-executor)
+                  missionary.core/blk (blk-executor)])]
+            ~@body)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Flow determinism: scheduled-flow + spawn-flow!
