@@ -94,7 +94,7 @@
 ;; -----------------------------------------------------------------------------
 
 (defrecord TestScheduler
-           [state timer-order rng-seed trace? micro-schedule])
+           [state timer-order seed trace? micro-schedule])
 
 (defn- maybe-trace-state
   "If tracing enabled (state has non-nil :trace vector), append event."
@@ -108,30 +108,26 @@
 
   Options:
   {:initial-ms     0
-   :seed           42                  ; unified seed for timer tie-breaking and RNG
+   :seed           42                  ; seed for RNG and timer tie-breaking
                                        ; when provided, timer-order defaults to :seeded
    :timer-order    :fifo | :seeded     ; explicit override for timer ordering
-   :rng-seed       42                  ; explicit override for RNG seed (defaults to :seed)
    :trace?         true|false
    :micro-schedule nil | vector        ; selection decisions for microtask interleaving}
 
-  The :seed option is the primary way to control determinism. It automatically:
-  - Sets :rng-seed (for :random selection decisions)
-  - Sets :timer-order to :seeded (for timer tie-breaking)
-
-  Use explicit :timer-order or :rng-seed only if you need different values for each.
+  The :seed option controls determinism:
+  - Used for :random selection decisions
+  - Sets :timer-order to :seeded (for timer tie-breaking) unless explicitly overridden
 
   Thread safety: On JVM, all scheduler operations must be performed from a single
   thread. Cross-thread callbacks will throw an error to catch accidental nondeterminism."
   ([]
    (make-scheduler {}))
-  ([{:keys [initial-ms seed timer-order rng-seed trace? micro-schedule]
+  ([{:keys [initial-ms seed timer-order trace? micro-schedule]
      :or {initial-ms 0
+          seed 0
           trace? false
           micro-schedule nil}}]
-   ;; Derive effective values from :seed with explicit overrides
-   (let [effective-rng-seed (or rng-seed seed 0)
-         effective-timer-order (or timer-order (when seed :seeded) :fifo)]
+   (let [effective-timer-order (or timer-order (when (not= seed 0) :seeded) :fifo)]
      (->TestScheduler
       (atom {:now-ms (long initial-ms)
              :next-id 0
@@ -145,8 +141,8 @@
              ;; interleaving: micro-schedule index (consumed as used)
              :schedule-idx 0
              ;; deterministic RNG state for :random selection (LCG)
-             :rng-state (long effective-rng-seed)})
-      effective-timer-order (long effective-rng-seed) (boolean trace?) micro-schedule))))
+             :rng-state (long seed)})
+      effective-timer-order (long seed) (boolean trace?) micro-schedule))))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -316,7 +312,7 @@
                     at-ms (+ now (long delay-ms))
                     order id
                     tie (case (:timer-order sched)
-                          :seeded (seeded-tie (:rng-seed sched) order)
+                          :seeded (seeded-tie (:seed sched) order)
                             ;; default/fallback
                           order)
                     k [at-ms tie order id]

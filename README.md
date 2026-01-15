@@ -137,10 +137,9 @@ The scheduler manages virtual time and a queue of pending tasks:
 
 ```clojure
 (def sched (mt/make-scheduler {:initial-ms      0       ; starting time
-                                :seed            42      ; unified seed (sets rng + timer-order :seeded)
+                                :seed            42      ; seed for RNG and timer tie-breaking
                                 :trace?          true    ; enable execution trace
                                 :timer-order     :fifo   ; explicit override (:fifo or :seeded)
-                                :rng-seed        42      ; explicit RNG override (defaults to :seed)
                                 :micro-schedule  nil}))  ; microtask interleaving (see Schedule Decisions)
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
