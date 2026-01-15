@@ -544,16 +544,68 @@ The testkit provides deterministic execution guarantees under specific condition
 | `m/relieve`, `m/sem`, `m/rdv`, `m/mbx`, `m/dfv` | ✓ | Under single-threaded scheduler driving |
 | `mt/subject`, `mt/state` | ✓ | Deterministic flow sources |
 | `m/via` with `m/cpu` or `m/blk` | ✓ | JVM only; executors rebound to scheduler microtasks |
+| `m/signal`, `m/watch`, `m/latest`, `m/stream` | ✓ | When atom changes happen inside the controlled task (see below) |
 
 **Explicitly NOT supported (non-deterministic):**
 
 | Primitive | Why |
 |-----------|-----|
-| `m/publisher`, `m/stream`, `m/signal` | Reactive-streams subsystem; external threading |
+| `m/publisher` | Reactive-streams subsystem with internal scheduling |
 | `m/via` with custom executors | Work runs on uncontrolled threads |
 | Real I/O (HTTP, file, database) | Actual wall-clock time, external systems |
 | `m/observe` with external callbacks | Events arrive from outside the scheduler |
 | `m/watch` on atoms modified externally | Modifications from other threads |
+
+### Why `m/signal` and `m/watch` Work
+
+Signal propagation in Missionary is **synchronous**. When you call `(swap! !atom f)`:
+
+1. The atom's value changes
+2. The watch callback fires **immediately in the same call stack**
+3. The signal recomputes **immediately in the same call stack**
+4. Downstream consumers receive the value **immediately in the same call stack**
+
+No async scheduling is involved. The testkit controls *when* that `swap!` happens (via `m/sleep` or `mt/yield` yield points), which gives you deterministic control over when signals propagate.
+
+```clojure
+;; ✅ WORKS: Atom changes inside the controlled task
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        !input (atom 1)]
+    (mt/run sched
+      (m/sp
+        (let [<x (m/signal (m/watch !input))
+              <y (m/signal (m/latest + <x <x))  ; diamond DAG
+              results (atom [])]
+          (m/? (m/race
+                 ;; Consumer
+                 (m/reduce (fn [_ v]
+                             (swap! results conj v)
+                             (when (= 3 (count @results))
+                               (reduced @results)))
+                           nil <y)
+                 ;; Producer - changes happen at yield points
+                 (m/sp
+                   (m/? (m/sleep 0))        ; yield point
+                   (swap! !input inc)       ; signal propagates HERE
+                   (m/? (m/sleep 0))        ; yield point
+                   (swap! !input inc)       ; signal propagates HERE
+                   (m/? (m/sleep 1000))))))))))
+;; => [2 4 6]  (deterministic, 3 is never observed due to diamond dedup)
+
+;; ❌ DEADLOCK: No internal yield points to trigger changes
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        !input (atom 1)]
+    (mt/run sched
+      (m/sp
+        (let [<x (m/signal (m/watch !input))]
+          ;; Task waits for signal changes, but nothing triggers them
+          (m/? (m/reduce (fn [_ v] (when (= v 4) (reduced v))) nil <x)))))))
+;; => throws "Deadlock: no microtasks, no timers, and task still pending"
+```
+
+**The rule:** Atom mutations must happen **inside** the `m/sp` task with yield points (`m/sleep` or `mt/yield`). External mutations cause deadlock because the scheduler sees no pending work.
 
 **Thread control requirement:** Determinism is guaranteed only when the scheduler drives execution from a single thread. All task completions, flow transfers, and timer callbacks must occur on the scheduler's driver thread. Off-thread callbacks (e.g., from real executors or external event sources) will either throw `::mt/off-scheduler-callback` or silently break determinism.
 
@@ -578,10 +630,12 @@ The testkit virtualizes **time-based primitives** only:
 ### What is NOT virtualized
 
 - **Real I/O** - HTTP requests, file operations, database calls execute in real time
-- **Real `m/observe` callbacks** - External event sources (DOM, network) are not controlled
-- **Real `m/watch` on atoms** - Changes from external threads are not controlled
+- **External `m/observe` callbacks** - Events from external sources (DOM, network) are not controlled
+- **External `m/watch` modifications** - Atom changes from threads outside the task are not controlled
 
-**Solution:** Use `mt/subject` (discrete) and `mt/state` (continuous) for deterministic flow sources in tests.
+**Solutions:**
+- For external events, use `mt/subject` (discrete) or `mt/state` (continuous)
+- For reactive signals, keep atom mutations inside the controlled task (see [Why `m/signal` and `m/watch` Work](#why-msignal-and-mwatch-work))
 
 ```clojure
 ;; Instead of m/observe with real callbacks, use mt/subject
