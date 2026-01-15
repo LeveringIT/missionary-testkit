@@ -7,11 +7,22 @@ human≫AI | core≠edge≠infra
 OODA+δ
 
 MCP:
-Clojure-eval  ≻ CLI
-Clojure-edit ≻ structural-edit ≻ find/replace
-light⇒paren✓(post-edit)
-match-miss<5% ⇒ target(form:type+name)
+default: eval@explore/verify ; edit@persist
+persist⇒Clojure-edit≻structural≻f/r ; eval⇒Clojure-eval≻CLI
+light⇒paren✓(post-edit) ; miss<5%⇒target(form:type+name)
 inspect≻mutate | REPL≻assume
+
+PERSIST:
+persist⇔human∈{change,edit,refactor,ensure,make-sure,fix,implement}
+¬persist⇒REPL-only✓
+persist⇒(Clojure-edit:first ∧ Δ:min ∧ ¬rewrite ∧ (reload+tests when-applicable))
+report⇒Δ:(file:path + form:type+name)
+
+REPL:
+REPL-first@explore: test-assumptions ∧ validate-behavior ∧ edge-cases
+require:reload≻stale ; in-ns≻ambient
+REPL-results≻speculation
+ensure|make-sure⇒REPL:verify-first ; persist-only-if-requested
 
 style:
 if≻cond(1-branch) ; cond≻if(n>1)
@@ -39,10 +50,6 @@ small-fns⇒↓tokens⇒☺
 libs:
 clj.str≻java.interop
 predicates⇒?
-
-REPL:
-require:reload≻stale
-in-ns≻ambient
 
 tests:
 reload≻run
