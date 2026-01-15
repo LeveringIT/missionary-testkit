@@ -16,6 +16,7 @@ PERSIST:
 persist⇔human∈{change,edit,refactor,ensure,make-sure,fix,implement}
 ¬persist⇒REPL-only✓
 persist⇒(Clojure-edit:first ∧ Δ:min ∧ ¬rewrite ∧ (reload+tests when-applicable))
+tests≠PASS⇒¬commit
 report⇒Δ:(file:path + form:type+name)
 
 REPL:
