@@ -699,6 +699,10 @@ Strict mode detects off-thread access to catch accidental non-determinism. It is
 
 Strict mode is unavailable in ClojureScript (single-threaded environment).
 
+### Parallel test execution
+
+`with-determinism` uses reference-counted var rebinding for safe parallel test runs. The first test to enter rebinds `m/sleep`, `m/timeout`, `m/cpu`, and `m/blk` to their virtual equivalents; the last test to exit restores the originals. Tests run fully concurrently with correct isolation via thread-local `*is-deterministic*` binding.
+
 ### Flow forking
 
 `m/amb` and `m/amb=` require a forking context (`m/ap` with `m/?>`):

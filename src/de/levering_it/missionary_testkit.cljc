@@ -905,6 +905,61 @@
 ;; -----------------------------------------------------------------------------
 
 #?(:clj
+   (defonce ^{:doc "Global lock and state for with-determinism macro to ensure thread-safe with-redefs.
+     This allows parallel test runs without var rebinding conflicts."
+              :no-doc true}
+     determinism-state
+     (atom {:active-count 0
+            :original-sleep nil
+            :original-timeout nil
+            :original-cpu nil
+            :original-blk nil})))
+
+#?(:clj
+   (defonce ^:no-doc determinism-lock (Object.)))
+
+#?(:clj
+   (defn ^:no-doc acquire-determinism!
+     "Acquire determinism context. First caller saves originals and rebinds vars.
+     Returns true, always succeeds."
+     []
+     (locking determinism-lock
+       (let [state @determinism-state]
+         (when (zero? (:active-count state))
+           ;; First acquirer: save originals and rebind
+           (swap! determinism-state assoc
+                  :original-sleep @#'missionary.core/sleep
+                  :original-timeout @#'missionary.core/timeout
+                  :original-cpu @#'missionary.core/cpu
+                  :original-blk @#'missionary.core/blk)
+           (alter-var-root #'missionary.core/sleep (constantly sleep))
+           (alter-var-root #'missionary.core/timeout (constantly timeout))
+           (alter-var-root #'missionary.core/cpu (constantly (cpu-executor)))
+           (alter-var-root #'missionary.core/blk (constantly (blk-executor))))
+         (swap! determinism-state update :active-count inc)))
+     true))
+
+#?(:clj
+   (defn ^:no-doc release-determinism!
+     "Release determinism context. Last caller restores original vars."
+     []
+     (locking determinism-lock
+       (swap! determinism-state update :active-count dec)
+       (let [state @determinism-state]
+         (when (zero? (:active-count state))
+           ;; Last releaser: restore originals
+           (alter-var-root #'missionary.core/sleep (constantly (:original-sleep state)))
+           (alter-var-root #'missionary.core/timeout (constantly (:original-timeout state)))
+           (alter-var-root #'missionary.core/cpu (constantly (:original-cpu state)))
+           (alter-var-root #'missionary.core/blk (constantly (:original-blk state)))
+           (swap! determinism-state assoc
+                  :original-sleep nil
+                  :original-timeout nil
+                  :original-cpu nil
+                  :original-blk nil))))
+     nil))
+
+#?(:clj
    (defmacro with-scheduler
      "Bind *scheduler* to a scheduler for the duration of body.
 
@@ -964,17 +1019,27 @@
      INTERRUPT BEHAVIOR: When a via task is cancelled before its microtask executes,
      the via body will run with Thread.interrupted() returning true. Blocking calls
      in the via body will throw InterruptedException. The interrupt flag is cleared
-     after the via body completes, so the scheduler remains usable."
+     after the via body completes, so the scheduler remains usable.
+
+     CONCURRENCY: Uses reference counting to make var rebinding safe for parallel test runs.
+     Multiple tests can run concurrently - first acquires the rebindings, last restores originals."
      [& body]
      (let [cljs? (boolean &env)]
-       `(binding [*is-deterministic* true]
-          (with-redefs
-           [missionary.core/sleep sleep
-            missionary.core/timeout timeout
-            ~@(when-not cljs?
-                `[missionary.core/cpu (cpu-executor)
-                  missionary.core/blk (blk-executor)])]
-            ~@body)))))
+       (if cljs?
+         ;; CLJS: single-threaded, use simple with-redefs
+         `(binding [*is-deterministic* true]
+            (with-redefs
+             [missionary.core/sleep sleep
+              missionary.core/timeout timeout]
+              ~@body))
+         ;; CLJ: use reference-counted var rebinding for parallel safety
+         `(do
+            (acquire-determinism!)
+            (try
+              (binding [*is-deterministic* true]
+                ~@body)
+              (finally
+                (release-determinism!))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Flow determinism: scheduled-flow + spawn-flow!

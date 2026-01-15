@@ -7,8 +7,8 @@ human≫AI | core≠edge≠infra
 OODA+δ
 
 MCP:
-Clojure-eval ≻ Clojure-edit ≻ CLI
-structural-edit ≻ find/replace
+Clojure-eval  ≻ CLI
+Clojure-edit ≻ structural-edit ≻ find/replace
 light⇒paren✓(post-edit)
 match-miss<5% ⇒ target(form:type+name)
 inspect≻mutate | REPL≻assume

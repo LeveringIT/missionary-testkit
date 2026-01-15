@@ -21,7 +21,7 @@ API:
   interleave=(trace->schedule replay-schedule seed->schedule check-interleaving explore-interleavings selection-gen schedule-gen)
 I: inv={determinism∀f, iface-consistency, time↑only, fifo@same-time unless schedule, timers→sorted, completion→micro-q, schedule→select if >1}
 F: flow-constraints={subject:1sub, state:1sub, transfer!:ready?∧¬terminated?}
-TS: strict⇒drive-only-one-thread ; off-thread-cb⇒fail(::off-scheduler-callback) ; atom⇒safe-reads
+TS: strict⇒drive-only-one-thread ; off-thread-cb⇒fail(::off-scheduler-callback) ; atom⇒safe-reads ; with-determinism⇒global-lock(parallel-safe)
 via: m/via(cpu|blk)⇒sync-on-driver ; real-exec⇒break-determinism ; cancel⇒interrupt ; InterruptedException possible ; flag-cleared-after
 XP: .cljc ; JVM-only={Executor fns} ; CLJS={with-determinism patches sleep/timeout only, run⇒Promise} ; JVM run⇒value
 CFG: deps-alias{:test,:nrepl(7888),:build} ; env{CLOJARS_USERNAME,CLOJARS_PASSWORD} ; mcp-config=.clojure-mcp/config.edn start-nrepl=["clojure","-M:nrepl"]
