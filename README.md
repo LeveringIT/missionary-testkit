@@ -138,7 +138,6 @@ The scheduler manages virtual time and a queue of pending tasks:
 ```clojure
 (def sched (mt/make-scheduler {:initial-ms      0       ; starting time
                                 :trace?          true    ; enable execution trace
-                                :strict?         true    ; thread safety checks (default on JVM)
                                 :timer-order     :fifo   ; timer tie-breaking (:fifo or :seeded)
                                 :rng-seed        42      ; seed for all RNG uses
                                 :micro-schedule  nil}))  ; microtask interleaving (see Schedule Decisions)
@@ -603,12 +602,12 @@ You can use Missionary's built-in `m/observe` and `m/watch` if you control all e
                   ...]}
 ```
 
-**2. Strict mode catches off-thread access**:
+**2. Thread safety catches off-thread access**:
 
 ```clojure
 ;; m/observe: off-thread emit is NOT caught
 (mt/with-determinism
-  (let [sched (mt/make-scheduler {:strict? true})]
+  (let [sched (mt/make-scheduler)]
     (let [emit-fn (atom nil)
           flow (m/observe (fn [emit!] (reset! emit-fn emit!) #()))]
       ;; Start consuming the flow so emit-fn gets set
@@ -620,7 +619,7 @@ You can use Missionary's built-in `m/observe` and `m/watch` if you control all e
 
 ;; mt/subject: off-thread emit IS caught
 (mt/with-determinism
-  (let [sched (mt/make-scheduler {:strict? true})]
+  (let [sched (mt/make-scheduler)]
     (let [{:keys [emit]} (mt/subject sched)]
       (mt/step! sched)
       @(future ((emit :value) identity identity)))))  ; off-thread - CAUGHT!
@@ -644,10 +643,10 @@ The same applies to `m/watch` vs `mt/state`:
 | Aspect | `m/observe` / `m/watch` | `mt/subject` / `mt/state` |
 |--------|------------------------|---------------------------|
 | Events in trace | No | Yes |
-| Strict mode catches off-thread | No | Yes |
+| Thread safety catches off-thread | No | Yes |
 | Works for simple tests | Yes | Yes |
 
-**Use testkit versions** when you want full traceability or strict mode protection. **Use Missionary built-ins** for simple tests where you control all modifications from within scheduled code.
+**Use testkit versions** when you want full traceability or thread safety protection. **Use Missionary built-ins** for simple tests where you control all modifications from within scheduled code.
 
 ### Threading model
 
@@ -678,25 +677,22 @@ Missionary uses cooperative single-threaded execution by default. Tasks interlea
 (import '[java.util.concurrent Executors])
 (def real-exec (Executors/newSingleThreadExecutor))
 (mt/with-determinism
-  (let [sched (mt/make-scheduler {:strict? true})]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched
       (m/via real-exec (do-work)))))  ; Fails - off-thread callback
 ```
 
-### Strict mode (JVM only)
+### Thread safety (JVM only)
 
-Strict mode detects off-thread access to catch accidental non-determinism. It is **enabled by default** on the JVM:
+The scheduler enforces single-threaded access to catch accidental non-determinism from off-thread callbacks:
 
 ```clojure
 ;; This throws because it's called from wrong thread
 (future ((:emit subject) :value))
 ;; => "Scheduler driven from multiple threads (enqueue-microtask!)"
-
-;; To disable strict mode (not recommended):
-(mt/make-scheduler {:strict? false})
 ```
 
-Strict mode is unavailable in ClojureScript (single-threaded environment).
+This protection is automatic on JVM. ClojureScript is single-threaded so no enforcement is needed.
 
 ### Parallel test execution
 

@@ -66,7 +66,7 @@
 ;; -----------------------------------------------------------------------------
 
 (defrecord TestScheduler
-           [state timer-order rng-seed strict? trace? micro-schedule])
+           [state timer-order rng-seed trace? micro-schedule])
 
 (defn- maybe-trace-state
   "If tracing enabled (state has non-nil :trace vector), append event."
@@ -82,19 +82,17 @@
   {:initial-ms     0
    :timer-order    :fifo | :seeded     ; how timers with same due-time are ordered
    :rng-seed       42                  ; seed for all RNG (timer tie-breaking, :random selection)
-   :strict?        true|false          ; default true on JVM to catch cross-thread access
    :trace?         true|false
    :micro-schedule nil | vector        ; selection decisions for microtask interleaving}
 
-  Note: strict? defaults to true on JVM to detect accidental non-determinism
-  from cross-thread callbacks. On CLJS it's ignored (single-threaded)."
+  Thread safety: On JVM, all scheduler operations must be performed from a single
+  thread. Cross-thread callbacks will throw an error to catch accidental nondeterminism."
   ([]
    (make-scheduler {}))
-  ([{:keys [initial-ms timer-order rng-seed strict? trace? micro-schedule]
+  ([{:keys [initial-ms timer-order rng-seed trace? micro-schedule]
      :or {initial-ms 0
           timer-order :fifo
           rng-seed 0
-          strict? #?(:clj true :cljs false)
           trace? false
           micro-schedule nil}}]
    (->TestScheduler
@@ -105,13 +103,13 @@
            :timers (sorted-map)
            ;; trace is either nil or vector
            :trace (when trace? [])
-           ;; JVM-only "driver thread" captured lazily under strict mode
+           ;; JVM-only "driver thread" captured lazily for thread safety enforcement
            :driver-thread #?(:clj nil :cljs ::na)
            ;; interleaving: micro-schedule index (consumed as used)
            :schedule-idx 0
            ;; deterministic RNG state for :random selection (LCG)
            :rng-state (long rng-seed)})
-    timer-order (long rng-seed) (boolean strict?) (boolean trace?) micro-schedule)))
+    timer-order (long rng-seed) (boolean trace?) micro-schedule)))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -183,28 +181,28 @@
 
 #?(:clj
    (defn- ensure-driver-thread!
-     "In strict mode, enforce that ALL scheduler operations are performed by a single thread.
-      This includes driving (step/tick/advance/run), enqueuing, timers, and flow control."
+     "Enforce that ALL scheduler operations are performed by a single thread.
+      This includes driving (step/tick/advance/run), enqueuing, timers, and flow control.
+      Cross-thread access throws to catch accidental nondeterminism."
      [^TestScheduler sched op-label]
-     (when (:strict? sched)
-       (let [state-atom (:state sched)
-             this-thread (Thread/currentThread)]
-         (loop []
-           (let [s @state-atom
-                 owner (:driver-thread s)]
-             (cond
-               (nil? owner)
-               (if (compare-and-set! state-atom s (assoc s :driver-thread this-thread))
-                 true
-                 (recur))
-
-               (= owner this-thread)
+     (let [state-atom (:state sched)
+           this-thread (Thread/currentThread)]
+       (loop []
+         (let [s @state-atom
+               owner (:driver-thread s)]
+           (cond
+             (nil? owner)
+             (if (compare-and-set! state-atom s (assoc s :driver-thread this-thread))
                true
+               (recur))
 
-               :else
-               (throw (mt-ex off-scheduler-callback sched
-                             (str "Scheduler driven from multiple threads (" op-label ").")
-                             {:label op-label})))))))))
+             (= owner this-thread)
+             true
+
+             :else
+             (throw (mt-ex off-scheduler-callback sched
+                           (str "Scheduler driven from multiple threads (" op-label ").")
+                           {:label op-label}))))))))
 
 #?(:cljs
    (defn- ensure-driver-thread! [_ _] true))
@@ -563,31 +561,29 @@
        (let [cancel
              (task
               (fn [v]
-                  ;; strict: detect off-driver-thread callback (JVM only)
+                ;; Detect off-driver-thread callback (JVM only)
                 #?(:clj
-                   (if (and (:strict? sched)
-                            (let [owner (:driver-thread @(:state sched))]
-                              (and owner (not= owner (Thread/currentThread)))))
-                     ;; Off-thread: fail directly to avoid deadlock
-                     (fail-directly!
-                      (mt-ex off-scheduler-callback sched
-                             "Task success callback invoked off scheduler thread."
-                             {:label label}))
-                     (complete! :success v))
+                   (let [owner (:driver-thread @(:state sched))]
+                     (if (and owner (not= owner (Thread/currentThread)))
+                       ;; Off-thread: fail directly to avoid deadlock
+                       (fail-directly!
+                        (mt-ex off-scheduler-callback sched
+                               "Task success callback invoked off scheduler thread."
+                               {:label label}))
+                       (complete! :success v)))
                    :cljs
                    (complete! :success v)))
               (fn [e]
                 #?(:clj
-                   (if (and (:strict? sched)
-                            (let [owner (:driver-thread @(:state sched))]
-                              (and owner (not= owner (Thread/currentThread)))))
-                     ;; Off-thread: fail directly to avoid deadlock
-                     (fail-directly!
-                      (mt-ex off-scheduler-callback sched
-                             "Task failure callback invoked off scheduler thread."
-                             {:label label
-                              :mt/original-error (pr-str e)}))
-                     (complete! :failure e))
+                   (let [owner (:driver-thread @(:state sched))]
+                     (if (and owner (not= owner (Thread/currentThread)))
+                       ;; Off-thread: fail directly to avoid deadlock
+                       (fail-directly!
+                        (mt-ex off-scheduler-callback sched
+                               "Task failure callback invoked off scheduler thread."
+                               {:label label
+                                :mt/original-error (pr-str e)}))
+                       (complete! :failure e)))
                    :cljs
                    (complete! :failure e))))]
          (reset! cancel-cell (or cancel (fn [] nil))))
