@@ -38,21 +38,22 @@
 
 ;; Test usage - fully deterministic:
 (comment
-  (mt/with-determinism [sched (mt/make-scheduler)]
-    (let [{:keys [flow set close]} (mt/state sched {:initial 0})]
-      (mt/run sched
-        (m/sp
-          (m/? (m/join (fn [_ v] v)
-                 ;; Simulate state changes at controlled times
-                 (m/sp
-                   (m/? (m/sleep 100))
-                   (set 1)
-                   (m/? (m/sleep 100))
-                   (set 2)
-                   (m/? (m/sleep 100))
-                   (close))
-                 ;; Test the component
-                 (mt/collect (counter-display flow)))))))))
+  (mt/with-determinism
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [{:keys [flow set close]} (mt/state sched {:initial 0})]
+        (mt/run sched
+          (m/sp
+            (m/? (m/join (fn [_ v] v)
+                   ;; Simulate state changes at controlled times
+                   (m/sp
+                     (m/? (m/sleep 100))
+                     (set 1)
+                     (m/? (m/sleep 100))
+                     (set 2)
+                     (m/? (m/sleep 100))
+                     (close))
+                   ;; Test the component
+                   (mt/collect (counter-display flow))))))))))
   ;; => ["Count: 0" "Count: 1" "Count: 2"]
 
 ;; =============================================================================
@@ -83,17 +84,18 @@
 
 ;; Test: mt/state already returns the right shape!
 (comment
-  (mt/with-determinism [sched (mt/make-scheduler)]
-    (let [state (mt/state sched {:initial 0})]
-      (mt/run sched
-        (m/sp
-          (m/? (m/join (fn [_ v] v)
-                 (m/sp
-                   (m/? (m/sleep 100))
-                   ((:set state) 42)
-                   (m/? (m/sleep 100))
-                   ((:close state)))
-                 (mt/collect (m/eduction (map :value) (stateful-counter state))))))))))
+  (mt/with-determinism
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [state (mt/state sched {:initial 0})]
+        (mt/run sched
+          (m/sp
+            (m/? (m/join (fn [_ v] v)
+                   (m/sp
+                     (m/? (m/sleep 100))
+                     ((:set state) 42)
+                     (m/? (m/sleep 100))
+                     ((:close state)))
+                   (mt/collect (m/eduction (map :value) (stateful-counter state)))))))))))
   ;; => [0 42]
 
 ;; =============================================================================
@@ -121,18 +123,19 @@
 
 ;; Test usage:
 (comment
-  (mt/with-determinism [sched (mt/make-scheduler)]
-    (let [{:keys [flow emit close]} (mt/subject sched)]
-      (mt/run sched
-        (m/sp
-          (m/? (m/join (fn [_ v] v)
-                 ;; Simulate click events
-                 (m/sp
-                   (m/? (emit {:type :click :x 100 :y 200}))
-                   (m/? (emit {:type :click :x 150 :y 250}))
-                   (m/? (close)))
-                 ;; Test the logger
-                 (mt/collect (event-logger flow)))))))))
+  (mt/with-determinism
+    (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [{:keys [flow emit close]} (mt/subject sched)]
+        (mt/run sched
+          (m/sp
+            (m/? (m/join (fn [_ v] v)
+                   ;; Simulate click events
+                   (m/sp
+                     (m/? (emit {:type :click :x 100 :y 200}))
+                     (m/? (emit {:type :click :x 150 :y 250}))
+                     (m/? (close)))
+                   ;; Test the logger
+                   (mt/collect (event-logger flow))))))))))
   ;; => [{:type :click :x 100 :y 200} {:type :click :x 150 :y 250}]
 
 ;; =============================================================================
@@ -141,33 +144,35 @@
 
 (defn run-examples []
   (println "=== Example 1: counter-display with mt/state ===")
-  (let [result (mt/with-determinism [sched (mt/make-scheduler)]
-                 (let [{:keys [flow set close]} (mt/state sched {:initial 0})]
-                   (mt/run sched
-                     (m/sp
-                       (m/? (m/join (fn [_ v] v)
-                              (m/sp
-                                (m/? (m/sleep 100))
-                                (set 1)
-                                (m/? (m/sleep 100))
-                                (set 2)
-                                (m/? (m/sleep 100))
-                                (close))
-                              (mt/collect (counter-display flow))))))))]
+  (let [result (mt/with-determinism
+                 (mt/with-scheduler [sched (mt/make-scheduler)]
+                   (let [{:keys [flow set close]} (mt/state sched {:initial 0})]
+                     (mt/run sched
+                       (m/sp
+                         (m/? (m/join (fn [_ v] v)
+                                (m/sp
+                                  (m/? (m/sleep 100))
+                                  (set 1)
+                                  (m/? (m/sleep 100))
+                                  (set 2)
+                                  (m/? (m/sleep 100))
+                                  (close))
+                                (mt/collect (counter-display flow)))))))))]
     (println "Result:" result))
 
   (println "\n=== Example 2: event-logger with mt/subject ===")
-  (let [result (mt/with-determinism [sched (mt/make-scheduler)]
-                 (let [{:keys [flow emit close]} (mt/subject sched)]
-                   (mt/run sched
-                     (m/sp
-                       (m/? (m/join (fn [_ v] v)
-                              (m/sp
-                                (m/? (emit :click))
-                                (m/? (emit :scroll))
-                                (m/? (emit :keypress))
-                                (m/? (close)))
-                              (mt/collect (event-logger flow))))))))]
+  (let [result (mt/with-determinism
+                 (mt/with-scheduler [sched (mt/make-scheduler)]
+                   (let [{:keys [flow emit close]} (mt/subject sched)]
+                     (mt/run sched
+                       (m/sp
+                         (m/? (m/join (fn [_ v] v)
+                                (m/sp
+                                  (m/? (emit :click))
+                                  (m/? (emit :scroll))
+                                  (m/? (emit :keypress))
+                                  (m/? (close)))
+                                (mt/collect (event-logger flow)))))))))]
     (println "Result:" result)))
 
 (comment
