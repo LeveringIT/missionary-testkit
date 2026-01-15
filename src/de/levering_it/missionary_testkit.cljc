@@ -1531,16 +1531,16 @@
   Creates a schedule of the given length with random FIFO/LIFO/random decisions.
   Uses the same LCG algorithm on both CLJ and CLJS for cross-platform consistency."
   [seed num-decisions]
-  ;; Use consistent LCG across platforms. Reduce seed to 32-bit range first
-  ;; to avoid overflow with large seeds (e.g., System/currentTimeMillis).
-  (let [lcg (fn [s] (mod (+ (* 1103515245 (long s)) 12345) 2147483648))
-        initial-s (mod (long seed) 2147483648)]
+  ;; Use same MINSTD LCG as lcg-next to avoid overflow in CLJS.
+  ;; MINSTD: a=48271, m=2^31-1, keeps values in safe 32-bit range.
+  (let [initial-s (let [s (mod (long seed) 2147483647)]
+                    (if (zero? s) 1 s))]
     (loop [s initial-s
            result []
            i 0]
       (if (>= i num-decisions)
         result
-        (let [next-s (lcg s)
+        (let [next-s (lcg-next s)
               decision (case (mod next-s 3)
                          0 :fifo
                          1 :lifo
