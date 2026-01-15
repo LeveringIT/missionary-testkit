@@ -442,92 +442,104 @@
     (:at-ms t)))
 
 (defn step!
-  "Run exactly 1 microtask. Returns ::idle if no microtasks."
+  "Run exactly 1 microtask. Returns ::idle if no microtasks.
+
+  Binds *scheduler* to sched for the duration of execution."
   [^TestScheduler sched]
   (ensure-driver-thread! sched "step!")
-  (let [state-atom (:state sched)]
-    (loop []
-      (let [s @state-atom
-            q (:micro-q s)]
-        (if (q-empty? q)
-          idle
-          (let [q-size (count q) ; O(1) for PersistentQueue
-                ;; Only get schedule decision when there's actually a choice to make
-                [decision s-after-decision] (if (> q-size 1)
-                                              (get-schedule-decision sched s)
-                                              [:fifo s])
-                rng-state (:rng-state s-after-decision)
-                ;; Select from queue (uses decision only when q-size > 1)
-                [mt q' new-rng] (if (> q-size 1)
-                                  (select-from-queue q decision rng-state)
-                                  [(q-peek q) (q-pop q) rng-state])
-                now (:now-ms s-after-decision)
-                ;; Build trace event with selection info when queue had choices
-                select-trace (when (> q-size 1)
-                               {:event :select-task
-                                :decision decision
-                                :queue-size q-size
-                                :selected-id (:id mt)
-                                :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec q)))
-                                :now-ms now})
-                s' (-> s-after-decision
-                       (assoc :micro-q q')
-                       (assoc :rng-state new-rng)
-                       (cond-> select-trace (maybe-trace-state select-trace))
-                       (maybe-trace-state {:event :run-microtask
-                                           :id (:id mt)
-                                           :kind (:kind mt)
-                                           :label (:label mt)
-                                           :lane (:lane mt)
-                                           :now-ms now}))]
-            (if (compare-and-set! state-atom s s')
-              (do
-                (try
-                  ((:f mt))
-                  (catch #?(:clj Throwable :cljs :default) e
-                    ;; Re-throw user exceptions untouched (so tests can assert on them).
-                    (throw e)))
-                (dissoc mt :f))
-              (recur))))))))
+  (binding [*scheduler* sched]
+    (let [state-atom (:state sched)]
+      (loop []
+        (let [s @state-atom
+              q (:micro-q s)]
+          (if (q-empty? q)
+            idle
+            (let [q-size (count q) ; O(1) for PersistentQueue
+                  ;; Only get schedule decision when there's actually a choice to make
+                  [decision s-after-decision] (if (> q-size 1)
+                                                (get-schedule-decision sched s)
+                                                [:fifo s])
+                  rng-state (:rng-state s-after-decision)
+                  ;; Select from queue (uses decision only when q-size > 1)
+                  [mt q' new-rng] (if (> q-size 1)
+                                    (select-from-queue q decision rng-state)
+                                    [(q-peek q) (q-pop q) rng-state])
+                  now (:now-ms s-after-decision)
+                  ;; Build trace event with selection info when queue had choices
+                  select-trace (when (> q-size 1)
+                                 {:event :select-task
+                                  :decision decision
+                                  :queue-size q-size
+                                  :selected-id (:id mt)
+                                  :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec q)))
+                                  :now-ms now})
+                  s' (-> s-after-decision
+                         (assoc :micro-q q')
+                         (assoc :rng-state new-rng)
+                         (cond-> select-trace (maybe-trace-state select-trace))
+                         (maybe-trace-state {:event :run-microtask
+                                             :id (:id mt)
+                                             :kind (:kind mt)
+                                             :label (:label mt)
+                                             :lane (:lane mt)
+                                             :now-ms now}))]
+              (if (compare-and-set! state-atom s s')
+                (do
+                  (try
+                    ((:f mt))
+                    (catch #?(:clj Throwable :cljs :default) e
+                      ;; Re-throw user exceptions untouched (so tests can assert on them).
+                      (throw e)))
+                  (dissoc mt :f))
+                (recur)))))))))
 
 (defn tick!
-  "Drain all microtasks at current virtual time. Returns number of microtasks executed."
+  "Drain all microtasks at current virtual time. Returns number of microtasks executed.
+
+  Binds *scheduler* to sched for the duration of execution."
   [^TestScheduler sched]
   (ensure-driver-thread! sched "tick!")
-  (loop [n 0]
-    (let [r (step! sched)]
-      (if (= r idle)
-        n
-        (recur (inc n))))))
+  (binding [*scheduler* sched]
+    (loop [n 0]
+      (let [r (step! sched)]
+        (if (= r idle)
+          n
+          (recur (inc n)))))))
 
 (defn advance-to!
-  "Set time to t (>= now), enqueue due timers, then tick. Returns number of microtasks executed by tick."
+  "Set time to t (>= now), enqueue due timers, then tick. Returns number of microtasks executed by tick.
+
+  Binds *scheduler* to sched for the duration of execution."
   [^TestScheduler sched t]
   (ensure-driver-thread! sched "advance-to!")
-  (let [t (long t)]
-    (swap! (:state sched)
-           (fn [s]
-             (let [now (:now-ms s)]
-               (when (< t now)
-                 (throw (mt-ex illegal-transfer sched
-                               (str "advance-to! requires t >= now (" t " < " now ").")
-                               {:label "advance-to!"})))
-               (-> s
-                   (assoc :now-ms t)
-                   (maybe-trace-state {:event :advance-to :from now :to t :now-ms now})
-                   (->> (promote-due-timers-in-state sched))))))
-    (tick! sched)))
+  (binding [*scheduler* sched]
+    (let [t (long t)]
+      (swap! (:state sched)
+             (fn [s]
+               (let [now (:now-ms s)]
+                 (when (< t now)
+                   (throw (mt-ex illegal-transfer sched
+                                 (str "advance-to! requires t >= now (" t " < " now ").")
+                                 {:label "advance-to!"})))
+                 (-> s
+                     (assoc :now-ms t)
+                     (maybe-trace-state {:event :advance-to :from now :to t :now-ms now})
+                     (->> (promote-due-timers-in-state sched))))))
+      (tick! sched))))
 
 (defn advance!
-  "Advance virtual time by dt-ms (>=0), enqueue due timers, then tick."
+  "Advance virtual time by dt-ms (>=0), enqueue due timers, then tick.
+
+  Binds *scheduler* to sched for the duration of execution."
   [^TestScheduler sched dt-ms]
   (ensure-driver-thread! sched "advance!")
-  (let [dt (long dt-ms)]
-    (when (neg? dt)
-      (throw (mt-ex illegal-transfer sched
-                    (str "advance! requires non-negative dt-ms, got " dt-ms ".")
-                    {:label "advance!"})))
-    (advance-to! sched (+ (now-ms sched) dt))))
+  (binding [*scheduler* sched]
+    (let [dt (long dt-ms)]
+      (when (neg? dt)
+        (throw (mt-ex illegal-transfer sched
+                      (str "advance! requires non-negative dt-ms, got " dt-ms ".")
+                      {:label "advance!"})))
+      (advance-to! sched (+ (now-ms sched) dt)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Jobs (task driving)
@@ -1100,6 +1112,8 @@
 (defn spawn-flow!
   "Spawn a flow process under the scheduler and return a deterministic handle.
 
+  Binds *scheduler* to sched for the duration of flow initialization.
+
   Handle ops:
     (mt/ready? p)
     (mt/terminated? p)
@@ -1109,40 +1123,44 @@
    (spawn-flow! sched flow {}))
   ([^TestScheduler sched flow {:keys [label] :as _opts}]
    (ensure-driver-thread! sched "spawn-flow!")
-   (let [st (atom {:ready? false
-                   :terminated? false
-                   :cancelled? false})
-         ;; internal n/t mutate flags only; flow is wrapped to marshal signals via scheduler
-         n* (fn [] (swap! st assoc :ready? true))
-         t* (fn [] (swap! st assoc :terminated? true :ready? false))
-         f* (scheduled-flow sched flow {:label label})
-         proc (f* n* t*)]
-     (->FlowProcess sched label st proc))))
+   (binding [*scheduler* sched]
+     (let [st (atom {:ready? false
+                     :terminated? false
+                     :cancelled? false})
+           ;; internal n/t mutate flags only; flow is wrapped to marshal signals via scheduler
+           n* (fn [] (swap! st assoc :ready? true))
+           t* (fn [] (swap! st assoc :terminated? true :ready? false))
+           f* (scheduled-flow sched flow {:label label})
+           proc (f* n* t*)]
+       (->FlowProcess sched label st proc)))))
 
 (defn ready? [^FlowProcess p] (:ready? @(:state p)))
 (defn terminated? [^FlowProcess p] (:terminated? @(:state p)))
 
 (defn transfer!
   "Perform one transfer. Must be called on the scheduler driver thread.
-  Throws ::mt/illegal-transfer if not ready or already terminated."
+  Throws ::mt/illegal-transfer if not ready or already terminated.
+
+  Binds *scheduler* to the flow's scheduler for the duration of execution."
   [^FlowProcess p]
   (let [sched (:sched p)
         label (:label p)]
     (ensure-driver-thread! sched "transfer!")
-    (let [{:keys [ready? terminated? cancelled?]} @(:state p)]
-      (cond
-        terminated?
-        (throw (mt-ex illegal-transfer sched "Illegal transfer: flow already terminated."
-                      {:label label}))
+    (binding [*scheduler* sched]
+      (let [{:keys [ready? terminated? cancelled?]} @(:state p)]
+        (cond
+          terminated?
+          (throw (mt-ex illegal-transfer sched "Illegal transfer: flow already terminated."
+                        {:label label}))
 
-        (not ready?)
-        (throw (mt-ex illegal-transfer sched "Illegal transfer: flow not ready."
-                      {:label label}))
+          (not ready?)
+          (throw (mt-ex illegal-transfer sched "Illegal transfer: flow not ready."
+                        {:label label}))
 
-        :else
-        (do
-          (swap! (:state p) assoc :ready? false)
-          (deref (:process p)))))))
+          :else
+          (do
+            (swap! (:state p) assoc :ready? false)
+            (deref (:process p))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Deterministic flow sources: subject (discrete) and state (continuous)
