@@ -10,6 +10,9 @@ human≫AI | core≠edge≠infra
 λ≫μ Σ≫Π Δ@edges explicit≻implicit
 OODA+δ
 
+SESSION:
+start⇒PROJECT_SUMMARY.md?≻read
+
 MCP:
 default: eval@explore/verify ; edit@persist
 persist⇒Clojure-edit≻structural≻f/r ; eval⇒Clojure-eval≻CLI
