@@ -1567,7 +1567,10 @@
   [task {:keys [test-seed schedule-length max-steps max-time-ms]
          :or {max-time-ms 60000}}]
   (let [schedule (seed->schedule test-seed schedule-length)
-        sched (make-scheduler {:micro-schedule schedule :trace? true :rng-seed test-seed})
+        sched (make-scheduler {:micro-schedule schedule
+                               :trace? true
+                               :rng-seed test-seed
+                               :timer-order :seeded})
         result (try
                  {:value (run sched task {:max-steps max-steps
                                           :max-time-ms max-time-ms})}
