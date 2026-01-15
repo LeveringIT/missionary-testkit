@@ -336,7 +336,7 @@ This is useful for:
 ### Finding Bugs with check-interleaving
 
 ```clojure
-(mt/with-determinism [_ (mt/make-scheduler)]
+(mt/with-determinism
   (let [;; A task factory - returns fresh task with fresh state each iteration
         make-task (fn []
                     (let [shared (atom 0)]
@@ -352,7 +352,7 @@ This is useful for:
         ;; Check if any interleaving produces unexpected results
         result (mt/check-interleaving make-task
                  {:num-tests 100
-                  :seed 42
+                  :seed 42  ; Always specify for reproducibility
                   :property (fn [v] (#{20 10} v))})]  ; only valid results
 
     (when result
@@ -360,6 +360,8 @@ This is useful for:
       (println "Seed:" (:seed result))
       (println "Schedule:" (:micro-schedule result)))))
 ```
+
+**Note:** For reproducible tests, always specify `:seed`. Without it, the current system time is used, making failures harder to reproduce.
 
 ### Replaying a Failing Schedule
 
@@ -378,11 +380,14 @@ When `check-interleaving` finds a bug, you can replay the exact schedule:
 See how many distinct outcomes a concurrent task can produce:
 
 ```clojure
-(mt/with-determinism [_ (mt/make-scheduler)]
+(mt/with-determinism
   (let [make-task (fn [] ...)  ; task factory
         result (mt/explore-interleavings make-task {:num-samples 50 :seed 42})]
-    (println "Unique results:" (:unique-results result))))
+    (println "Unique results:" (:unique-results result))
+    (println "Seed used:" (:seed result))))  ; for reproducibility
 ```
+
+**Note:** For reproducible tests, always specify `:seed`. Without it, the current system time is used. The seed is always returned in the result map for later reproduction.
 
 ### Schedule Decisions
 
@@ -493,8 +498,8 @@ The scheduler automatically detects common problems:
 - Legacy: `(with-determinism [sched expr] & body)` - combines both macros (still supported)
 
 ### Interleaving (Concurrency Testing)
-- `(check-interleaving task-fn opts)` - find failures across many interleavings (task-fn is a 0-arg function)
-- `(explore-interleavings task-fn opts)` - explore unique outcomes (task-fn is a 0-arg function)
+- `(check-interleaving task-fn opts)` - find failures across many interleavings (task-fn is a 0-arg function). Always specify `:seed` for reproducibility.
+- `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`. Always specify `:seed` for reproducibility.
 - `(replay-schedule task schedule)` - replay exact execution order (task created inside `with-determinism`)
 - `(trace->schedule trace)` - extract schedule from trace
 - `(seed->schedule seed n)` - generate schedule from seed (cross-platform consistent)

@@ -789,14 +789,14 @@
   (ensure-driver-thread! sched "run")
   (let [start-time (now-ms sched)
         job (start! sched task {:label label})]
-    (loop [steps 0]
-      (let [steps (+ steps (tick! sched))
+    (loop [total-steps 0]
+      (let [total-steps (+ total-steps (tick! sched))
             elapsed (- (now-ms sched) start-time)]
-        (when (> steps (long max-steps))
+        (when (> total-steps (long max-steps))
           (throw (mt-ex budget-exceeded sched
-                        (str "Step budget exceeded: " steps " > " max-steps)
+                        (str "Step budget exceeded: " total-steps " > " max-steps)
                         {:label label
-                         :mt/steps steps
+                         :mt/steps total-steps
                          :mt/max-steps max-steps})))
         (when (> elapsed (long max-time-ms))
           (throw (mt-ex budget-exceeded sched
@@ -824,8 +824,7 @@
                                  :mt/next-timer-ms t-next
                                  :mt/start-ms start-time
                                  :mt/max-time-ms max-time-ms})))
-                (let [steps (+ steps (advance-to! sched t-next))]
-                  (recur steps)))
+                (recur (+ total-steps (advance-to! sched t-next))))
               ;; Recheck done? to handle off-thread callbacks that may have completed the job
               (if (done? job)
                 (result job)
@@ -1053,7 +1052,7 @@
          ;; internal n/t mutate flags only; flow is wrapped to marshal signals via scheduler
          n* (fn [] (swap! st assoc :ready? true))
          t* (fn [] (swap! st assoc :terminated? true :ready? false))
-         f* (scheduled-flow sched flow {:mode :async :label label})
+         f* (scheduled-flow sched flow {:label label})
          proc (f* n* t*)]
      (->FlowProcess sched label st proc))))
 
@@ -1498,10 +1497,11 @@
   Creates a schedule of the given length with random FIFO/LIFO/random decisions.
   Uses the same LCG algorithm on both CLJ and CLJS for cross-platform consistency."
   [seed num-decisions]
-  ;; Use consistent LCG across platforms (same as lcg-next but with different parameters
-  ;; to avoid confusion with the internal RNG used for :random selection)
-  (let [lcg (fn [s] (mod (+ (* 1103515245 (long s)) 12345) 2147483648))]
-    (loop [s (long seed)
+  ;; Use consistent LCG across platforms. Reduce seed to 32-bit range first
+  ;; to avoid overflow with large seeds (e.g., System/currentTimeMillis).
+  (let [lcg (fn [s] (mod (+ (* 1103515245 (long s)) 12345) 2147483648))
+        initial-s (mod (long seed) 2147483648)]
+    (loop [s initial-s
            result []
            i 0]
       (if (>= i num-decisions)
@@ -1562,7 +1562,10 @@
    :seed           seed used for this iteration
    :micro-schedule schedule that caused failure (for replay)
    :trace          full trace (if trace? was true)
-   :iteration      which iteration failed}"
+   :iteration      which iteration failed}
+
+  Note: For reproducible tests, always specify :seed. Without it, the current
+  system time is used, making results non-reproducible across runs."
   [task-fn {:keys [num-tests seed property max-steps max-time-ms schedule-length]
             :or {num-tests 100
                  max-steps 10000
@@ -1596,13 +1599,17 @@
 
   Options:
   - :num-samples     - number of different schedules to try (default 100)
-  - :seed            - base seed for schedule generation
+  - :seed            - base seed for schedule generation (default: current time)
   - :schedule-length - length of generated micro-schedules (default 100)
   - :max-steps       - max scheduler steps per run (default 10000)
 
   Returns:
   {:unique-results - count of distinct results seen
-   :results        - vector of {:result r :micro-schedule s} maps}"
+   :results        - vector of {:result r :micro-schedule s} maps
+   :seed           - the base seed used (for reproducibility)}
+
+  Note: For reproducible tests, always specify :seed. Without it, the current
+  system time is used, making results non-reproducible across runs."
   [task-fn {:keys [num-samples seed schedule-length max-steps]
             :or {num-samples 100
                  schedule-length 100
@@ -1619,7 +1626,8 @@
                   {:result r
                    :micro-schedule (:micro-schedule run-result)})]
     {:unique-results (count (distinct (map :result results)))
-     :results (vec results)}))
+     :results (vec results)
+     :seed base-seed}))
 
 ;; -----------------------------------------------------------------------------
 ;; Interleaving: test.check generators (optional, requires test.check)
