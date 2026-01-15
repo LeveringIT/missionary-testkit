@@ -22,9 +22,10 @@ inspect≻mutate | REPL≻assume
 PERSIST:
 persist⇔human∈{change,edit,refactor,ensure,make-sure,fix,implement}
 ¬persist⇒REPL-only✓
-persist⇒(Clojure-edit:first ∧ Δ:min ∧ ¬rewrite ∧ (reload+tests when-applicable))
-tests≠PASS⇒¬commit
-report⇒Δ:(file:path + form:type+name)
+persist⇒(Clojure-edit:first ∧ Δ:min ∧ ¬rewrite ∧ reload ∧ tests:run)
+tests=PASS⇒commit ; tests≠PASS⇒¬commit
+commit≔after(all-Δ) ; commit-msg≔Δ:summary
+report⇒Δ:(file:path + form:type+name) ; commit:hash?
 
 REPL:
 REPL-first@explore: test-assumptions ∧ validate-behavior ∧ edge-cases
