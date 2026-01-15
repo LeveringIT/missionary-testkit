@@ -61,7 +61,7 @@
 
 (deftest sleep-test
   (testing "sleep completes after virtual time advances"
-    (mt/with-scheduler [sched (mt/make-scheduler)]
+    (let [sched (mt/make-scheduler)]
       (let [job (mt/start! sched (mt/sleep 100 :done) {:label "sleep-test"})]
         (is (not (mt/done? job)))
         (is (= 1 (count (:timers (mt/pending sched)))))
@@ -70,14 +70,14 @@
         (is (= :done (mt/result job))))))
 
   (testing "sleep with nil result"
-    (mt/with-scheduler [sched (mt/make-scheduler)]
+    (let [sched (mt/make-scheduler)]
       (let [job (mt/start! sched (mt/sleep 50) {})]
         (mt/advance-to! sched 50)
         (is (mt/done? job))
         (is (nil? (mt/result job))))))
 
   (testing "cancelled sleep throws Cancelled"
-    (mt/with-scheduler [sched (mt/make-scheduler)]
+    (let [sched (mt/make-scheduler)]
       (let [job (mt/start! sched (mt/sleep 100 :done) {:label "cancel-test"})]
         (mt/cancel! job)
         (mt/tick! sched)
@@ -90,7 +90,7 @@
 
 (deftest timeout-test
   (testing "timeout passes through when inner task completes first"
-    (mt/with-scheduler [sched (mt/make-scheduler)]
+    (let [sched (mt/make-scheduler)]
       (let [job (mt/start! sched
                            (mt/timeout (mt/sleep 50 :inner) 100 :timed-out)
                            {:label "timeout-pass"})]
@@ -99,7 +99,7 @@
         (is (= :inner (mt/result job))))))
 
   (testing "timeout fires when inner task takes too long"
-    (mt/with-scheduler [sched (mt/make-scheduler)]
+    (let [sched (mt/make-scheduler)]
       (let [job (mt/start! sched
                            (mt/timeout (mt/sleep 200 :inner) 100 :timed-out)
                            {:label "timeout-fire"})]
@@ -108,14 +108,14 @@
         (is (= :timed-out (mt/result job))))))
 
   (testing "timeout with nil fallback"
-    (mt/with-scheduler [sched (mt/make-scheduler)]
+    (let [sched (mt/make-scheduler)]
       (let [job (mt/start! sched (mt/timeout (mt/sleep 200 :inner) 100) {})]
         (mt/advance-to! sched 100)
         (is (mt/done? job))
         (is (nil? (mt/result job))))))
 
   (testing "cancelling timeout cancels inner and throws Cancelled"
-    (mt/with-scheduler [sched (mt/make-scheduler)]
+    (let [sched (mt/make-scheduler)]
       (let [job (mt/start! sched
                            (mt/timeout (mt/sleep 200 :inner) 100 :timed-out)
                            {:label "timeout-cancel"})]
@@ -130,7 +130,7 @@
 
 (deftest job-lifecycle-test
   (testing "job starts pending"
-    (mt/with-scheduler [sched (mt/make-scheduler)]
+    (let [sched (mt/make-scheduler)]
       (let [job (mt/start! sched (mt/sleep 100 :done) {})]
         (is (not (mt/done? job)))
         (is (= ::mt/pending (mt/result job))))))
@@ -325,27 +325,27 @@
 
   (testing "*is-deterministic* is true inside with-determinism"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [sched (mt/make-scheduler)]
         (is (true? mt/*is-deterministic*)))))
 
   (testing "rebinds m/sleep to virtual sleep"
     (is (= :done
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (mt/run sched
                        (m/sp (m/? (m/sleep 100 :done)))))))))
 
   (testing "rebinds m/timeout to virtual timeout"
     (is (= :timed-out
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (mt/run sched
                        (m/sp (m/? (m/timeout (m/sleep 200 :inner) 100 :timed-out)))))))))
 
   (testing "concurrent sleeps with join"
     (is (= [:a :b :c]
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (mt/run sched
                        (m/sp
                         (m/? (m/join vector
@@ -356,7 +356,7 @@
   (testing "sequential sleeps accumulate time"
     (let [times (atom [])]
       (mt/with-determinism
-        (mt/with-scheduler [sched (mt/make-scheduler)]
+        (let [sched (mt/make-scheduler)]
           (mt/run sched
                   (m/sp
                    (swap! times conj (mt/now-ms sched))
@@ -374,13 +374,13 @@
   (testing "run auto-advances time"
     (is (= :done
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (mt/run sched (m/sp (m/? (m/sleep 1000 :done)))))))))
 
   (testing "run detects deadlock without auto-advance"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Deadlock"
                           (mt/with-determinism
-                            (mt/with-scheduler [sched (mt/make-scheduler)]
+                            (let [sched (mt/make-scheduler)]
                               (mt/run sched
                                       (m/sp (m/? (m/sleep 100)))
                                       {:auto-advance? false}))))))
@@ -388,7 +388,7 @@
   (testing "run enforces step budget"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Step budget exceeded"
                           (mt/with-determinism
-                            (mt/with-scheduler [sched (mt/make-scheduler)]
+                            (let [sched (mt/make-scheduler)]
                               (mt/run sched
                                       (m/sp
                                         ;; Create many microtasks
@@ -401,7 +401,7 @@
   (testing "run enforces time budget"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Time budget exceeded"
                           (mt/with-determinism
-                            (mt/with-scheduler [sched (mt/make-scheduler)]
+                            (let [sched (mt/make-scheduler)]
                               (mt/run sched
                                       (m/sp (m/? (m/sleep 10000 :done)))
                                       {:max-time-ms 1000})))))))
@@ -414,7 +414,7 @@
   (testing "collect gathers flow values into vector"
     (is (= [:a :b :c]
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (let [{:keys [flow emit close]} (mt/subject sched)]
                  (mt/run sched
                          (m/sp
@@ -429,7 +429,7 @@
   (testing "collect with transducer"
     (is (= [2 4 6]
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (let [{:keys [flow emit close]} (mt/subject sched)]
                  (mt/run sched
                          (m/sp
@@ -444,7 +444,7 @@
   (testing "collect with timeout"
     (is (= ::mt/timeout
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (let [{:keys [flow emit]} (mt/subject sched)]
                  ;; Emit one value but never close - should timeout
                  (mt/run sched
@@ -462,7 +462,7 @@
 (deftest trace-test
   (testing "trace records events when enabled"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
+      (let [sched (mt/make-scheduler {:trace? true})]
         (mt/run sched (m/sp (m/? (m/sleep 100 :done))))
         (let [trace (mt/trace sched)]
           (is (vector? trace))
@@ -472,7 +472,7 @@
 
   (testing "trace is nil when disabled"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:trace? false})]
+      (let [sched (mt/make-scheduler {:trace? false})]
         (mt/run sched (m/sp (m/? (m/sleep 100 :done))))
         (is (nil? (mt/trace sched)))))))
 
@@ -482,31 +482,34 @@
 
 (deftest executor-test
   (testing "executor runs runnables as microtasks"
-    (mt/with-scheduler [sched (mt/make-scheduler)]
-      (let [result (atom nil)
-            exec (mt/executor)]
-        (.execute exec (fn [] (reset! result :executed)))
-        (is (nil? @result))
-        (mt/tick! sched)
-        (is (= :executed @result)))))
+    (let [sched (mt/make-scheduler)]
+      (binding [mt/*scheduler* sched]
+        (let [result (atom nil)
+              exec (mt/executor)]
+          (.execute exec (fn [] (reset! result :executed)))
+          (is (nil? @result))
+          (mt/tick! sched)
+          (is (= :executed @result))))))
 
   (testing "cpu-executor runs on cpu lane"
-    (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
-      (let [result (atom nil)
-            exec (mt/cpu-executor)]
-        (.execute exec (fn [] (reset! result :cpu-done)))
-        (mt/tick! sched)
-        (is (= :cpu-done @result))
-        (is (some #(= :cpu (:lane %)) (mt/trace sched))))))
+    (let [sched (mt/make-scheduler {:trace? true})]
+      (binding [mt/*scheduler* sched]
+        (let [result (atom nil)
+              exec (mt/cpu-executor)]
+          (.execute exec (fn [] (reset! result :cpu-done)))
+          (mt/tick! sched)
+          (is (= :cpu-done @result))
+          (is (some #(= :cpu (:lane %)) (mt/trace sched)))))))
 
   (testing "blk-executor runs on blk lane"
-    (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
-      (let [result (atom nil)
-            exec (mt/blk-executor)]
-        (.execute exec (fn [] (reset! result :blk-done)))
-        (mt/tick! sched)
-        (is (= :blk-done @result))
-        (is (some #(= :blk (:lane %)) (mt/trace sched)))))))
+    (let [sched (mt/make-scheduler {:trace? true})]
+      (binding [mt/*scheduler* sched]
+        (let [result (atom nil)
+              exec (mt/blk-executor)]
+          (.execute exec (fn [] (reset! result :blk-done)))
+          (mt/tick! sched)
+          (is (= :blk-done @result))
+          (is (some #(= :blk (:lane %)) (mt/trace sched))))))))
 
 ;; =============================================================================
 ;; m/via with Virtualized Executors
@@ -515,7 +518,7 @@
 (deftest via-with-virtualized-executors-test
   (testing "m/via m/cpu runs deterministically on driver thread"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
+      (let [sched (mt/make-scheduler {:trace? true})]
         (let [thread-id (atom nil)
               driver-thread (Thread/currentThread)
               result (mt/run sched
@@ -529,7 +532,7 @@
 
   (testing "m/via m/blk runs deterministically"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
+      (let [sched (mt/make-scheduler {:trace? true})]
         (let [result (mt/run sched
                              (m/sp
                               (m/? (m/via m/blk
@@ -538,7 +541,7 @@
 
   (testing "cancelled via before tick sees interrupt flag"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [sched (mt/make-scheduler)]
         (let [saw-interrupt (atom false)
               job (mt/start! sched
                             (m/via m/cpu
@@ -551,7 +554,7 @@
 
   (testing "scheduler remains usable after cancelled via"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [sched (mt/make-scheduler)]
         (let [job1 (mt/start! sched (m/via m/cpu :done1) {})]
           (mt/cancel! job1)
           (mt/tick! sched)
@@ -564,7 +567,7 @@
 
   (testing "via with blocking call throws InterruptedException when cancelled"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [sched (mt/make-scheduler)]
         (let [job (mt/start! sched
                             (m/via m/cpu
                                    (Thread/sleep 100)
@@ -615,7 +618,7 @@
   (testing "race completes with first result"
     (is (= :fast
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (mt/run sched
                        (m/sp
                         (m/? (m/race
@@ -630,7 +633,7 @@
     ;; amb= interleaves flows, so values come in round-robin order
     (is (= [1 10 2 20 3 30]
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (let [subj1 (mt/subject sched)
                      subj2 (mt/subject sched)]
                  (mt/run sched
@@ -660,7 +663,7 @@
     ;; Using m/? on each flow separately collects them in order
     (is (= [:a :b :c]
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (let [{:keys [flow emit close]} (mt/subject sched)]
                  (mt/run sched
                          (m/sp
@@ -684,7 +687,7 @@
     (let [run-task (fn [seed]
                      (let [order (atom [])]
                        (mt/with-determinism
-                         (mt/with-scheduler [sched (mt/make-scheduler {:rng-seed seed
+                         (let [sched (mt/make-scheduler {:rng-seed seed
                                                                        :micro-schedule [:random :random :random
                                                                                         :random :random :random]})]
                            (mt/run sched
@@ -748,7 +751,7 @@
           ;; Schedule with decisions only for actual branch points
           schedule [:lifo :fifo :fifo]]
       (mt/with-determinism
-        (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule schedule :trace? true})]
+        (let [sched (mt/make-scheduler {:micro-schedule schedule :trace? true})]
           (let [result1 (mt/run sched (make-task))
                 trace (mt/trace sched)
                 extracted-schedule (mt/trace->schedule trace)]
@@ -767,7 +770,7 @@
   (testing "FIFO selection maintains order"
     (let [order (atom [])]
       (mt/with-determinism
-        (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [:fifo :fifo :fifo] :trace? true})]
+        (let [sched (mt/make-scheduler {:micro-schedule [:fifo :fifo :fifo] :trace? true})]
           ;; Create a task that starts 3 concurrent sleeps at t=0
           (mt/run sched
                   (m/sp
@@ -780,7 +783,7 @@
 
   (testing "LIFO selection reverses order"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [:lifo :lifo :lifo :lifo :lifo
+      (let [sched (mt/make-scheduler {:micro-schedule [:lifo :lifo :lifo :lifo :lifo
                                                                      :lifo :lifo :lifo :lifo :lifo]
                                                     :trace? true})]
         ;; Run a task - with LIFO the last enqueued task runs first
@@ -793,7 +796,7 @@
 
   (testing "schedule falls back to FIFO when exhausted"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [:lifo] :trace? true})]
+      (let [sched (mt/make-scheduler {:micro-schedule [:lifo] :trace? true})]
         ;; Schedule has only 1 decision, rest should use FIFO
         (is (= :done
                (mt/run sched
@@ -842,7 +845,7 @@
 
   (testing "[:by-label label] falls back to first when label not found"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [[:by-label "nonexistent"]]
+      (let [sched (mt/make-scheduler {:micro-schedule [[:by-label "nonexistent"]]
                                                     :trace? true})]
         ;; Run concurrent sleeps (all have label "sleep")
         (let [result (mt/run sched
@@ -856,7 +859,7 @@
 (deftest by-id-selection-test
   (testing "[:by-id id] selects task with matching ID"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
+      (let [sched (mt/make-scheduler {:trace? true})]
         ;; First, run to see what IDs get assigned
         (mt/run sched
                 (m/sp
@@ -878,7 +881,7 @@
     ;; So to select the third timer (ID 3), we use [:by-id 3]
     (let [execution-order (atom [])]
       (mt/with-determinism
-        (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [[:by-id 4]  ; select third sleep (ID 4)
+        (let [sched (mt/make-scheduler {:micro-schedule [[:by-id 4]  ; select third sleep (ID 4)
                                                                        :fifo :fifo]
                                                       :trace? true})]
           (mt/run sched
@@ -898,7 +901,7 @@
 
   (testing "[:by-id id] falls back to first when ID not found"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [[:by-id 99999]] ; nonexistent ID
+      (let [sched (mt/make-scheduler {:micro-schedule [[:by-id 99999]] ; nonexistent ID
                                                     :trace? true})]
         ;; Run concurrent sleeps
         (let [result (mt/run sched
@@ -913,7 +916,7 @@
   (testing "[:nth n] selects nth task from queue"
     (let [execution-order (atom [])]
       (mt/with-determinism
-        (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [[:nth 2]  ; select third item (0-indexed)
+        (let [sched (mt/make-scheduler {:micro-schedule [[:nth 2]  ; select third item (0-indexed)
                                                                        :fifo :fifo]
                                                       :trace? true})]
           (mt/run sched
@@ -930,7 +933,7 @@
   (testing "[:nth n] wraps around when n >= queue size"
     (let [execution-order (atom [])]
       (mt/with-determinism
-        (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [[:nth 5]  ; larger than queue size 3
+        (let [sched (mt/make-scheduler {:micro-schedule [[:nth 5]  ; larger than queue size 3
                                                                        :fifo :fifo]
                                                       :trace? true})]
           (mt/run sched
@@ -947,7 +950,7 @@
 (deftest trace->schedule-test
   (testing "extracts schedule from trace"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [:lifo :fifo :lifo] :trace? true})]
+      (let [sched (mt/make-scheduler {:micro-schedule [:lifo :fifo :lifo] :trace? true})]
         ;; Run something with concurrent tasks to trigger selection events
         (mt/run sched
                 (m/sp
@@ -1085,7 +1088,7 @@
 (deftest select-task-trace-event-test
   (testing "select-task events are traced when queue has multiple items"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [:lifo :fifo] :trace? true})]
+      (let [sched (mt/make-scheduler {:micro-schedule [:lifo :fifo] :trace? true})]
         ;; Run concurrent tasks that will queue up
         (mt/run sched
                 (m/sp
@@ -1104,7 +1107,7 @@
 
   (testing "no select-task events when queue always has single item"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
+      (let [sched (mt/make-scheduler {:trace? true})]
         ;; Run sequential tasks - queue never has multiple items
         (mt/run sched
                 (m/sp
@@ -1268,7 +1271,7 @@
 
   (testing "yield creates scheduling point in test mode"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [sched (mt/make-scheduler)]
         (let [job (mt/start! sched (mt/yield :done) {:label "yield-test"})]
           ;; Job should not be done yet - needs tick to process microtask
           (is (not (mt/done? job)))
@@ -1279,7 +1282,7 @@
 
   (testing "yield with nil result in test mode"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [sched (mt/make-scheduler)]
         (let [job (mt/start! sched (mt/yield) {})]
           (mt/tick! sched)
           (is (mt/done? job))
@@ -1287,7 +1290,7 @@
 
   (testing "cancelled yield throws Cancelled"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [sched (mt/make-scheduler)]
         (let [job (mt/start! sched (mt/yield :done) {:label "cancel-test"})]
           (mt/cancel! job)
           (mt/tick! sched)
@@ -1297,14 +1300,14 @@
   (testing "yield works with with-determinism macro"
     (is (= :done
            (mt/with-determinism
-             (mt/with-scheduler [sched (mt/make-scheduler)]
+             (let [sched (mt/make-scheduler)]
                (mt/run sched
                        (m/sp (m/? (mt/yield :done)))))))))
 
   (testing "multiple yields create interleaving opportunities"
     (let [order (atom [])]
       (mt/with-determinism
-        (mt/with-scheduler [sched (mt/make-scheduler {:micro-schedule [:fifo :fifo :fifo :fifo]})]
+        (let [sched (mt/make-scheduler {:micro-schedule [:fifo :fifo :fifo :fifo]})]
           (mt/run sched
                   (m/sp
                    (m/? (m/join vector
@@ -1344,7 +1347,7 @@
 
   (testing "yield is traced when tracing enabled"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
+      (let [sched (mt/make-scheduler {:trace? true})]
         (mt/run sched (m/sp (m/? (mt/yield :done))))
         (let [trace (mt/trace sched)]
           (is (vector? trace))
@@ -1365,8 +1368,9 @@
 
   (testing "clock returns virtual time within with-determinism"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:initial-ms 1000})]
-        (is (= 1000 (mt/clock)))
+      (let [sched (mt/make-scheduler {:initial-ms 1000})]
+        (binding [mt/*scheduler* sched]
+          (is (= 1000 (mt/clock))))
         (mt/run sched
                 (m/sp
                  (is (= 1000 (mt/clock)))
@@ -1378,7 +1382,7 @@
   (testing "clock tracks time across multiple sleeps"
     (let [times (atom [])]
       (mt/with-determinism
-        (mt/with-scheduler [sched (mt/make-scheduler)]
+        (let [sched (mt/make-scheduler)]
           (mt/run sched
                   (m/sp
                    (swap! times conj (mt/clock))
@@ -1390,7 +1394,7 @@
 
   (testing "clock returns consistent time within concurrent tasks"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler)]
+      (let [sched (mt/make-scheduler)]
         (let [result (mt/run sched
                              (m/sp
                               (m/? (m/join vector
@@ -1406,7 +1410,7 @@
     ;; Simulate production code that uses clock for timestamps
     (let [record-event (fn [event] {:time (mt/clock) :event event})]
       (mt/with-determinism
-        (mt/with-scheduler [sched (mt/make-scheduler {:initial-ms 1000})]
+        (let [sched (mt/make-scheduler {:initial-ms 1000})]
           (let [events (mt/run sched
                                (m/sp
                                 (let [e1 (record-event :start)]
@@ -1420,8 +1424,9 @@
 (deftest clock-vs-now-ms-test
   (testing "clock equals now-ms when scheduler bound"
     (mt/with-determinism
-      (mt/with-scheduler [sched (mt/make-scheduler {:initial-ms 42})]
-        (is (= (mt/now-ms sched) (mt/clock)))
-        (mt/advance! sched 100)
-        (is (= (mt/now-ms sched) (mt/clock)))
-        (is (= 142 (mt/clock)))))))
+      (let [sched (mt/make-scheduler {:initial-ms 42})]
+        (binding [mt/*scheduler* sched]
+          (is (= (mt/now-ms sched) (mt/clock)))
+          (mt/advance! sched 100)
+          (is (= (mt/now-ms sched) (mt/clock)))
+          (is (= 142 (mt/clock))))))))

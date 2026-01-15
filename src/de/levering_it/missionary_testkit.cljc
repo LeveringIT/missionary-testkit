@@ -522,12 +522,15 @@
 (defn start!
   "Start a Missionary task under the scheduler and return a Job handle.
 
+  Automatically binds *scheduler* to sched for the task invocation.
+
   (def job (mt/start! sched task {:label \"optional\"}))"
   ([^TestScheduler sched task]
    (start! sched task {}))
   ([^TestScheduler sched task {:keys [label] :as _opts}]
    (ensure-driver-thread! sched "start!")
-   (let [id (next-id! sched)
+   (binding [*scheduler* sched]
+     (let [id (next-id! sched)
          job-state (atom {:status :pending})
          cancel-cell (atom nil)
 
@@ -592,7 +595,7 @@
          (complete! :failure e)
          (reset! cancel-cell (fn [] nil))))
 
-     (->Job sched id label job-state cancel-cell))))
+      (->Job sched id label job-state cancel-cell)))))
 
 (defn done?
   "Has the job completed (success or failure)?"
@@ -835,16 +838,21 @@
 (defn run
   "Run task deterministically to completion (or throw).
 
+  Automatically binds *scheduler* to sched for the duration of execution,
+  so m/via with m/cpu or m/blk works without explicit with-scheduler.
+
   JVM: returns value or throws.
   CLJS: returns a js/Promise that resolves/rejects."
   ([^TestScheduler sched task]
    (run sched task {}))
   ([^TestScheduler sched task opts]
-   #?(:clj (run* sched task opts)
+   #?(:clj (binding [*scheduler* sched]
+             (run* sched task opts))
       :cljs (js/Promise.
              (fn [resolve reject]
                (try
-                 (resolve (run* sched task opts))
+                 (binding [*scheduler* sched]
+                   (resolve (run* sched task opts)))
                  (catch :default e
                    (reject e))))))))
 
@@ -963,12 +971,18 @@
    (defmacro with-scheduler
      "Bind *scheduler* to a scheduler for the duration of body.
 
+     NOTE: Usually not needed. mt/run and mt/start! automatically bind *scheduler*.
+     Only use this macro when you need *scheduler* bound outside of run/start!,
+     e.g., for calling mt/clock or mt/executor directly.
+
      Usage:
        (with-determinism
-         (with-scheduler [sched (mt/make-scheduler)]
-           (mt/run sched (m/sp ...))))
+         (let [sched (mt/make-scheduler)]
+           (with-scheduler [_ sched]  ; bind for clock
+             (println \"Time:\" (mt/clock)))
+           (mt/run sched (m/sp ...))))  ; run binds automatically
 
-     This is a convenience macro equivalent to:
+     Equivalent to:
        (let [sched (mt/make-scheduler)]
          (binding [mt/*scheduler* sched]
            ...))"

@@ -43,7 +43,7 @@ Add to your `deps.edn`:
 ;; Wrap your test in with-determinism - this rebinds m/sleep and m/timeout
 ;; to use virtual time instead of real time
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched
       (m/sp
         ;; This "sleeps" for 10 seconds but executes instantly!
@@ -56,7 +56,7 @@ Add to your `deps.edn`:
 
 ```clojure
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched
       (m/sp
         ;; Race two tasks - deterministic winner every time
@@ -70,7 +70,7 @@ Add to your `deps.edn`:
 
 ```clojure
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched
       (m/sp
         ;; Task takes 500ms but timeout is 100ms
@@ -90,7 +90,7 @@ Add to your `deps.edn`:
 ```clojure
 ;; ✅ CORRECT: Task created inside with-determinism
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched
       (m/sp
         (m/? (m/sleep 100))  ; Uses virtual time
@@ -103,14 +103,14 @@ Add to your `deps.edn`:
     :done))
 
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched (make-my-task))))  ; Factory called inside macro
 
 ;; ❌ WRONG: Task created BEFORE with-determinism
 (def my-task (m/sp (m/? (m/sleep 100)) :done))  ; Created outside!
 
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched my-task)))  ; m/sleep was captured at def time, NOT virtualized!
 ```
 
@@ -168,7 +168,7 @@ This allows you to write time-aware code that works in both contexts:
 
 ;; In tests: uses virtual time, runs instantly
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler {:initial-ms 1000})]
+  (let [sched (mt/make-scheduler {:initial-ms 1000})]
     (mt/run sched
       (m/sp
         (let [e1 (record-event :start)]
@@ -219,7 +219,7 @@ A controlled source for discrete values - like an event stream:
 
 ```clojure
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (let [{:keys [flow emit close]} (mt/subject sched)]
       (mt/run sched
         (m/sp
@@ -248,7 +248,7 @@ A controlled source for continuous values - like a watched atom:
 
 ```clojure
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (let [{:keys [flow set close]} (mt/state sched {:initial 0})]
       (mt/run sched
         (m/sp
@@ -303,7 +303,7 @@ Enable tracing to see exactly what happened:
 
 ```clojure
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler {:trace? true})]
+  (let [sched (mt/make-scheduler {:trace? true})]
     (mt/run sched (m/sp (m/? (m/sleep 100 :done))))
     (mt/trace sched)))
 
@@ -328,7 +328,7 @@ Use `mt/yield` to create scheduling points that allow other tasks to interleave.
 
 ;; In tests: creates a scheduling point where other tasks can run
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (let [order (atom [])]
       (mt/run sched
         (m/sp
@@ -434,7 +434,7 @@ The scheduler automatically detects common problems:
 ```clojure
 ;; Deadlock detection
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched
       (m/sp (m/? (m/sleep 100)))
       {:auto-advance? false})))
@@ -442,7 +442,7 @@ The scheduler automatically detects common problems:
 
 ;; Infinite loop protection
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched
       (m/sp (loop [] (m/? (m/sleep 0)) (recur)))
       {:max-steps 100})))
@@ -450,7 +450,7 @@ The scheduler automatically detects common problems:
 
 ;; Time budget
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched
       (m/sp (m/? (m/sleep 999999)))
       {:max-time-ms 1000})))
@@ -503,12 +503,12 @@ The scheduler automatically detects common problems:
 - `(blk-executor)` - deterministic blocking executor (requires `*scheduler*` bound)
 
 ### Dynamic Vars
-- `*scheduler*` - the current TestScheduler (bound by `with-scheduler`)
+- `*scheduler*` - the current TestScheduler (bound automatically by `run` and `start!`)
 - `*is-deterministic*` - `true` when inside `with-determinism` scope
 
 ### Integration Macros
 - `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point))
-- `(with-scheduler [sched expr] & body)` - bind `*scheduler*` to `sched` for the body. Use inside `with-determinism`.
+- `(with-scheduler [sched expr] & body)` - bind `*scheduler*` to `sched` for the body. Usually not needed since `run` and `start!` bind it automatically. Use only for direct `clock` or `executor` calls outside `run`.
 
 ### Interleaving (Concurrency Testing)
 - `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:success true :seed s ...}` or `{:failure ... :seed s ...}`.
@@ -552,7 +552,7 @@ The testkit virtualizes **time-based primitives** only:
 ```clojure
 ;; Instead of m/observe with real callbacks, use mt/subject
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (let [{:keys [flow emit close]} (mt/subject sched)]
       (mt/run sched
         (m/sp
@@ -568,7 +568,7 @@ The testkit virtualizes **time-based primitives** only:
 
 ;; Instead of m/watch on a real atom, use mt/state
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (let [{:keys [flow set close]} (mt/state sched {:initial 0})]
       (mt/run sched
         (m/sp
@@ -609,7 +609,7 @@ You can use Missionary's built-in `m/observe` and `m/watch` if you control all e
 ```clojure
 ;; m/observe: off-thread emit is NOT caught
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler {:strict? true})]
+  (let [sched (mt/make-scheduler {:strict? true})]
     (let [emit-fn (atom nil)
           flow (m/observe (fn [emit!] (reset! emit-fn emit!) #()))]
       ;; Start consuming the flow so emit-fn gets set
@@ -621,7 +621,7 @@ You can use Missionary's built-in `m/observe` and `m/watch` if you control all e
 
 ;; mt/subject: off-thread emit IS caught
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler {:strict? true})]
+  (let [sched (mt/make-scheduler {:strict? true})]
     (let [{:keys [emit]} (mt/subject sched)]
       (mt/step! sched)
       @(future ((emit :value) identity identity)))))  ; off-thread - CAUGHT!
@@ -669,7 +669,7 @@ Missionary uses cooperative single-threaded execution by default. Tasks interlea
 ```clojure
 ;; CORRECT: m/via with virtualized executors
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)]
     (mt/run sched
       (m/sp
         (m/? (m/via m/cpu (+ 1 2 3)))))))  ; Works - runs on driver thread
@@ -679,7 +679,7 @@ Missionary uses cooperative single-threaded execution by default. Tasks interlea
 (import '[java.util.concurrent Executors])
 (def real-exec (Executors/newSingleThreadExecutor))
 (mt/with-determinism
-  (mt/with-scheduler [sched (mt/make-scheduler {:strict? true})]
+  (let [sched (mt/make-scheduler {:strict? true})]
     (mt/run sched
       (m/via real-exec (do-work)))))  ; Fails - off-thread callback
 ```
