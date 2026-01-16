@@ -566,27 +566,54 @@ See how many distinct outcomes a concurrent task can produce:
 
 ### Schedule Decisions
 
-Schedules control task selection when the queue has multiple ready tasks:
-
-**Basic decisions:**
-- `:fifo` - first in, first out (default)
-- `:lifo` - last in, first out
-- `:random` - random selection (deterministic via seed)
-
-**Targeted decisions:**
-- `[:nth n]` - select nth task (wraps if n >= queue size)
-- `[:by-label label]` - select first task with matching label
-- `[:by-id id]` - select task with specific ID
-
-All targeted decisions fall back to the first task if no match is found.
+Schedules control task selection when the queue has multiple ready tasks. Schedules are vectors of **task IDs** extracted from execution traces:
 
 ```clojure
-;; Create scheduler with explicit micro-schedule
-(mt/make-scheduler {:micro-schedule [:lifo :fifo :lifo :fifo]})
+;; Run once with tracing to discover task IDs
+(mt/with-determinism
+  (let [sched (mt/make-scheduler {:trace? true :seed 42})]
+    (mt/run sched (make-task))
+    (mt/trace->schedule (mt/trace sched))))
+;; => [2 4 3]  ; bare task IDs
 
-;; Mix basic and targeted decisions
-(mt/make-scheduler {:micro-schedule [:fifo [:nth 2] :lifo [:by-label "producer"]]})
+;; Replay with the same schedule
+(mt/with-determinism
+  (mt/replay-schedule (make-task) [2 4 3]))
+
+;; Or modify the schedule to test different orderings
+(mt/with-determinism
+  (mt/replay-schedule (make-task) [4 2 3]))  ; different order
 ```
+
+**Run-time selection** (when no explicit schedule):
+- No seed: FIFO ordering (first in, first out)
+- With seed: Random ordering (deterministic via seed)
+
+### Manual Stepping
+
+For fine-grained control, use `next-tasks` to see available tasks and `step!` with a task ID:
+
+```clojure
+(mt/with-determinism
+  (let [sched (mt/make-scheduler {:trace? true})]
+    (mt/start! sched (make-concurrent-task))
+
+    ;; See what tasks are available
+    (println "Available:" (mt/next-tasks sched))
+    ;; => [{:id 2 :kind :yield ...} {:id 3 :kind :yield ...}]
+
+    ;; Step a specific task by ID
+    (mt/step! sched 3)  ; run task with ID 3
+    (mt/step! sched 2)  ; run task with ID 2
+
+    ;; Or let the scheduler choose (FIFO/random)
+    (mt/step! sched)))  ; no ID = automatic selection
+```
+
+See `examples/manual_schedule.clj` for complete examples of:
+- Run → Inspect schedule → Edit → Replay workflow
+- Manual stepping with `next-tasks` and `step!`
+- Custom schedule construction
 
 ## Error Detection
 
@@ -628,10 +655,12 @@ The scheduler automatically detects common problems:
 - `(clock)` - current time: virtual when scheduler bound, real otherwise (for production code)
 - `(pending sched)` - queued microtasks and timers
 - `(next-event sched)` - what would execute next: `{:type :microtask ...}`, `{:type :timer ...}`, or `nil`
+- `(next-tasks sched)` - vector of available microtasks with `:id`, `:kind`, `:label`, `:lane` (for manual stepping)
 - `(trace sched)` - execution trace (if enabled)
 
 ### Time Control
-- `(step! sched)` - run one microtask, returns `::mt/idle` if none
+- `(step! sched)` - run one microtask (FIFO/random selection), returns `::mt/idle` if none
+- `(step! sched task-id)` - run specific microtask by ID (for manual stepping)
 - `(tick! sched)` - run all microtasks at current time, returns count
 - `(advance! sched dt-ms)` - advance by delta, run due tasks
 - `(advance-to! sched t)` - advance to absolute time, run due tasks
@@ -668,7 +697,7 @@ The scheduler automatically detects common problems:
 - `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`.
 - `(replay task-fn failure)` - replay a failure bundle from `check-interleaving`
 - `(replay-schedule task schedule)` - replay exact execution order (task created inside `with-determinism`)
-- `(trace->schedule trace)` - extract schedule from trace
+- `(trace->schedule trace)` - extract schedule (vector of task IDs) from trace
 
 ## Running Tests
 

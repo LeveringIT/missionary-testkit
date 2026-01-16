@@ -483,15 +483,12 @@
 
 (deftest random-selection-determinism-test
   (testing ":random selection is deterministic with same seed across runs"
-    ;; This test verifies the fix for non-deterministic :random selection.
-    ;; Previously, :random used (hash task-map) which included function objects,
-    ;; making results non-reproducible. Now it uses a proper LCG RNG.
+    ;; This test verifies that seeded random selection produces deterministic results.
+    ;; Same seed should always produce the same execution order.
     (let [run-task (fn [seed]
                      (let [order (atom [])]
                        (mt/with-determinism
-                         (let [sched (mt/make-scheduler {:seed seed
-                                                        :micro-schedule [:random :random :random
-                                                                         :random :random :random]})]
+                         (let [sched (mt/make-scheduler {:seed seed})]
                            (mt/run sched
                                    (m/sp
                                     (m/? (m/join vector
@@ -527,7 +524,7 @@
         ;; Should produce deterministic results - same seeds always give same outcomes
         (is (pos? (:unique-results exploration)))
 
-        ;; Replay should give same result
+        ;; Replay should give same result - schedule is now [id1 id2 ...] format
         (when-let [first-result (first (:results exploration))]
           (let [replayed (mt/replay-schedule (make-task) (:micro-schedule first-result))]
             (is (= (:result first-result) replayed)
@@ -537,94 +534,105 @@
     ;; This test verifies that schedule decisions are only consumed when there's
     ;; actually a choice to make (queue size > 1), not on every step.
     ;; This ensures trace->schedule extraction matches actual schedule consumption.
-    (let [make-task (fn []
-                      (let [order (atom [])]
-                        (m/sp
-                         ;; Single sequential sleep (no branch, no schedule decision)
-                         (m/? (m/sleep 10))
-                         ;; Branch point: 3 concurrent tasks (needs schedule decisions)
-                         (m/? (m/join vector
-                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :a))
-                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :b))
-                                      (m/sp (m/? (m/sleep 0)) (swap! order conj :c))))
-                         ;; Another single sleep (no branch)
-                         (m/? (m/sleep 10))
-                         @order)))
-          ;; Schedule with decisions only for actual branch points
-          schedule [:lifo :fifo :fifo]]
-      (mt/with-determinism
-        (let [sched (mt/make-scheduler {:micro-schedule schedule :trace? true})]
-          (let [result1 (mt/run sched (make-task))
-                trace (mt/trace sched)
-                extracted-schedule (mt/trace->schedule trace)]
-            ;; With LIFO first, :c should run first (last enqueued)
-            (is (= :c (first result1)) "LIFO should select last enqueued task first")
+    (mt/with-determinism
+      ;; First run to discover IDs
+      (let [sched1 (mt/make-scheduler {:trace? true})
+            make-task (fn []
+                        (let [order (atom [])]
+                          (m/sp
+                           ;; Single sequential sleep (no branch, no schedule decision)
+                           (m/? (m/sleep 10))
+                           ;; Branch point: 3 concurrent tasks (needs schedule decisions)
+                           (m/? (m/join vector
+                                        (m/sp (m/? (m/sleep 0)) (swap! order conj :a))
+                                        (m/sp (m/? (m/sleep 0)) (swap! order conj :b))
+                                        (m/sp (m/? (m/sleep 0)) (swap! order conj :c))))
+                           ;; Another single sleep (no branch)
+                           (m/? (m/sleep 10))
+                           @order)))]
+        (let [result1 (mt/run sched1 (make-task))
+              trace (mt/trace sched1)
+              extracted-schedule (mt/trace->schedule trace)]
+          ;; Extracted schedule should be task IDs (integers)
+          (is (vector? extracted-schedule))
+          (is (every? integer? extracted-schedule) "Schedule should contain task IDs")
 
-            ;; Extracted schedule should match what trace recorded
-            (is (vector? extracted-schedule))
-
-            ;; Replay with extracted schedule should give identical result
-            (let [result2 (mt/replay-schedule (make-task) extracted-schedule)]
-              (is (= result1 result2)
-                  "Replaying extracted schedule should reproduce exact same result"))))))))
+          ;; Replay with extracted schedule should give identical result
+          (let [result2 (mt/replay-schedule (make-task) extracted-schedule)]
+            (is (= result1 result2)
+                "Replaying extracted schedule should reproduce exact same result")))))))
 
 (deftest schedule-selection-test
-  (testing "FIFO selection maintains order"
+  (testing "default FIFO selection maintains order"
     (let [order (atom [])]
       (mt/with-determinism
-        (let [sched (mt/make-scheduler {:micro-schedule [:fifo :fifo :fifo] :trace? true})]
-          ;; Create a task that starts 3 concurrent sleeps at t=0
+        (let [sched (mt/make-scheduler {:trace? true})]
+          ;; Create a task that starts 3 concurrent yields
           (mt/run sched
                   (m/sp
                    (m/? (m/join vector
-                                (m/sp (swap! order conj :a) :a)
-                                (m/sp (swap! order conj :b) :b)
-                                (m/sp (swap! order conj :c) :c)))))))
-      ;; With FIFO, order depends on when tasks were enqueued
-      (is (= 3 (count @order)))))
+                                (m/sp (m/? (mt/yield)) (swap! order conj :a) :a)
+                                (m/sp (m/? (mt/yield)) (swap! order conj :b) :b)
+                                (m/sp (m/? (mt/yield)) (swap! order conj :c) :c)))))))
+      ;; With FIFO (default), :a completes first since its yield was enqueued first
+      (is (= [:a :b :c] @order))))
 
-  (testing "LIFO selection reverses order"
+  (testing "task ID schedule reverses order"
+    ;; First run to discover IDs, then replay in reverse
     (mt/with-determinism
-      (let [sched (mt/make-scheduler {:micro-schedule [:lifo :lifo :lifo :lifo :lifo
-                                                                     :lifo :lifo :lifo :lifo :lifo]
-                                                    :trace? true})]
-        ;; Run a task - with LIFO the last enqueued task runs first
-        (mt/run sched
+      (let [sched1 (mt/make-scheduler {:trace? true})
+            order1 (atom [])
+            make-task (fn [order]
+                        (m/sp
+                         (m/? (m/join vector
+                                      (m/sp (m/? (mt/yield)) (swap! order conj :a) :a)
+                                      (m/sp (m/? (mt/yield)) (swap! order conj :b) :b)
+                                      (m/sp (m/? (mt/yield)) (swap! order conj :c) :c)))))]
+        ;; Run to get task IDs
+        (mt/run sched1 (make-task order1))
+        (let [trace (mt/trace sched1)
+              select-events (filter #(= :select-task (:event %)) trace)]
+          (when (>= (count select-events) 2)
+            ;; Get the IDs that were selected
+            (let [first-sel (first select-events)
+                  selected-id (:selected-id first-sel)
+                  alt-ids (:alternatives first-sel)
+                  ;; Reverse the order for replay: pick last alternative first
+                  reversed-schedule (vec (concat [(last alt-ids)] [(first alt-ids)]))]
+              (let [order2 (atom [])
+                    sched2 (mt/make-scheduler {:micro-schedule reversed-schedule :trace? true})]
+                (mt/run sched2 (make-task order2))
+                ;; Order should be different from FIFO
+                (is (not= @order1 @order2) "Reversed schedule should produce different order"))))))))
+
+  (testing "schedule exhaustion throws error"
+    (mt/with-determinism
+      ;; First discover what IDs we need
+      (let [sched1 (mt/make-scheduler {:trace? true})]
+        (mt/run sched1
                 (m/sp
                  (m/? (m/join vector
                               (m/sleep 0 :a)
                               (m/sleep 0 :b)
-                              (m/sleep 0 :c))))))))
+                              (m/sleep 0 :c)))))
+        ;; Get one ID from trace
+        (let [select-events (filter #(= :select-task (:event %)) (mt/trace sched1))]
+          (when-let [first-id (:selected-id (first select-events))]
+            ;; Schedule has only 1 decision but 3 concurrent tasks need 2 decisions
+            (let [sched2 (mt/make-scheduler {:micro-schedule [first-id] :trace? true})]
+              (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                    #"Schedule exhausted"
+                                    (mt/run sched2
+                                            (m/sp
+                                             (m/? (m/join vector
+                                                          (m/sleep 0 :a)
+                                                          (m/sleep 0 :b)
+                                                          (m/sleep 0 :c))))))))))))))
 
-  (testing "schedule exhaustion throws error"
-    (mt/with-determinism
-      (let [sched (mt/make-scheduler {:micro-schedule [:lifo] :trace? true})]
-        ;; Schedule has only 1 decision but 3 concurrent tasks need 2 decisions
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                              #"Schedule exhausted"
-                              (mt/run sched
-                                      (m/sp
-                                       (m/? (m/join vector
-                                                    (m/sleep 0 :a)
-                                                    (m/sleep 0 :b)
-                                                    (m/sleep 0 :c)))))))))))
-
-(deftest by-label-selection-test
-  (testing "[:by-label label] falls back to first when label not found"
-    (mt/with-determinism
-      (let [sched (mt/make-scheduler {:micro-schedule [[:by-label "nonexistent"]]
-                                                    :trace? true})]
-        ;; Run concurrent sleeps (all have label "sleep")
-        (let [result (mt/run sched
-                             (m/sp
-                              (m/? (m/join vector
-                                           (m/sleep 0 :a)
-                                           (m/sleep 0 :b)))))]
-          ;; Should still complete (falls back to first item)
-          (is (= [:a :b] (sort result))))))))
+;; NOTE: by-label selection was removed - schedules now use task IDs only
 
 (deftest by-id-selection-test
-  (testing "[:by-id id] selects task with matching ID"
+  (testing "bare integer ID selects task with matching ID"
     (mt/with-determinism
       (let [sched (mt/make-scheduler {:trace? true})]
         ;; First, run to see what IDs get assigned
@@ -642,82 +650,77 @@
           ;; Should have 3 timers
           (is (= 3 (count timer-ids)))))))
 
-  (testing "[:by-id id] selects specific task when multiple are queued"
-    ;; We need to know IDs ahead of time - they're assigned sequentially starting from 0
-    ;; Job gets ID 0, then timers get IDs 1, 2, 3
-    ;; So to select the third timer (ID 3), we use [:by-id 3]
-    (let [execution-order (atom [])]
-      (mt/with-determinism
-        (let [sched (mt/make-scheduler {:micro-schedule [[:by-id 4]  ; select third sleep (ID 4)
-                                                                       :fifo :fifo]
-                                                      :trace? true})]
-          (mt/run sched
-                  (m/sp
-                   (m/? (m/join vector
-                                (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :a) :a)
-                                (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :b) :b)
-                                (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :c) :c)))))
-
-          ;; Check trace for select-task event
-          (let [trace (mt/trace sched)
-                select-events (filter #(= :select-task (:event %)) trace)]
-            (when (seq select-events)
-              (let [first-select (first select-events)]
-                (is (= [:by-id 4] (:decision first-select))
-                    "First selection should use [:by-id 4]"))))))))
-
-  (testing "[:by-id id] falls back to first when ID not found"
+  (testing "task ID selects specific task when multiple are queued"
+    ;; First run to discover IDs, then replay with reversed order
     (mt/with-determinism
-      (let [sched (mt/make-scheduler {:micro-schedule [[:by-id 99999]] ; nonexistent ID
-                                                    :trace? true})]
-        ;; Run concurrent sleeps
-        (let [result (mt/run sched
-                             (m/sp
-                              (m/? (m/join vector
-                                           (m/sleep 0 :a)
-                                           (m/sleep 0 :b)))))]
-          ;; Should still complete (falls back to first item)
-          (is (= [:a :b] (sort result))))))))
+      (let [sched1 (mt/make-scheduler {:trace? true})
+            execution-order1 (atom [])]
+        ;; Run first to discover IDs
+        (mt/run sched1
+                (m/sp
+                 (m/? (m/join vector
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order1 conj :a) :a)
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order1 conj :b) :b)
+                              (m/sp (m/? (m/sleep 0)) (swap! execution-order1 conj :c) :c)))))
 
-(deftest nth-selection-test
-  (testing "[:nth n] selects nth task from queue"
-    (let [execution-order (atom [])]
-      (mt/with-determinism
-        (let [sched (mt/make-scheduler {:micro-schedule [[:nth 2]  ; select third item (0-indexed)
-                                                                       :fifo :fifo]
-                                                      :trace? true})]
-          (mt/run sched
-                  (m/sp
-                   (m/? (m/join vector
-                                (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :a) :a)
-                                (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :b) :b)
-                                (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :c) :c)))))
+        ;; Get full schedule from trace to replay with reversed order
+        (let [original-schedule (mt/trace->schedule (mt/trace sched1))]
+          (when (>= (count original-schedule) 2)
+            ;; Reverse the schedule to get a different order
+            (let [reversed-schedule (vec (reverse original-schedule))
+                  execution-order2 (atom [])
+                  sched2 (mt/make-scheduler {:micro-schedule reversed-schedule :trace? true})]
+              ;; This will run with reversed order
+              (mt/run sched2
+                      (m/sp
+                       (m/? (m/join vector
+                                    (m/sp (m/? (m/sleep 0)) (swap! execution-order2 conj :a) :a)
+                                    (m/sp (m/? (m/sleep 0)) (swap! execution-order2 conj :b) :b)
+                                    (m/sp (m/? (m/sleep 0)) (swap! execution-order2 conj :c) :c)))))
 
-          ;; Third task should run first due to [:nth 2]
-          (is (= :c (first @execution-order))
-              "[:nth 2] should select the third task (index 2)")))))
+              ;; Execution orders should differ
+              (is (not= @execution-order1 @execution-order2)
+                  "Different schedules should produce different execution orders")))))))
+  (testing "task ID not found throws error"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:micro-schedule [99999] :trace? true})] ; nonexistent ID
+        ;; Run concurrent sleeps - should throw because ID not found
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"Task ID 99999 not found"
+                              (mt/run sched
+                                      (m/sp
+                                       (m/? (m/join vector
+                                                    (m/sleep 0 :a)
+                                                    (m/sleep 0 :b))))))))))
 
-  (testing "[:nth n] wraps around when n >= queue size"
-    (let [execution-order (atom [])]
-      (mt/with-determinism
-        (let [sched (mt/make-scheduler {:micro-schedule [[:nth 5]  ; larger than queue size 3
-                                                                       :fifo :fifo]
-                                                      :trace? true})]
-          (mt/run sched
-                  (m/sp
-                   (m/? (m/join vector
-                                (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :a) :a)
-                                (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :b) :b)
-                                (m/sp (m/? (m/sleep 0)) (swap! execution-order conj :c) :c)))))
+  (testing "[:by-id id] format still works (backward compatible)"
+    (mt/with-determinism
+      (let [sched1 (mt/make-scheduler {:trace? true})]
+        ;; First run to get IDs
+        (mt/run sched1
+                (m/sp
+                 (m/? (m/join vector
+                              (m/sleep 0 :a)
+                              (m/sleep 0 :b)))))
+        (let [schedule (mt/trace->schedule (mt/trace sched1))]
+          (when (seq schedule)
+            (let [first-id (first schedule)
+                  ;; Use [:by-id id] format
+                  sched2 (mt/make-scheduler {:micro-schedule [[:by-id first-id]] :trace? true})]
+              (mt/run sched2
+                      (m/sp
+                       (m/? (m/join vector
+                                    (m/sleep 0 :a)
+                                    (m/sleep 0 :b)))))
+              ;; Should complete successfully
+              (is true))))))))
 
-          ;; [:nth 5] with queue size 3 -> 5 mod 3 = 2 -> third task
-          (is (= :c (first @execution-order))
-              "[:nth 5] should wrap to index 2 (5 mod 3)"))))))
+;; NOTE: nth-selection was removed - schedules now use task IDs only
 
 (deftest trace->schedule-test
-  (testing "extracts schedule from trace"
+  (testing "extracts task IDs from trace"
     (mt/with-determinism
-      (let [sched (mt/make-scheduler {:micro-schedule [:lifo :fifo :lifo] :trace? true})]
+      (let [sched (mt/make-scheduler {:trace? true})]
         ;; Run something with concurrent tasks to trigger selection events
         (mt/run sched
                 (m/sp
@@ -726,10 +729,10 @@
                               (m/sleep 0 :b)
                               (m/sleep 0 :c)))))
         (let [extracted (mt/trace->schedule (mt/trace sched))]
-          ;; Should be a vector of decisions
+          ;; Should be a vector of task IDs
           (is (vector? extracted))
-          ;; Decisions should be keywords
-          (is (every? keyword? extracted))))))
+          ;; IDs should be integers
+          (is (every? integer? extracted))))))
 
   (testing "empty trace yields empty schedule"
     (is (= [] (mt/trace->schedule []))))
@@ -739,8 +742,9 @@
                                    {:event :advance-to :from 0 :to 100}])))))
 
 (deftest replay-schedule-test
-  (testing "replay produces same result with same schedule"
+  (testing "replay produces same result with same schedule (using IDs)"
     ;; replay-schedule takes a task, which should be created inside with-determinism
+    ;; First run to discover task IDs, then replay
     (mt/with-determinism
       (let [make-task (fn []
                         (m/sp
@@ -748,12 +752,16 @@
                                       (m/sleep 0 1)
                                       (m/sleep 0 2)
                                       (m/sleep 0 3)))))
-            schedule [:fifo :fifo :fifo :fifo :fifo :fifo]
+            ;; First run to get schedule
+            sched1 (mt/make-scheduler {:trace? true})
+            _ (mt/run sched1 (make-task))
+            schedule (mt/trace->schedule (mt/trace sched1))
+            ;; Replay with same schedule
             r1 (mt/replay-schedule (make-task) schedule)
             r2 (mt/replay-schedule (make-task) schedule)]
         (is (= r1 r2)))))
 
-  (testing "different schedules can produce different results"
+  (testing "different ID schedules can produce different results"
     ;; This test uses a task where order matters
     (mt/with-determinism
       (let [;; Task factory that records execution order (fresh atom each time)
@@ -763,13 +771,25 @@
                            (m/? (m/join (fn [& args] @order)
                                         (m/sp (swap! order conj :a) :a)
                                         (m/sp (swap! order conj :b) :b)
-                                        (m/sp (swap! order conj :c) :c))))))]
-        ;; Run with different schedules
-        (let [r1 (mt/replay-schedule (make-task) [:fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo :fifo])
-              r2 (mt/replay-schedule (make-task) [:lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo :lifo])]
-          ;; Results should be vectors of the recorded order
-          (is (vector? r1))
-          (is (vector? r2)))))))
+                                        (m/sp (swap! order conj :c) :c))))))
+            ;; First run to discover IDs
+            sched1 (mt/make-scheduler {:trace? true})
+            _ (mt/run sched1 (make-task))
+            schedule1 (mt/trace->schedule (mt/trace sched1))]
+        ;; Get select events to find alternative orderings
+        (let [select-events (filter #(= :select-task (:event %)) (mt/trace sched1))]
+          (when (seq select-events)
+            (let [first-sel (first select-events)
+                  alt-ids (:alternatives first-sel)
+                  ;; Create reversed schedule if we have alternatives
+                  schedule2 (when (seq alt-ids)
+                              (vec (concat [(last alt-ids)] (rest schedule1))))]
+              (when schedule2
+                (let [r1 (mt/replay-schedule (make-task) schedule1)
+                      r2 (mt/replay-schedule (make-task) schedule2)]
+                  ;; Results should be vectors of the recorded order
+                  (is (vector? r1))
+                  (is (vector? r2)))))))))))
 
 (deftest replay-test
   (testing "replay accepts failure bundle directly"
@@ -872,7 +892,7 @@
 (deftest select-task-trace-event-test
   (testing "select-task events are traced when queue has multiple items"
     (mt/with-determinism
-      (let [sched (mt/make-scheduler {:micro-schedule [:lifo :fifo] :trace? true})]
+      (let [sched (mt/make-scheduler {:trace? true})]
         ;; Run concurrent tasks that will queue up
         (mt/run sched
                 (m/sp
@@ -1091,7 +1111,7 @@
   (testing "multiple yields create interleaving opportunities"
     (let [order (atom [])]
       (mt/with-determinism
-        (let [sched (mt/make-scheduler {:micro-schedule [:fifo :fifo :fifo :fifo]})]
+        (let [sched (mt/make-scheduler {:trace? true})]
           (mt/run sched
                   (m/sp
                    (m/? (m/join vector
@@ -1103,7 +1123,7 @@
                                  (swap! order conj :b1)
                                  (m/? (mt/yield))
                                  (swap! order conj :b2))))))))
-      ;; With FIFO scheduling, order should be deterministic
+      ;; With FIFO scheduling (default), order should be deterministic
       (is (= 4 (count @order)))))
 
   (testing "yield enables interleaving exploration"
@@ -1214,3 +1234,141 @@
           (mt/advance! sched 100)
           (is (= (mt/now-ms sched) (mt/clock)))
           (is (= 142 (mt/clock))))))))
+
+;; =============================================================================
+;; Manual Stepping Tests (next-tasks and step! with task-id)
+;; =============================================================================
+
+(deftest next-tasks-test
+  (testing "returns empty vector when no microtasks"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)]
+        (is (= [] (mt/next-tasks sched))))))
+
+  (testing "returns available tasks with IDs"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)]
+        (mt/start! sched
+                   (m/sp
+                    (m/? (m/join vector
+                                 (mt/yield :a)
+                                 (mt/yield :b)
+                                 (mt/yield :c)))))
+        ;; After starting, there should be 3 yield tasks in queue
+        (let [tasks (mt/next-tasks sched)]
+          (is (= 3 (count tasks)))
+          (is (every? :id tasks))
+          (is (every? #(= :yield (:kind %)) tasks))))))
+
+  (testing "task IDs can be used with step!"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            order (atom [])]
+        (mt/start! sched
+                   (m/sp
+                    (m/? (m/join vector
+                                 (m/sp (m/? (mt/yield)) (swap! order conj :a) :a)
+                                 (m/sp (m/? (mt/yield)) (swap! order conj :b) :b)
+                                 (m/sp (m/? (mt/yield)) (swap! order conj :c) :c)))))
+        ;; Get available tasks
+        (let [tasks (mt/next-tasks sched)
+              ;; Pick the last task first to reverse order
+              last-task-id (:id (last tasks))]
+          ;; Step the last task first
+          (mt/step! sched last-task-id)
+          ;; Then step the rest with default (FIFO)
+          (mt/tick! sched)
+          ;; First completion should be :c (since we stepped it first)
+          (is (= :c (first @order))))))))
+
+(deftest step-with-task-id-test
+  (testing "step! with task-id runs specific task"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:trace? true})
+            order (atom [])]
+        (mt/start! sched
+                   (m/sp
+                    (m/? (m/join vector
+                                 (m/sp (m/? (mt/yield)) (swap! order conj :a))
+                                 (m/sp (m/? (mt/yield)) (swap! order conj :b))))))
+        ;; Get task IDs
+        (let [tasks (mt/next-tasks sched)
+              id-a (:id (first tasks))
+              id-b (:id (second tasks))]
+          ;; Step task B first
+          (mt/step! sched id-b)
+          (is (= [:b] @order))
+          ;; Then step task A
+          (mt/step! sched id-a)
+          (is (= [:b :a] @order))))))
+
+  (testing "step! with nonexistent task-id throws"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)]
+        (mt/start! sched (m/sp (m/? (mt/yield))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"Task ID 99999 not found"
+                              (mt/step! sched 99999))))))
+
+  (testing "step! with task-id records decision in trace"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:trace? true})]
+        (mt/start! sched
+                   (m/sp
+                    (m/? (m/join vector
+                                 (mt/yield :a)
+                                 (mt/yield :b)))))
+        (let [tasks (mt/next-tasks sched)
+              second-id (:id (second tasks))]
+          ;; Step specific task
+          (mt/step! sched second-id)
+          ;; Check trace has the selection
+          (let [select-events (filter #(= :select-task (:event %)) (mt/trace sched))]
+            (when (seq select-events)
+              (let [ev (first select-events)]
+                (is (= second-id (:decision ev)))
+                (is (= second-id (:selected-id ev)))))))))))
+
+;; =============================================================================
+;; Concurrent Emit Interleaving Test
+;; =============================================================================
+
+(deftest concurrent-emit-interleaving-test
+  (testing "explore-interleavings finds all 6 permutations of concurrent emits"
+    ;; When 3 concurrent tasks emit events at the same virtual time,
+    ;; the scheduler can interleave them in any order, producing all 3! = 6 permutations.
+    (letfn [(make-event-emitter []
+              (let [!cb (atom nil)]
+                {:flow  (m/observe (fn [cb]
+                                     (reset! !cb cb)
+                                     #(reset! !cb nil)))
+                 :emit! (fn [v] (when-let [cb @!cb] (cb v)))}))]
+      (let [results (->> (mt/with-determinism
+                           (mt/explore-interleavings
+                             #(m/sp
+                                (let [{:keys [flow emit!]} (make-event-emitter)]
+                                  (m/? (m/race
+                                         ;; Consumer: collect 3 events from discrete flow
+                                         (m/reduce (fn [acc event]
+                                                     (let [acc (conj acc event)]
+                                                       (if (>= (count acc) 3) (reduced acc) acc)))
+                                                   [] flow)
+                                         ;; Producer: emit at controlled points via concurrent tasks
+                                         (m/sp
+                                           (m/?
+                                             (m/join vector
+                                                     (m/sp (m/? (m/sleep 10)) (emit! :click))
+                                                     (m/sp (m/? (m/sleep 10)) (emit! :scroll))
+                                                     (m/sp (m/? (m/sleep 10)) (emit! :keypress))))
+                                           (m/? (m/sleep 1000)))))))
+                             {:num-samples 100 :seed 123}))
+                         :results
+                         (map :result)
+                         distinct
+                         set)]
+        ;; Should find exactly 6 unique permutations
+        (is (= 6 (count results))
+            "Should find all 6 permutations of [:click :scroll :keypress]")
+        ;; All results should be permutations of the 3 events
+        (is (every? #(= (set %) #{:click :scroll :keypress}) results)
+            "Each result should contain exactly the 3 events")))))

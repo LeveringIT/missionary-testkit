@@ -60,6 +60,8 @@
 (def ^:const budget-exceeded ::budget-exceeded)
 (def ^:const off-scheduler-callback ::off-scheduler-callback)
 (def ^:const schedule-exhausted ::schedule-exhausted)
+(def ^:const task-id-not-found ::task-id-not-found)
+(def ^:const unknown-decision ::unknown-decision)
 
 (def ^:const illegal-blocking-emission ::illegal-blocking-emission)
 (def ^:const illegal-transfer ::illegal-transfer)
@@ -219,6 +221,24 @@
          :label (:label t)
          :at-ms (:at-ms t)
          :lane (:lane t)}))))
+
+(defn next-tasks
+  "Returns vector of available microtasks that can be selected for execution.
+
+  Use this for manual stepping to see which tasks are available and their IDs.
+  Each task map contains :id :kind :label :lane keys.
+
+  Usage for manual stepping:
+    (mt/start! sched task)
+    (let [tasks (mt/next-tasks sched)]
+      (println \"Available:\" (mapv :id tasks))
+      (mt/step! sched (-> tasks first :id)))  ; step specific task
+
+  Returns empty vector if no microtasks are ready (check timers with next-event)."
+  [^TestScheduler sched]
+  (let [{:keys [micro-q]} @(:state sched)]
+    (mapv (fn [mt] (select-keys mt [:id :kind :label :lane]))
+          (seq micro-q))))
 
 (defn- diag
   ([sched] (diag sched nil))
@@ -395,51 +415,58 @@
   "Select an item from the queue based on the decision.
   Returns [selected-item remaining-queue new-rng-state] or nil if queue is empty.
 
-  Decisions:
-  - :fifo - first in, first out (default)
-  - :lifo - last in, first out
-  - :random - random selection (uses RNG state for determinism)
-  - [:nth n] - select nth item (wraps if n >= queue size)
-  - [:by-label label] - select first item with matching label
-  - [:by-id id] - select item with matching id"
+  Decisions (for micro-schedule replay):
+  - integer (task ID) - select task with matching :id
+  - [:by-id id] - same as bare integer (backward compatible)
+
+  Decisions (for run-time selection, not in schedule):
+  - :fifo - first in, first out (default when no seed)
+  - :random - random selection (used internally when seed provided)"
   [q decision rng-state]
   (when-not (q-empty? q)
-    ;; Fast path for FIFO - no conversion needed
-    (if (= decision :fifo)
-      [(q-peek q) (q-pop q) rng-state]
-      ;; Other decisions need indexed access
+    (cond
+      ;; Bare integer = task ID for replay
+      (integer? decision)
       (let [v (q->vec q)
-            n (count v)]
-        (case decision
-          :lifo
-          [(peek v) (vec->q (pop v)) rng-state]
+            target-id decision
+            idx (first (keep-indexed (fn [i item] (when (= target-id (:id item)) i)) v))]
+        (if idx
+          [(nth v idx) (vec->q (remove-nth v idx)) rng-state]
+          ;; ID not found - throw error for explicit replay schedules
+          (throw (ex-info (str "Task ID " target-id " not found in queue")
+                          {:mt/kind ::task-id-not-found
+                           :target-id target-id
+                           :available-ids (mapv :id v)}))))
 
-          :random
-          (let [next-rng (lcg-next rng-state)
-                idx (mod next-rng n)]
-            [(nth v idx) (vec->q (remove-nth v idx)) next-rng])
+      ;; [:by-id id] - backward compatible with previous format
+      (and (vector? decision) (= :by-id (first decision)))
+      (let [v (q->vec q)
+            target-id (second decision)
+            idx (first (keep-indexed (fn [i item] (when (= target-id (:id item)) i)) v))]
+        (if idx
+          [(nth v idx) (vec->q (remove-nth v idx)) rng-state]
+          (throw (ex-info (str "Task ID " target-id " not found in queue")
+                          {:mt/kind ::task-id-not-found
+                           :target-id target-id
+                           :available-ids (mapv :id v)}))))
 
-          ;; default: check for vector decisions
-          (cond
-            (and (vector? decision) (= :nth (first decision)))
-            (let [idx (mod (second decision) n)]
-              [(nth v idx) (vec->q (remove-nth v idx)) rng-state])
+      ;; :fifo - first in, first out (run-time default)
+      (= decision :fifo)
+      [(q-peek q) (q-pop q) rng-state]
 
-            (and (vector? decision) (= :by-label (first decision)))
-            (let [label (second decision)
-                  idx (or (first (keep-indexed (fn [i item] (when (= label (:label item)) i)) v))
-                          0)]
-              [(nth v idx) (vec->q (remove-nth v idx)) rng-state])
+      ;; :random - random selection (run-time with seed)
+      (= decision :random)
+      (let [v (q->vec q)
+            n (count v)
+            next-rng (lcg-next rng-state)
+            idx (mod next-rng n)]
+        [(nth v idx) (vec->q (remove-nth v idx)) next-rng])
 
-            (and (vector? decision) (= :by-id (first decision)))
-            (let [target-id (second decision)
-                  idx (or (first (keep-indexed (fn [i item] (when (= target-id (:id item)) i)) v))
-                          0)]
-              [(nth v idx) (vec->q (remove-nth v idx)) rng-state])
-
-            ;; fallback to FIFO
-            :else
-            [(q-peek q) (q-pop q) rng-state]))))))
+      ;; Unknown decision type
+      :else
+      (throw (ex-info (str "Unknown schedule decision: " (pr-str decision))
+                      {:mt/kind ::unknown-decision
+                       :decision decision})))))
 
 (defn- get-schedule-decision
   "Get the current schedule decision and advance the index.
@@ -487,78 +514,100 @@
   (when-let [[_ t] (first (:timers @(:state sched)))]
     (:at-ms t)))
 
+(defn- execute-microtask!
+  "Internal: execute the microtask and handle interrupts (JVM) and tracing."
+  [^TestScheduler sched state-atom mt now]
+  #?(:clj
+     ;; Clear any pending interrupt before executing microtask.
+     ;; This prevents stale interrupt state from leaking into the task
+     ;; and affecting blocking operations unexpectedly.
+     (let [was-interrupted (Thread/interrupted)]
+       (try
+         ((:f mt))
+         (catch Throwable e
+           (throw e))
+         (finally
+           ;; Clear interrupt flag after execution to keep scheduler stable.
+           ;; Record in trace if interrupt occurred during or before execution.
+           (let [interrupted-after (Thread/interrupted)]
+             (when (and (:trace? sched) (or was-interrupted interrupted-after))
+               (swap! state-atom
+                      maybe-trace-state
+                      {:event :interrupt-cleared
+                       :id (:id mt)
+                       :before was-interrupted
+                       :after interrupted-after
+                       :now-ms now}))))))
+     :cljs
+     (try
+       ((:f mt))
+       (catch :default e
+         (throw e))))
+  (dissoc mt :f))
+
+(defn- select-and-remove-task
+  "Select a task from queue and return [mt q' decision rng-state s-after].
+  When task-id is provided, selects that specific task.
+  Otherwise uses schedule/FIFO/random selection."
+  [^TestScheduler sched s q task-id]
+  (let [q-size (count q)]
+    (if task-id
+      ;; Explicit task-id: select by ID
+      (let [v (q->vec q)
+            idx (first (keep-indexed (fn [i item] (when (= task-id (:id item)) i)) v))]
+        (if-not idx
+          (throw (ex-info (str "Task ID " task-id " not found in queue")
+                          {:mt/kind task-id-not-found
+                           :target-id task-id
+                           :available-ids (mapv :id v)}))
+          [(nth v idx) (vec->q (remove-nth v idx)) task-id (:rng-state s) s]))
+      ;; No task-id: use schedule/FIFO/random
+      (if (= q-size 1)
+        [(q-peek q) (q-pop q) :fifo (:rng-state s) s]
+        (let [[decision s-after] (get-schedule-decision sched s)
+              [mt q' new-rng] (select-from-queue q decision (:rng-state s-after))]
+          [mt q' decision new-rng s-after])))))
+
 (defn step!
   "Run exactly 1 microtask. Returns ::idle if no microtasks.
 
+  (step! sched)        - select next task per schedule/FIFO/random
+  (step! sched task-id) - run specific task by ID (for manual stepping)
+
   Binds *scheduler* to sched for the duration of execution."
-  [^TestScheduler sched]
-  (ensure-driver-thread! sched "step!")
-  (binding [*scheduler* sched]
-    (let [state-atom (:state sched)]
-      (loop []
-        (let [s @state-atom
-              q (:micro-q s)]
-          (if (q-empty? q)
-            idle
-            (let [q-size (count q) ; O(1) for PersistentQueue
-                  ;; Only get schedule decision when there's actually a choice to make
-                  [decision s-after-decision] (if (> q-size 1)
-                                                (get-schedule-decision sched s)
-                                                [:fifo s])
-                  rng-state (:rng-state s-after-decision)
-                  ;; Select from queue (uses decision only when q-size > 1)
-                  [mt q' new-rng] (if (> q-size 1)
-                                    (select-from-queue q decision rng-state)
-                                    [(q-peek q) (q-pop q) rng-state])
-                  now (:now-ms s-after-decision)
-                  ;; Build trace event with selection info when queue had choices
-                  select-trace (when (> q-size 1)
-                                 {:event :select-task
-                                  :decision decision
-                                  :queue-size q-size
-                                  :selected-id (:id mt)
-                                  :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec q)))
-                                  :now-ms now})
-                  s' (-> s-after-decision
-                         (assoc :micro-q q')
-                         (assoc :rng-state new-rng)
-                         (cond-> select-trace (maybe-trace-state select-trace))
-                         (maybe-trace-state {:event :run-microtask
-                                             :id (:id mt)
-                                             :kind (:kind mt)
-                                             :label (:label mt)
-                                             :lane (:lane mt)
-                                             :now-ms now}))]
-              (if (compare-and-set! state-atom s s')
-                (do
-                  #?(:clj
-                     ;; Clear any pending interrupt before executing microtask.
-                     ;; This prevents stale interrupt state from leaking into the task
-                     ;; and affecting blocking operations unexpectedly.
-                     (let [was-interrupted (Thread/interrupted)]
-                       (try
-                         ((:f mt))
-                         (catch Throwable e
-                           (throw e))
-                         (finally
-                           ;; Clear interrupt flag after execution to keep scheduler stable.
-                           ;; Record in trace if interrupt occurred during or before execution.
-                           (let [interrupted-after (Thread/interrupted)]
-                             (when (and (:trace? sched) (or was-interrupted interrupted-after))
-                               (swap! state-atom
-                                      maybe-trace-state
-                                      {:event :interrupt-cleared
-                                       :id (:id mt)
-                                       :before was-interrupted
-                                       :after interrupted-after
-                                       :now-ms now}))))))
-                     :cljs
-                     (try
-                       ((:f mt))
-                       (catch :default e
-                         (throw e))))
-                  (dissoc mt :f))
-                (recur)))))))))
+  ([^TestScheduler sched] (step! sched nil))
+  ([^TestScheduler sched task-id]
+   (ensure-driver-thread! sched "step!")
+   (binding [*scheduler* sched]
+     (let [state-atom (:state sched)]
+       (loop []
+         (let [s @state-atom
+               q (:micro-q s)]
+           (if (q-empty? q)
+             idle
+             (let [q-size (count q)
+                   [mt q' decision new-rng s-after] (select-and-remove-task sched s q task-id)
+                   now (:now-ms s-after)
+                   select-trace (when (> q-size 1)
+                                  {:event :select-task
+                                   :decision decision
+                                   :queue-size q-size
+                                   :selected-id (:id mt)
+                                   :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec q)))
+                                   :now-ms now})
+                   s' (-> s-after
+                          (assoc :micro-q q')
+                          (assoc :rng-state new-rng)
+                          (cond-> select-trace (maybe-trace-state select-trace))
+                          (maybe-trace-state {:event :run-microtask
+                                              :id (:id mt)
+                                              :kind (:kind mt)
+                                              :label (:label mt)
+                                              :lane (:lane mt)
+                                              :now-ms now}))]
+               (if (compare-and-set! state-atom s s')
+                 (execute-microtask! sched state-atom mt now)
+                 (recur))))))))))
 
 (defn tick!
   "Drain all microtasks at current virtual time. Returns number of microtasks executed.
@@ -1169,17 +1218,19 @@
 ;; -----------------------------------------------------------------------------
 
 (defn trace->schedule
-  "Extract the sequence of selection decisions from a trace.
-  Returns a vector of decisions that can be used to replay the same execution order.
+  "Extract the sequence of task IDs from a trace for replay.
+  Returns a vector of task IDs [id1 id2 id3 ...] that can be used to replay
+  the exact same execution order.
 
-  For :random decisions, emits [:by-id selected-id] to ensure exact replay."
+  Usage:
+    (def schedule (mt/trace->schedule (mt/trace sched)))
+    ;; => [2 4 3]  ; bare task IDs
+    ;; User can inspect/modify: [2 3 4]  ; different order
+    (mt/replay-schedule (make-task) schedule)"
   [trace]
   (->> trace
        (filter #(= :select-task (:event %)))
-       (mapv (fn [{:keys [decision selected-id]}]
-               (if (= :random decision)
-                 [:by-id selected-id]
-                 decision)))))
+       (mapv :selected-id)))
 
 (defn replay-schedule
   "Run a task with the exact schedule from a previous trace.
