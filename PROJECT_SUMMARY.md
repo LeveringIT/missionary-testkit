@@ -3,7 +3,7 @@
 C: purpose=deterministic-testkit|missionary-async ; elim={real-time,rand,nondet} ; prod
 A: core=TestScheduler(state:atom) ; edge={public-api,macros} ; infra={build,clojars,nrepl}
 E: ns=de.levering-it.missionary-testkit as mt ; build-ns=build
-D: state{:now-ms :next-id :micro-q :timers :trace :driver-thread :schedule-idx :rng-state} ; policy∈{:fifo,:seeded} ; schedule=nil|vec(decisions)
+D: state{:now-ms :next-id :micro-q :timers :trace :driver-thread :schedule-idx :rng-state} ; timer-order∈{:fifo,:seeded} ; seed≠0⇒:seeded(default) ; seed=0⇒:fifo(default) ; schedule=nil|vec(decisions)
 X: model=micro-q(FIFO) + timers(sorted-map[at tie order id]→timer) ; time=virtual(manual) ; strict⇒1-driver-thread
 Δ: timers→promote(now>=at)→micro-q ; microtask→may enqueue ; completion→via micro-q ; schedule⇒override(>1 item)
 T: cmd=clojure -M:test -m cognitect.test-runner ; reload-before-test=require:reload ; cover≈35t/192a
@@ -19,7 +19,8 @@ API:
   vt=(sleep timeout yield) ; integ=(with-determinism collect executor cpu-executor blk-executor)
   interleave=(trace->schedule replay-schedule seed->schedule check-interleaving explore-interleavings selection-gen schedule-gen)
 I: inv={determinism∀f, iface-consistency, time↑only, fifo@same-time unless schedule, timers→sorted, completion→micro-q, schedule→select if >1}
-DC: det-yes={sleep,timeout,yield,race,join,amb,amb=,seed,sample,relieve,sem,rdv,mbx,dfv,via(cpu|blk),watch(internal),signal(internal)} ; det-no={publisher,via(custom),real-IO,observe(ext),watch(ext)}
+DC: det-yes={sleep,timeout,yield,race,join,amb,amb=,seed,sample,relieve,sem,rdv,mbx,dfv,via(cpu|blk),watch(int),signal(int),stream(int),latest,observe(int)} ; det-no={publisher,via(custom),real-IO,observe(ext),watch(ext)}
+EX: coord={mbx,dfv,rdv,sem} ; flows={diamond-dag,glitch-free,nested-diamond,sampling} ; observe={event-emitter,controlled-callbacks}
 TS: strict⇒drive-only-one-thread ; off-thread-cb⇒fail(::off-scheduler-callback) ; atom⇒safe-reads ; with-determinism⇒global-lock(parallel-safe)
 via: m/via(cpu|blk)⇒sync-on-driver ; real-exec⇒break-determinism ; cancel⇒interrupt ; InterruptedException possible
 INT: step!⇒clear-before+after ; trace:interrupt-cleared{:before :after :id :now-ms} ; scheduler-thread-stable
@@ -29,3 +30,4 @@ CMD: repl=clojure -M:nrepl ; build=clojure -T:build ci ; deploy=clojure -T:build
 SAFE: read-only={now-ms pending trace clock done?}
 MUT: advances={step! tick! advance! advance-to! run start! cancel!}
 FS: src=src/de/levering_it/missionary_testkit.cljc ; test=test/de/levering_it/missionary_testkit_test.clj ; build=build.clj
+R: Δ1=README:+coord-primitives(mbx,dfv,rdv,sem) ; Δ2=README:+continuous-flows(diamond-dag,glitch-free) ; Δ3=README:+observe-pattern ; Δ4=README:clarify-seed/timer-order ; Δ5=src:fix-determinism-contract-comment

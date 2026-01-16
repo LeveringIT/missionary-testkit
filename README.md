@@ -139,13 +139,21 @@ The scheduler manages virtual time and a queue of pending tasks:
 (def sched (mt/make-scheduler {:initial-ms      0       ; starting time
                                 :seed            42      ; seed for RNG and timer tie-breaking
                                 :trace?          true    ; enable execution trace
-                                :timer-order     :fifo   ; explicit override (:fifo or :seeded)
+                                :timer-order     :fifo   ; explicit override (see below)
                                 :micro-schedule  nil}))  ; microtask interleaving (see Schedule Decisions)
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
 (mt/pending sched)  ; => {:microtasks [...] :timers [...]}
 (mt/trace sched)    ; => [{:event :enqueue-timer ...} ...]
 ```
+
+**Seed and timer-order relationship:**
+- `:seed` controls the RNG state for `:random` microtask selection and timer tie-breaking
+- `:timer-order` determines how timers with the same `at-ms` are ordered:
+  - `:fifo` - first scheduled wins (default when `seed` is 0)
+  - `:seeded` - deterministic pseudo-random order based on seed (default when `seed` ≠ 0)
+- If you provide a non-zero `:seed` without explicit `:timer-order`, it defaults to `:seeded`
+- Use explicit `:timer-order :fifo` to get insertion-order semantics even with a non-zero seed
 
 ### Using Clock in Production Code
 
@@ -246,6 +254,204 @@ Flows work deterministically when atom modifications happen inside the controlle
         (m/? (mt/collect (m/seed [1 2 3])))))))
 ;; => [1 2 3]
 ```
+
+## Coordination Primitives
+
+Missionary's coordination primitives (`m/mbx`, `m/dfv`, `m/rdv`, `m/sem`) work fully deterministically under the testkit. These enable communication and synchronization between concurrent tasks.
+
+### Mailbox (m/mbx) - Async Queue
+
+```clojure
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        mbx (m/mbx)]
+    (mt/run sched
+      (m/sp
+        ;; Post values (1-arity = post, never blocks)
+        (mbx :a)
+        (mbx :b)
+        ;; Fetch values (2-arity = task, use with m/?)
+        [(m/? mbx) (m/? mbx)]))))
+;; => [:a :b]  (FIFO order)
+```
+
+### Deferred Value (m/dfv) - Single-Assignment Promise
+
+```clojure
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        result (m/dfv)]
+    (mt/run sched
+      (m/sp
+        (m/? (m/join vector
+               ;; Worker: compute and assign
+               (m/sp
+                 (m/? (m/sleep 100))
+                 (result (* 6 7))  ; assign (1-arity)
+                 :worker-done)
+               ;; Waiter: block until assigned
+               (m/sp
+                 (m/? result))))))))  ; deref (2-arity task)
+;; => [:worker-done 42]
+```
+
+### Rendezvous (m/rdv) - Synchronous Handoff
+
+```clojure
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        rdv (m/rdv)]
+    (mt/run sched
+      (m/sp
+        (m/? (m/join vector
+               ;; Sender: (rdv value) returns a task
+               (m/sp
+                 (m/? (rdv :handoff))  ; give - blocks until receiver ready
+                 :sender-done)
+               ;; Receiver: (rdv s f) is the take task
+               (m/sp
+                 (m/? rdv))))))))      ; take - blocks until giver ready
+;; => [:sender-done :handoff]
+```
+
+### Semaphore (m/sem) - Resource Limiting
+
+```clojure
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        sem (m/sem 2)  ; 2 permits
+        max-concurrent (atom 0)
+        active (atom 0)]
+    (mt/run sched
+      (m/sp
+        (m/? (m/join vector
+               ;; 4 workers competing for 2 permits
+               (m/sp (m/? sem) (swap! active inc) (swap! max-concurrent max @active)
+                     (m/? (m/sleep 50)) (swap! active dec) (sem) :w1)
+               (m/sp (m/? sem) (swap! active inc) (swap! max-concurrent max @active)
+                     (m/? (m/sleep 50)) (swap! active dec) (sem) :w2)
+               (m/sp (m/? sem) (swap! active inc) (swap! max-concurrent max @active)
+                     (m/? (m/sleep 50)) (swap! active dec) (sem) :w3)
+               (m/sp (m/? sem) (swap! active inc) (swap! max-concurrent max @active)
+                     (m/? (m/sleep 50)) (swap! active dec) (sem) :w4)))
+        @max-concurrent))))
+;; => 2  (never exceeded 2 concurrent)
+```
+
+See `examples/coordination_primitives.clj` for more patterns including producer-consumer, request-response, and mutex implementations.
+
+## Continuous Flows and Diamond DAGs
+
+Continuous flows (`m/signal`, `m/watch`, `m/latest`) work deterministically when atom changes happen inside the controlled task. The testkit is particularly useful for testing complex signal topologies.
+
+### Diamond-Shaped DAG
+
+When a signal feeds multiple derived signals that later merge, you get a "diamond" topology. This tests glitch-free propagation:
+
+```clojure
+;;       !input
+;;        /   \
+;;    <left   <right
+;;        \   /
+;;       <merged
+
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        !input (atom 1)
+        <input (m/signal (m/watch !input))
+        <left  (m/signal (m/latest #(* 2 %) <input))    ; 2x
+        <right (m/signal (m/latest #(+ 10 %) <input))   ; +10
+        <merged (m/signal (m/latest (fn [l r] {:left l :right r :sum (+ l r)})
+                                    <left <right))
+        results (atom [])]
+    (mt/run sched
+      (m/sp
+        (m/? (m/race
+               (m/reduce (fn [_ v]
+                           (swap! results conj v)
+                           (when (>= (count @results) 3) (reduced @results)))
+                         nil <merged)
+               (m/sp
+                 (m/? (m/sleep 50)) (reset! !input 2)
+                 (m/? (m/sleep 50)) (reset! !input 5)
+                 (m/? (m/sleep 1000)))))))))
+;; Each result is consistent: left = 2*input, right = input+10
+;; No glitches like {:left 4 :right 11} (one updated, other didn't)
+```
+
+### Verifying Glitch-Free Behavior
+
+Use `check-interleaving` to verify diamond DAGs never produce inconsistent states:
+
+```clojure
+(mt/with-determinism
+  (mt/check-interleaving
+    (fn []
+      (let [!input (atom 1)
+            <input (m/signal (m/watch !input))
+            <doubled (m/signal (m/latest #(* 2 %) <input))
+            <plus-one (m/signal (m/latest inc <input))
+            <check (m/signal (m/latest (fn [d p]
+                                         {:consistent? (= (/ d 2) (dec p))})
+                                       <doubled <plus-one))]
+        (m/sp
+          (m/? (m/race
+                 (m/reduce (fn [acc v] (conj acc v))
+                           [] <check)
+                 (m/sp
+                   (dotimes [i 5]
+                     (m/? (m/sleep 10))
+                     (reset! !input i))
+                   (m/? (m/sleep 100))))))))
+    {:num-tests 50
+     :seed 42
+     :property (fn [results] (every? :consistent? results))}))
+;; => {:ok? true ...}
+```
+
+See `examples/continuous_flows.clj` for more patterns including nested diamonds, sampling, and dashboard examples.
+
+## Testing Discrete Flows with m/observe
+
+`m/observe` can be tested deterministically when callback invocations happen from **inside** the controlled task (via scheduler microtasks or timers), not from external threads.
+
+### Pattern: Controlled Event Emitter
+
+Create an emitter where you control when events fire:
+
+```clojure
+(defn make-event-emitter
+  "Returns {:flow <discrete-flow> :emit! <fn>}"
+  []
+  (let [!cb (atom nil)]
+    {:flow  (m/observe (fn [cb]
+                         (reset! !cb cb)
+                         #(reset! !cb nil)))
+     :emit! (fn [v] (when-let [cb @!cb] (cb v)))}))
+
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        {:keys [flow emit!]} (make-event-emitter)]
+    (mt/run sched
+      (m/sp
+        (m/? (m/race
+               ;; Consumer: collect events from discrete flow
+               (m/reduce (fn [acc event]
+                           (let [acc (conj acc event)]
+                             (if (>= (count acc) 3) (reduced acc) acc)))
+                         [] flow)
+               ;; Producer: emit at controlled points
+               (m/sp
+                 (m/? (m/sleep 10)) (emit! :click)
+                 (m/? (m/sleep 10)) (emit! :scroll)
+                 (m/? (m/sleep 10)) (emit! :keypress)
+                 (m/? (m/sleep 1000)))))))))
+;; => [:click :scroll :keypress]
+```
+
+This pattern works because `emit!` is called from inside the `m/sp` task at controlled yield points (`m/sleep`), so the callback invocation is part of the deterministic execution.
+
+See `examples/discrete_observe.clj` for more patterns including pub/sub channels and throttled event streams.
 
 ## Debugging with Traces
 

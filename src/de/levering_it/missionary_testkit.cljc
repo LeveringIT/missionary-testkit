@@ -27,13 +27,21 @@
 ;;   - m/seed, m/sample               ; flow combinators
 ;;   - m/relieve, m/sem, m/rdv, m/mbx, m/dfv  ; coordination primitives
 ;;   - m/via with m/cpu or m/blk (JVM); executors rebound to scheduler microtasks
+;;   - m/signal, m/watch, m/latest, m/stream ; when atom changes happen INSIDE the task
+;;   - m/observe                      ; when callbacks are invoked INSIDE the task
 ;;
 ;; EXPLICITLY NOT SUPPORTED (non-deterministic):
-;;   - m/publisher, m/stream, m/signal  ; reactive-streams subsystem, external threading
-;;   - m/via with custom executors      ; work runs on uncontrolled threads
-;;   - Real I/O (HTTP, file, database)  ; actual wall-clock time, external systems
-;;   - m/observe with external callbacks; events arrive from outside the scheduler
-;;   - m/watch on externally-modified atoms
+;;   - m/publisher                    ; reactive-streams subsystem, external threading
+;;   - m/via with custom executors    ; work runs on uncontrolled threads
+;;   - Real I/O (HTTP, file, database); actual wall-clock time, external systems
+;;   - m/observe with EXTERNAL callbacks ; events from outside the scheduler
+;;   - m/watch on EXTERNALLY-modified atoms ; changes from threads outside the task
+;;
+;; KEY INSIGHT: m/signal, m/watch, m/stream work deterministically because signal
+;; propagation is SYNCHRONOUS. When swap! is called inside the controlled task,
+;; the watch callback, signal recomputation, and downstream consumers all execute
+;; immediately in the same call stack. The testkit controls WHEN that swap! happens
+;; (via m/sleep or mt/yield), giving deterministic control over propagation timing.
 ;;
 ;; THREAD CONTROL: Determinism is guaranteed only when the scheduler drives
 ;; execution from a single thread. Off-thread callbacks throw ::off-scheduler-callback
