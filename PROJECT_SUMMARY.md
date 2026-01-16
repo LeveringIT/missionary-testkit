@@ -17,8 +17,8 @@ API:
   ctrl=(step! tick! advance! advance-to!)
   run=(run start!) ; job=(done? result cancel!)
   vt=(sleep timeout yield) ; integ=(with-determinism collect executor cpu-executor blk-executor)
-  interleave=(trace->schedule replay-schedule seed->schedule check-interleaving explore-interleavings selection-gen schedule-gen)
-I: inv={determinism∀f, iface-consistency, time↑only, fifo@same-time unless schedule, timers→sorted, completion→micro-q, schedule→select if >1}
+  interleave=(trace->schedule replay-schedule replay check-interleaving explore-interleavings)
+I: inv={determinism∀f, iface-consistency, time↑only, random@same-time(seeded) unless explicit-schedule, timers→sorted, completion→micro-q, schedule→select if >1}
 DC: det-yes={sleep,timeout,yield,race,join,amb,amb=,seed,sample,relieve,sem,rdv,mbx,dfv,via(cpu|blk),watch(int),signal(int),stream(int),latest,observe(int)} ; det-no={publisher,via(custom),real-IO,observe(ext),watch(ext)}
 EX: coord={mbx,dfv,rdv,sem} ; flows={diamond-dag,glitch-free,nested-diamond,sampling} ; observe={event-emitter,controlled-callbacks}
 TS: strict⇒drive-only-one-thread ; off-thread-cb⇒fail(::off-scheduler-callback) ; atom⇒safe-reads ; with-determinism⇒global-lock(parallel-safe)

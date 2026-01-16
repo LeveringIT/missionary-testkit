@@ -451,7 +451,7 @@
                       "Schedule exhausted; increase schedule-length"
                       {:schedule-length (count schedule)
                        :decisions-used idx}))))
-    [:fifo s]))
+    [:random s]))
 
 (defn- finalize-timer-promotion
   "Finalize state after promoting timers, adding trace event if any were promoted."
@@ -1228,26 +1228,6 @@
                                        :failure failure})))]
      (replay-schedule (task-fn) schedule opts))))
 
-(defn seed->schedule
-  "Deterministically generate a schedule from a seed.
-  Creates a schedule of the given length with random FIFO/LIFO/random decisions.
-  Uses the same LCG algorithm on both CLJ and CLJS for cross-platform consistency."
-  [seed num-decisions]
-  ;; Use same MINSTD LCG as lcg-next to avoid overflow in CLJS.
-  ;; MINSTD: a=48271, m=2^31-1, keeps values in safe 32-bit range.
-  (let [initial-s (let [s (mod (long seed) 2147483647)]
-                    (if (zero? s) 1 s))]
-    (loop [s initial-s
-           result []
-           i 0]
-      (if (>= i num-decisions)
-        result
-        (let [next-s (lcg-next s)
-              decision (case (mod next-s 3)
-                         0 :fifo
-                         1 :lifo
-                         2 :random)]
-          (recur next-s (conj result decision) (inc i)))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Interleaving: test helpers
@@ -1257,15 +1237,13 @@
   #?(:clj (System/currentTimeMillis)
      :cljs (.getTime (js/Date.))))
 
-(defn- run-with-schedule
-  "Run a task once with a generated schedule. Returns map with result info.
+(defn- run-with-random-interleaving
+  "Run a task once with random selection seeded by test-seed. Returns map with result info.
   Internal helper for check-interleaving and explore-interleavings.
   Must be called inside a with-determinism body."
-  [task {:keys [test-seed schedule-length max-steps max-time-ms]
+  [task {:keys [test-seed max-steps max-time-ms]
          :or {max-time-ms 60000}}]
-  (let [schedule (seed->schedule test-seed schedule-length)
-        sched (make-scheduler {:micro-schedule schedule
-                               :trace? true
+  (let [sched (make-scheduler {:trace? true
                                :seed test-seed})
         result (try
                  {:value (run sched task {:max-steps max-steps
@@ -1286,12 +1264,11 @@
   This ensures mutable state (like atoms) is reset between iterations.
 
   Options:
-  - :num-tests   - number of different schedules to try (default 100)
-  - :seed        - base seed for schedule generation (default: current time)
+  - :num-tests   - number of different interleavings to try (default 100)
+  - :seed        - base seed for RNG (default: current time)
   - :property    - (fn [result] boolean) - returns true if result is valid
   - :max-steps   - max scheduler steps per run (default 10000)
   - :max-time-ms - max virtual time per run (default 60000)
-  - :schedule-length - length of generated micro-schedules (default 100)
 
   Returns on success:
   {:ok?            true
@@ -1310,20 +1287,18 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-  [task-fn {:keys [num-tests seed property max-steps max-time-ms schedule-length]
+  [task-fn {:keys [num-tests seed property max-steps max-time-ms]
             :or {num-tests 100
                  max-steps 10000
-                 max-time-ms 60000
-                 schedule-length 100}}]
+                 max-time-ms 60000}}]
   (let [base-seed (or seed (default-base-seed))]
     (loop [i 0]
       (if (>= i num-tests)
         {:ok? true :seed base-seed :iterations-run num-tests}
-        (let [run-result (run-with-schedule (task-fn)
-                                            {:test-seed (+ base-seed i)
-                                             :schedule-length schedule-length
-                                             :max-steps max-steps
-                                             :max-time-ms max-time-ms})
+        (let [run-result (run-with-random-interleaving (task-fn)
+                                                       {:test-seed (+ base-seed i)
+                                                        :max-steps max-steps
+                                                        :max-time-ms max-time-ms})
               {:keys [result seed micro-schedule trace]} run-result
               exception? (some? (:error result))
               property-failed? (and property
@@ -1349,10 +1324,9 @@
   This ensures mutable state (like atoms) is reset between iterations.
 
   Options:
-  - :num-samples     - number of different schedules to try (default 100)
-  - :seed            - base seed for schedule generation (default: current time)
-  - :schedule-length - length of generated micro-schedules (default 100)
-  - :max-steps       - max scheduler steps per run (default 10000)
+  - :num-samples - number of different interleavings to try (default 100)
+  - :seed        - base seed for RNG (default: current time)
+  - :max-steps   - max scheduler steps per run (default 10000)
 
   Returns:
   {:unique-results - count of distinct results seen
@@ -1361,16 +1335,14 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-  [task-fn {:keys [num-samples seed schedule-length max-steps]
+  [task-fn {:keys [num-samples seed max-steps]
             :or {num-samples 100
-                 schedule-length 100
                  max-steps 10000}}]
   (let [base-seed (or seed (default-base-seed))
         results (for [i (range num-samples)
-                      :let [run-result (run-with-schedule (task-fn)
-                                                          {:test-seed (+ base-seed i)
-                                                           :schedule-length schedule-length
-                                                           :max-steps max-steps})
+                      :let [run-result (run-with-random-interleaving (task-fn)
+                                                                     {:test-seed (+ base-seed i)
+                                                                      :max-steps max-steps})
                             ;; Extract value or return error map
                             r (let [res (:result run-result)]
                                 (if (:error res) res (:value res)))]]
@@ -1380,33 +1352,6 @@
      :results (vec results)
      :seed base-seed}))
 
-;; -----------------------------------------------------------------------------
-;; Interleaving: test.check generators (optional, requires test.check)
-;; -----------------------------------------------------------------------------
-
-;; These are functions that return generators to avoid requiring test.check at load time
-(defn selection-gen
-  "Generator for a single selection decision.
-  Requires clojure.test.check.generators to be available."
-  []
-  (require '[clojure.test.check.generators :as gen])
-  (let [gen-ns (find-ns 'clojure.test.check.generators)]
-    ((ns-resolve gen-ns 'frequency)
-     [[5 ((ns-resolve gen-ns 'return) :fifo)]
-      [3 ((ns-resolve gen-ns 'return) :lifo)]
-      [2 ((ns-resolve gen-ns 'return) :random)]])))
-
-(defn schedule-gen
-  "Generator for a schedule of selection decisions.
-  Requires clojure.test.check.generators to be available.
-
-  Usage with test.check:
-    (require '[clojure.test.check.generators :as gen])
-    (gen/sample (mt/schedule-gen 10))"
-  [max-decisions]
-  (require '[clojure.test.check.generators :as gen])
-  (let [gen-ns (find-ns 'clojure.test.check.generators)]
-    ((ns-resolve gen-ns 'vector) (selection-gen) 0 max-decisions)))
 
 ;; -----------------------------------------------------------------------------
 ;; Flow collection convenience

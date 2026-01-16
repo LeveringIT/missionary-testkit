@@ -582,9 +582,6 @@ All targeted decisions fall back to the first task if no match is found.
 
 ;; Mix basic and targeted decisions
 (mt/make-scheduler {:micro-schedule [:fifo [:nth 2] :lifo [:by-label "producer"]]})
-
-;; Generate schedule from seed (basic decisions only)
-(mt/seed->schedule 42 10) ; => [:lifo :fifo :random ...]
 ```
 
 ## Error Detection
@@ -668,8 +665,6 @@ The scheduler automatically detects common problems:
 - `(replay task-fn failure)` - replay a failure bundle from `check-interleaving`
 - `(replay-schedule task schedule)` - replay exact execution order (task created inside `with-determinism`)
 - `(trace->schedule trace)` - extract schedule from trace
-- `(seed->schedule seed n)` - generate schedule from seed (cross-platform consistent)
-- `(selection-gen)` / `(schedule-gen n)` - test.check generators
 
 ## Running Tests
 

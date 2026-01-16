@@ -804,23 +804,6 @@
                             #"missing :schedule"
                             (mt/replay (fn [] (m/sp :done)) {:ok? false}))))))
 
-(deftest seed->schedule-test
-  (testing "generates schedule of correct length"
-    (let [schedule (mt/seed->schedule 42 10)]
-      (is (vector? schedule))
-      (is (= 10 (count schedule)))))
-
-  (testing "same seed produces same schedule"
-    (is (= (mt/seed->schedule 12345 20)
-           (mt/seed->schedule 12345 20))))
-
-  (testing "different seeds produce different schedules"
-    (is (not= (mt/seed->schedule 1 10)
-              (mt/seed->schedule 2 10))))
-
-  (testing "schedule contains valid decisions"
-    (let [schedule (mt/seed->schedule 42 100)]
-      (is (every? #{:fifo :lifo :random} schedule)))))
 
 (deftest check-interleaving-test
   (testing "returns success map with seed when all tests pass"
