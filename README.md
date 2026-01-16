@@ -137,23 +137,27 @@ The scheduler manages virtual time and a queue of pending tasks:
 
 ```clojure
 (def sched (mt/make-scheduler {:initial-ms      0       ; starting time
-                                :seed            42      ; seed for RNG and timer tie-breaking
+                                :seed            42      ; seed for random ordering (nil = FIFO)
                                 :trace?          true    ; enable execution trace
-                                :timer-order     :fifo   ; explicit override (see below)
-                                :micro-schedule  nil}))  ; microtask interleaving (see Schedule Decisions)
+                                :micro-schedule  nil}))  ; explicit decisions (see Schedule Decisions)
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
 (mt/pending sched)  ; => {:microtasks [...] :timers [...]}
 (mt/trace sched)    ; => [{:event :enqueue-timer ...} ...]
 ```
 
-**Seed and timer-order relationship:**
-- `:seed` controls the RNG state for `:random` microtask selection and timer tie-breaking
-- `:timer-order` determines how timers with the same `at-ms` are ordered:
-  - `:fifo` - first scheduled wins (default when `seed` is 0)
-  - `:seeded` - deterministic pseudo-random order based on seed (default when `seed` ≠ 0)
-- If you provide a non-zero `:seed` without explicit `:timer-order`, it defaults to `:seeded`
-- Use explicit `:timer-order :fifo` to get insertion-order semantics even with a non-zero seed
+**Ordering behavior:**
+- **No seed (default):** FIFO ordering for both timers and microtasks. Predictable, good for unit tests.
+- **With seed:** Random ordering (seeded RNG) for both timers and microtasks. Deterministic but shuffled, good for fuzz/property testing.
+
+```clojure
+;; FIFO ordering (default) - predictable for unit tests
+(mt/make-scheduler)
+(mt/make-scheduler {:trace? true})
+
+;; Random ordering - for exploring interleavings
+(mt/make-scheduler {:seed 42})
+```
 
 ### Using Clock in Production Code
 

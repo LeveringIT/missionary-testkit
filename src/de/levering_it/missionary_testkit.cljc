@@ -101,7 +101,7 @@
 ;; -----------------------------------------------------------------------------
 
 (defrecord TestScheduler
-           [state timer-order seed trace? micro-schedule])
+           [state seed trace? micro-schedule])
 
 (defn- maybe-trace-state
   "If tracing enabled (state has non-nil :trace vector), append event."
@@ -115,41 +115,43 @@
 
   Options:
   {:initial-ms     0
-   :seed           42                  ; seed for RNG and timer tie-breaking
-                                       ; when provided, timer-order defaults to :seeded
-   :timer-order    :fifo | :seeded     ; explicit override for timer ordering
+   :seed           nil | number        ; nil (default) = FIFO ordering
+                                       ; number = random ordering with that seed
    :trace?         true|false
-   :micro-schedule nil | vector        ; selection decisions for microtask interleaving}
+   :micro-schedule nil | vector        ; explicit selection decisions (overrides seed)}
 
-  The :seed option controls determinism:
-  - Used for :random selection decisions
-  - Sets :timer-order to :seeded (for timer tie-breaking) unless explicitly overridden
+  Ordering behavior:
+  - No seed (or nil): FIFO ordering for both timers and microtasks.
+    Predictable, good for unit tests with specific expected order.
+  - With seed: Random ordering (seeded RNG) for both timers and microtasks.
+    Deterministic but shuffled, good for fuzz/property testing.
+
+  The :micro-schedule option provides explicit control over microtask selection
+  when you need to replay a specific interleaving or test a particular order.
 
   Thread safety: On JVM, all scheduler operations must be performed from a single
   thread. Cross-thread callbacks will throw an error to catch accidental nondeterminism."
   ([]
    (make-scheduler {}))
-  ([{:keys [initial-ms seed timer-order trace? micro-schedule]
+  ([{:keys [initial-ms seed trace? micro-schedule]
      :or {initial-ms 0
-          seed 0
           trace? false
           micro-schedule nil}}]
-   (let [effective-timer-order (or timer-order (when (not= seed 0) :seeded) :fifo)]
-     (->TestScheduler
-      (atom {:now-ms (long initial-ms)
-             :next-id 0
-             :micro-q empty-queue
-             ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
-             :timers (sorted-map)
-             ;; trace is either nil or vector
-             :trace (when trace? [])
-             ;; JVM-only "driver thread" captured lazily for thread safety enforcement
-             :driver-thread #?(:clj nil :cljs ::na)
-             ;; interleaving: micro-schedule index (consumed as used)
-             :schedule-idx 0
-             ;; deterministic RNG state for :random selection (LCG)
-             :rng-state (long seed)})
-      effective-timer-order (long seed) (boolean trace?) micro-schedule))))
+   (->TestScheduler
+    (atom {:now-ms (long initial-ms)
+           :next-id 0
+           :micro-q empty-queue
+           ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
+           :timers (sorted-map)
+           ;; trace is either nil or vector
+           :trace (when trace? [])
+           ;; JVM-only "driver thread" captured lazily for thread safety enforcement
+           :driver-thread #?(:clj nil :cljs ::na)
+           ;; interleaving: micro-schedule index (consumed as used)
+           :schedule-idx 0
+           ;; deterministic RNG state for :random selection (LCG)
+           :rng-state (if seed (long seed) 0)})
+    seed (boolean trace?) micro-schedule)))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -200,8 +202,8 @@
     when no microtasks but a timer is pending
   - nil when scheduler is idle (no work pending)
 
-  Note: This reflects FIFO order for microtasks. Actual selection may differ
-  if a micro-schedule with non-FIFO decisions is configured."
+  Note: This reflects FIFO order. Actual selection may differ if a seed is
+  provided (random ordering) or an explicit micro-schedule is configured."
   [^TestScheduler sched]
   (let [{:keys [micro-q timers]} @(:state sched)]
     (if-let [mt (peek micro-q)]
@@ -318,9 +320,9 @@
               (let [now (:now-ms s)
                     at-ms (+ now (long delay-ms))
                     order id
-                    tie (case (:timer-order sched)
-                          :seeded (seeded-tie (:seed sched) order)
-                            ;; default/fallback
+                    ;; Timer tie-breaking: FIFO if no seed, seeded shuffle if seed provided
+                    tie (if-let [seed (:seed sched)]
+                          (seeded-tie seed order)
                           order)
                     k [at-ms tie order id]
                     t {:id id
@@ -451,7 +453,8 @@
                       "Schedule exhausted; increase schedule-length"
                       {:schedule-length (count schedule)
                        :decisions-used idx}))))
-    [:random s]))
+    ;; No explicit schedule: use FIFO if no seed, random if seed provided
+    [(if (:seed sched) :random :fifo) s]))
 
 (defn- finalize-timer-promotion
   "Finalize state after promoting timers, adding trace event if any were promoted."
