@@ -13,19 +13,38 @@ OODA+δ
 SESSION:
 start⇒PROJECT_SUMMARY.md?≻read
 
+TOOL ROUTING (hard rules):
+- For ANY Clojure evaluation, compilation, loading, or tests: use `clojure_eval`.
+  - Do NOT use bash to run `clojure`, `lein`, `bb`, or `java` unless `clojure_eval` is unavailable or failing.
+- For ANY persistent change to .clj/.cljs/.cljc/.edn: use `clojure_edit` (structural).
+  - Avoid manual text edits that can introduce paren mismatch.
+- Bash is LAST resort and only for: git, file listing/search, non-Clojure system tasks.
+- If you are about to paste a bash command that includes "clojure" -> STOP and call `clojure_eval` instead.
+- After each `clojure_edit`: run `clojure_eval` to reload/compile the touched namespace(s). Fix errors immediately.
+
 MCP:
-default: eval@explore/verify ; edit@persist
-persist⇒Clojure-edit≻structural≻f/r ; eval⇒Clojure-eval≻CLI
+default: explore=use `clojure_eval` ; persist=use `clojure_edit`
+priority: `clojure_eval` / `clojure_edit` >>> bash
+bash: only git/files/non-clojure; never for running `clojure` unless tools fail
+post-edit: `clojure_edit` -> paren✓ -> `clojure_eval` reload/compile -> tests
+
+
+context:
+`clojure_eval`: reload
 light⇒paren✓(post-edit) ; miss<5%⇒target(form:type+name)
 inspect≻mutate | REPL≻assume
 
 PERSIST:
-persist⇔human∈{change,edit,refactor,ensure,make-sure,fix,implement}
-¬persist⇒REPL-only✓
-persist⇒(Clojure-edit:first ∧ Δ:min ∧ ¬rewrite ∧ reload ∧ tests:run)
-tests=PASS⇒commit ; tests≠PASS⇒¬commit
-commit≔after(all-Δ) ; commit-msg≔Δ:summary
-report⇒Δ:(file:path + form:type+name) ; commit:hash?
+persist is ON when the task requires changing repo files to satisfy the request.
+persist is OFF only when the human explicitly says "no code changes" / "explain only".
+
+If persist=ON:
+- Use `clojure_edit` first (structural, minimal Δ, no rewrites)
+- Then `clojure_eval` reload/compile + run relevant tests
+
+If persist=OFF:
+- Use `clojure_eval` only (REPL exploration/verification); do not modify files.
+
 
 REPL:
 REPL-first@explore: test-assumptions ∧ validate-behavior ∧ edge-cases
@@ -64,8 +83,6 @@ tests:
 reload≻run
 normal∧error-paths
 
-shell:
-shell/sh≻CLI
 handle-errors
 dir≻implicit-cwd
 -X:test≻piecemeal

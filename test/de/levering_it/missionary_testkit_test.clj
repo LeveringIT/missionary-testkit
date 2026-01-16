@@ -185,165 +185,7 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"test error"
                             (mt/result job))))))
 
-;; =============================================================================
-;; Subject (Discrete Flow) Tests
-;; =============================================================================
 
-(deftest subject-test
-  (testing "subject flow receives emitted values"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow emit close]} (mt/subject sched {:label "test-subject"})
-          proc (mt/spawn-flow! sched flow {:label "consumer"})]
-      ;; Initially not ready
-      (mt/tick! sched)
-      (is (not (mt/ready? proc)))
-
-      ;; Emit a value
-      (mt/start! sched (emit :hello) {})
-      (mt/tick! sched)
-      (is (mt/ready? proc))
-
-      ;; Transfer
-      (is (= :hello (mt/transfer! proc)))
-      (mt/tick! sched)
-
-      ;; Close
-      (mt/start! sched (close) {})
-      (mt/tick! sched)
-      (is (mt/terminated? proc))))
-
-  (testing "subject queues multiple values"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow emit close]} (mt/subject sched)
-          proc (mt/spawn-flow! sched flow)]
-      (mt/tick! sched)
-
-      ;; Emit multiple values
-      (mt/start! sched (emit :a) {})
-      (mt/start! sched (emit :b) {})
-      (mt/start! sched (emit :c) {})
-      (mt/tick! sched)
-
-      ;; Transfer all
-      (is (= :a (mt/transfer! proc)))
-      (mt/tick! sched)
-      (is (= :b (mt/transfer! proc)))
-      (mt/tick! sched)
-      (is (= :c (mt/transfer! proc)))
-      (mt/tick! sched)
-
-      ;; Close
-      (mt/start! sched (close) {})
-      (mt/tick! sched)
-      (is (mt/terminated? proc))))
-
-  (testing "offer succeeds when no backlog"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow offer]} (mt/subject sched)
-          proc (mt/spawn-flow! sched flow)]
-      (mt/tick! sched)
-
-      (is (true? (offer :value)))
-      (mt/tick! sched)
-      (is (mt/ready? proc))
-      (is (= :value (mt/transfer! proc)))))
-
-  (testing "offer fails when backpressured"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow offer]} (mt/subject sched)
-          proc (mt/spawn-flow! sched flow)]
-      (mt/tick! sched)
-
-      ;; First offer succeeds
-      (is (true? (offer :first)))
-      ;; Second offer fails (already has pending)
-      (is (false? (offer :second)))
-
-      (mt/tick! sched)
-      (is (= :first (mt/transfer! proc)))))
-
-  (testing "subject fail propagates error"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow fail]} (mt/subject sched)
-          proc (mt/spawn-flow! sched flow)
-          ex (ex-info "subject failed" {})]
-      (mt/tick! sched)
-
-      (mt/start! sched (fail ex) {})
-      (mt/tick! sched)
-
-      (is (mt/ready? proc))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"subject failed"
-                            (mt/transfer! proc))))))
-
-;; =============================================================================
-;; State (Continuous Flow) Tests
-;; =============================================================================
-
-(deftest state-test
-  (testing "state provides initial value"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow]} (mt/state sched {:initial :init})
-          proc (mt/spawn-flow! sched flow)]
-      (mt/tick! sched)
-      (is (mt/ready? proc))
-      (is (= :init (mt/transfer! proc)))))
-
-  (testing "state updates on set"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow set]} (mt/state sched {:initial :v1})
-          proc (mt/spawn-flow! sched flow)]
-      (mt/tick! sched)
-
-      ;; Get initial
-      (is (= :v1 (mt/transfer! proc)))
-
-      ;; Set new value
-      (set :v2)
-      (mt/tick! sched)
-      (is (mt/ready? proc))
-      (is (= :v2 (mt/transfer! proc)))))
-
-  (testing "state close terminates flow"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow close]} (mt/state sched {:initial :init})
-          proc (mt/spawn-flow! sched flow)]
-      (mt/tick! sched)
-      (mt/transfer! proc)
-
-      (close)
-      (mt/tick! sched)
-      (is (mt/terminated? proc))))
-
-  ;; Note: state fail sets :closed? which prevents signal-ready! from firing.
-  ;; Use subject for flows that need fail propagation.
-  ;; The state flow is designed for continuous values where close is the normal termination.
-  )
-
-;; =============================================================================
-;; Flow Process Tests
-;; =============================================================================
-
-(deftest flow-process-test
-  (testing "transfer throws when not ready"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow]} (mt/subject sched)
-          proc (mt/spawn-flow! sched flow)]
-      (mt/tick! sched)
-      (is (not (mt/ready? proc)))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not ready"
-                            (mt/transfer! proc)))))
-
-  (testing "cancel! cancels flow process"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow]} (mt/subject sched)
-          proc (mt/spawn-flow! sched flow)]
-      (mt/tick! sched)
-      (mt/cancel! proc)
-      ;; After cancel, ready should signal with Cancelled error
-      (mt/tick! sched)
-      (is (mt/ready? proc))
-      (is (thrown? Cancelled (mt/transfer! proc))))))
 
 ;; =============================================================================
 ;; with-determinism Macro Tests
@@ -442,48 +284,20 @@
 
 (deftest collect-test
   (testing "collect gathers flow values into vector"
-    (is (= [:a :b :c]
+    (is (= [1 2 3]
            (mt/with-determinism
              (let [sched (mt/make-scheduler)]
-               (let [{:keys [flow emit close]} (mt/subject sched)]
-                 (mt/run sched
-                         (m/sp
-                          (m/? (m/join (fn [_ v] v)
-                                       (m/sp
-                                        (m/? (emit :a))
-                                        (m/? (emit :b))
-                                        (m/? (emit :c))
-                                        (m/? (close)))
-                                       (mt/collect flow)))))))))))
+               (mt/run sched
+                       (m/sp
+                        (m/? (mt/collect (m/seed [1 2 3]))))))))))
 
   (testing "collect with transducer"
     (is (= [2 4 6]
            (mt/with-determinism
              (let [sched (mt/make-scheduler)]
-               (let [{:keys [flow emit close]} (mt/subject sched)]
-                 (mt/run sched
-                         (m/sp
-                          (m/? (m/join (fn [_ v] v)
-                                       (m/sp
-                                        (m/? (emit 1))
-                                        (m/? (emit 2))
-                                        (m/? (emit 3))
-                                        (m/? (close)))
-                                       (mt/collect flow {:xf (map #(* 2 %))})))))))))))
-
-  (testing "collect with timeout"
-    (is (= ::mt/timeout
-           (mt/with-determinism
-             (let [sched (mt/make-scheduler)]
-               (let [{:keys [flow emit]} (mt/subject sched)]
-                 ;; Emit one value but never close - should timeout
-                 (mt/run sched
-                         (m/sp
-                          (m/? (m/join (fn [_ v] v)
-                                       (m/sp
-                                        (m/? (emit :a))
-                                        (m/? (m/sleep 2000))) ; wait longer than timeout
-                                       (mt/collect flow {:timeout-ms 100}))))))))))))
+               (mt/run sched
+                       (m/sp
+                        (m/? (mt/collect (m/seed [1 2 3]) {:xf (map #(* 2 %))}))))))))))
 
 ;; =============================================================================
 ;; Trace Tests
@@ -624,16 +438,7 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
                             (mt/result job)))))
 
-  (testing "transfer after termination throws"
-    (let [sched (mt/make-scheduler)
-          {:keys [flow close]} (mt/subject sched)
-          proc (mt/spawn-flow! sched flow)]
-      (mt/tick! sched)
-      (mt/start! sched (close) {})
-      (mt/tick! sched)
-      (is (mt/terminated? proc))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"terminated"
-                            (mt/transfer! proc))))))
+)
 
 (deftest no-scheduler-test
   (testing "sleep throws without scheduler"
@@ -658,52 +463,19 @@
 ;; Note: m/amb requires forking which is not supported in sequential tasks.
 ;; Use m/race instead for choosing between alternatives.
 
-(deftest integration-complex-flow-test
-  (testing "complex flow with multiple subjects using amb= (interleaved)"
-    ;; amb= interleaves flows, so values come in round-robin order
-    (is (= [1 10 2 20 3 30]
+(deftest integration-amb-test
+  (testing "amb= interleaves discrete flows"
+    ;; Using m/seed to create discrete flows
+    (is (= [:x :a :y :b :z :c]
            (mt/with-determinism
              (let [sched (mt/make-scheduler)]
-               (let [subj1 (mt/subject sched)
-                     subj2 (mt/subject sched)]
-                 (mt/run sched
-                         (m/sp
-                          (m/? (m/join (fn [_ _ v] v)
-                                       ;; Producer 1
-                                       (m/sp
-                                        (m/? ((:emit subj1) 1))
-                                        (m/? ((:emit subj1) 2))
-                                        (m/? ((:emit subj1) 3))
-                                        (m/? ((:close subj1))))
-                                       ;; Producer 2
-                                       (m/sp
-                                        (m/? ((:emit subj2) 10))
-                                        (m/? ((:emit subj2) 20))
-                                        (m/? ((:emit subj2) 30))
-                                        (m/? ((:close subj2))))
-                                       ;; Collect both - amb= interleaves
-                                       (mt/collect
-                                        (m/ap
-                                         (m/?> (m/amb=
-                                                (:flow subj1)
-                                                (:flow subj2))))))))))))))))
-
-(deftest integration-sequential-flows-test
-  (testing "collecting flows sequentially with cat"
-    ;; Using m/? on each flow separately collects them in order
-    (is (= [:a :b :c]
-           (mt/with-determinism
-             (let [sched (mt/make-scheduler)]
-               (let [{:keys [flow emit close]} (mt/subject sched)]
-                 (mt/run sched
-                         (m/sp
-                          (m/? (m/join (fn [_ v] v)
-                                       (m/sp
-                                        (m/? (emit :a))
-                                        (m/? (emit :b))
-                                        (m/? (emit :c))
-                                        (m/? (close)))
-                                       (mt/collect flow))))))))))))
+               (mt/run sched
+                       (m/sp
+                        (m/? (mt/collect
+                              (m/ap
+                               (m/?> (m/amb=
+                                      (m/seed [:a :b :c])
+                                      (m/seed [:x :y :z]))))))))))))))
 
 ;; =============================================================================
 ;; Interleaving Tests
@@ -838,43 +610,6 @@
                                                     (m/sleep 0 :c)))))))))))
 
 (deftest by-label-selection-test
-  (testing "[:by-label label] selects task with matching label"
-    ;; Use subjects with different labels to create distinctly labeled microtasks
-    (let [sched (mt/make-scheduler {:trace? true})
-          subj-a (mt/subject sched {:label "producer-a"})
-          subj-b (mt/subject sched {:label "producer-b"})
-          results (atom [])]
-
-      ;; Start consumers for both subjects
-      (mt/start! sched
-                 (m/sp
-                  (m/? (m/join vector
-                               ;; Consumer A
-                               (m/sp
-                                (swap! results conj [:a (m/? (m/reduce conj [] (:flow subj-a)))]))
-                               ;; Consumer B
-                               (m/sp
-                                (swap! results conj [:b (m/? (m/reduce conj [] (:flow subj-b)))])))))
-                 {:label "consumers"})
-
-      ;; Tick to let consumers subscribe
-      (mt/tick! sched)
-
-      ;; Emit to both subjects - this creates labeled microtasks
-      (mt/start! sched ((:emit subj-a) :val-a) {:label "emit-a"})
-      (mt/start! sched ((:emit subj-b) :val-b) {:label "emit-b"})
-
-      ;; Tick to process emits
-      (mt/tick! sched)
-
-      ;; Check that trace contains microtasks with different labels
-      (let [trace (mt/trace sched)
-            emit-events (filter #(= :subject/emit (:kind %)) trace)]
-        (is (some #(= "producer-a" (:label %)) emit-events)
-            "Should have microtask with label producer-a")
-        (is (some #(= "producer-b" (:label %)) emit-events)
-            "Should have microtask with label producer-b"))))
-
   (testing "[:by-label label] falls back to first when label not found"
     (mt/with-determinism
       (let [sched (mt/make-scheduler {:micro-schedule [[:by-label "nonexistent"]]

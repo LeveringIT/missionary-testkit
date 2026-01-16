@@ -116,7 +116,7 @@ Add to your `deps.edn`:
 
 **Why this matters:** The `with-determinism` macro rebinds `m/sleep`, `m/timeout`, and the executors (`m/cpu`, `m/blk`) to their virtual-time equivalents. If you create a task *before* entering the macro, those tasks capture the *real* versions of these primitives, and your tests will use real time instead of virtual time—defeating the purpose of the testkit.
 
-The same applies to flows created with `mt/subject` and `mt/state`—they must be created inside `with-determinism` to be properly scheduled.
+All flows, tasks, and atoms that you test must be created and modified inside `with-determinism` to ensure proper scheduling.
 
 ### Checking Deterministic Mode
 
@@ -212,88 +212,39 @@ This allows you to write time-aware code that works in both contexts:
 
 ## Testing Flows
 
-### Subject (Discrete Flow)
-
-A controlled source for discrete values - like an event stream:
+Flows work deterministically when atom modifications happen inside the controlled task. The testkit provides `mt/collect` to gather flow values:
 
 ```clojure
+;; Testing with m/watch - modify atoms inside the controlled task
 (mt/with-determinism
-  (let [sched (mt/make-scheduler)]
-    (let [{:keys [flow emit close]} (mt/subject sched)]
-      (mt/run sched
-        (m/sp
-          (m/? (m/join (fn [_ collected] collected)
-                 ;; Producer
-                 (m/sp
-                   (m/? (emit :a))
-                   (m/? (emit :b))
-                   (m/? (emit :c))
-                   (m/? (close)))
-                 ;; Consumer
-                 (mt/collect flow))))))))
-;; => [:a :b :c]
-```
-
-Subject API:
-- `(:flow subj)` - the flow to consume
-- `(:emit subj)` - `(fn [v] task)` - emit a value, completes when transferred
-- `(:offer subj)` - `(fn [v] bool)` - best-effort emit, returns false if backpressured
-- `(:close subj)` - `(fn [] task)` - close normally
-- `(:fail subj)` - `(fn [ex] task)` - fail with exception
-
-### State (Continuous Flow)
-
-A controlled source for continuous values - like a watched atom:
-
-```clojure
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)]
-    (let [{:keys [flow set close]} (mt/state sched {:initial 0})]
-      (mt/run sched
-        (m/sp
-          (m/? (m/join (fn [_ collected] collected)
-                 ;; Producer
-                 (m/sp
-                   (m/? (m/sleep 100))
-                   (set 1)
-                   (m/? (m/sleep 100))
-                   (set 2)
-                   (m/? (m/sleep 100))
-                   (close))
-                 ;; Consumer - take first 3 values
-                 (mt/collect flow {:xf (take 3)}))))))))
+  (let [sched (mt/make-scheduler)
+        !counter (atom 0)]
+    (mt/run sched
+      (m/sp
+        (m/? (m/race
+               ;; Consumer collects first 3 values
+               (m/reduce (fn [acc v]
+                           (let [acc (conj acc v)]
+                             (if (= 3 (count acc))
+                               (reduced acc)
+                               acc)))
+                         [] (m/watch !counter))
+               ;; Producer - mutations happen at controlled yield points
+               (m/sp
+                 (m/? (m/sleep 100))
+                 (swap! !counter inc)  ; signal propagates synchronously
+                 (m/? (m/sleep 100))
+                 (swap! !counter inc)
+                 (m/? (m/sleep 100)))))))))
 ;; => [0 1 2]
-```
 
-State API:
-- `(:flow st)` - the continuous flow
-- `(:set st)` - `(fn [v] nil)` - update the value
-- `(:close st)` - `(fn [] nil)` - terminate the flow
-
-### Manual Flow Control
-
-For fine-grained testing of flow behavior:
-
-```clojure
-(let [sched (mt/make-scheduler)
-      {:keys [flow emit]} (mt/subject sched)
-      proc (mt/spawn-flow! sched flow)]
-
-  ;; Flow starts not ready
-  (mt/tick! sched)
-  (mt/ready? proc)      ; => false
-
-  ;; Emit makes it ready
-  (mt/start! sched (emit :value) {})
-  (mt/tick! sched)
-  (mt/ready? proc)      ; => true
-
-  ;; Transfer the value
-  (mt/transfer! proc)   ; => :value
-
-  ;; Check termination
-  (mt/terminated? proc) ; => false
-  (mt/cancel! proc))    ; cancel the flow
+;; Testing discrete flows with m/seed
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)]
+    (mt/run sched
+      (m/sp
+        (m/? (mt/collect (m/seed [1 2 3])))))))
+;; => [1 2 3]
 ```
 
 ## Debugging with Traces
@@ -487,14 +438,6 @@ The scheduler automatically detects common problems:
 - `(result job)` - get result or throw error
 - `(cancel! job)` - cancel the job
 
-### Flow Testing
-- `(subject sched)` / `(subject sched opts)` - create discrete flow source
-- `(state sched)` / `(state sched opts)` - create continuous flow source
-- `(spawn-flow! sched flow)` - spawn flow for manual testing
-- `(ready? proc)` - is flow ready for transfer?
-- `(terminated? proc)` - has flow terminated?
-- `(transfer! proc)` - transfer one value
-
 ### Virtual Time Primitives
 - `(mt/sleep ms)` / `(mt/sleep ms x)` - virtual sleep task
 - `(mt/timeout task ms)` / `(mt/timeout task ms x)` - virtual timeout wrapper
@@ -542,7 +485,6 @@ The testkit provides deterministic execution guarantees under specific condition
 | `m/race`, `m/join`, `m/amb`, `m/amb=` | ✓ | Under single-threaded scheduler driving |
 | `m/seed`, `m/sample` | ✓ | Under single-threaded scheduler driving |
 | `m/relieve`, `m/sem`, `m/rdv`, `m/mbx`, `m/dfv` | ✓ | Under single-threaded scheduler driving |
-| `mt/subject`, `mt/state` | ✓ | Deterministic flow sources |
 | `m/via` with `m/cpu` or `m/blk` | ✓ | JVM only; executors rebound to scheduler microtasks |
 | `m/signal`, `m/watch`, `m/latest`, `m/stream` | ✓ | When atom changes happen inside the controlled task (see below) |
 
@@ -633,110 +575,32 @@ The testkit virtualizes **time-based primitives** only:
 - **External `m/observe` callbacks** - Events from external sources (DOM, network) are not controlled
 - **External `m/watch` modifications** - Atom changes from threads outside the task are not controlled
 
-**Solutions:**
-- For external events, use `mt/subject` (discrete) or `mt/state` (continuous)
-- For reactive signals, keep atom mutations inside the controlled task (see [Why `m/signal` and `m/watch` Work](#why-msignal-and-mwatch-work))
+**Solution:** Keep atom mutations inside the controlled task. See [Why `m/signal` and `m/watch` Work](#why-msignal-and-mwatch-work).
 
 ```clojure
-;; Instead of m/observe with real callbacks, use mt/subject
+;; Modify atoms inside the controlled task for deterministic behavior
 (mt/with-determinism
-  (let [sched (mt/make-scheduler)]
-    (let [{:keys [flow emit close]} (mt/subject sched)]
-      (mt/run sched
-        (m/sp
-          (m/? (m/join (fn [_ v] v)
-                 ;; Producer - simulates external events
-                 (m/sp
-                   (m/? (emit :click))
-                   (m/? (emit :scroll))
-                   (m/? (close)))
-                 ;; Consumer
-                 (mt/collect flow))))))))
-;; => [:click :scroll]
-
-;; Instead of m/watch on a real atom, use mt/state
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)]
-    (let [{:keys [flow set close]} (mt/state sched {:initial 0})]
-      (mt/run sched
-        (m/sp
-          (m/? (m/join (fn [_ v] v)
-                 ;; Producer - simulates atom changes
-                 (m/sp
-                   (m/? (m/sleep 10))
-                   (set 1)
-                   (m/? (m/sleep 10))
-                   (set 2)
-                   (m/? (m/sleep 10))
-                   (close))
-                 ;; Consumer - samples the continuous flow
-                 (mt/collect flow))))))))
+  (let [sched (mt/make-scheduler)
+        !counter (atom 0)]
+    (mt/run sched
+      (m/sp
+        (m/? (m/race
+               ;; Consumer
+               (m/reduce (fn [acc v]
+                           (let [acc (conj acc v)]
+                             (if (= 3 (count acc))
+                               (reduced acc)
+                               acc)))
+                         [] (m/watch !counter))
+               ;; Producer - mutations at controlled yield points
+               (m/sp
+                 (m/? (m/sleep 10))
+                 (swap! !counter inc)  ; signal propagates synchronously
+                 (m/? (m/sleep 10))
+                 (swap! !counter inc)
+                 (m/? (m/sleep 10)))))))))
 ;; => [0 1 2]
 ```
-
-#### Why use `mt/subject` and `mt/state` instead of `m/observe` and `m/watch`?
-
-You can use Missionary's built-in `m/observe` and `m/watch` if you control all emissions/modifications from within the scheduled code. However, the testkit versions provide two key advantages:
-
-**1. Full traceability** - All events appear in `(mt/trace sched)`:
-
-```clojure
-;; m/observe / m/watch: events are invisible to the scheduler
-{:total-events 2, :subject-events []}
-
-;; mt/subject / mt/state: events appear in trace with timestamps
-{:total-events 18,
- :subject-events [{:kind :subject/notifier, :now-ms 0}
-                  {:kind :subject/emit-success, :now-ms 0}
-                  {:kind :subject/terminator, :now-ms 0}
-                  ...]}
-```
-
-**2. Thread safety catches off-thread access**:
-
-```clojure
-;; m/observe: off-thread emit is NOT caught
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)]
-    (let [emit-fn (atom nil)
-          flow (m/observe (fn [emit!] (reset! emit-fn emit!) #()))]
-      ;; Start consuming the flow so emit-fn gets set
-      (mt/start! sched (m/reduce (fn [_ x] x) nil flow) {})
-      (mt/tick! sched)
-      @(future (@emit-fn :value))   ; off-thread - NOT caught!
-      :no-error)))
-;; => :no-error (silently non-deterministic!)
-
-;; mt/subject: off-thread emit IS caught
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)]
-    (let [{:keys [emit]} (mt/subject sched)]
-      (mt/step! sched)
-      @(future ((emit :value) identity identity)))))  ; off-thread - CAUGHT!
-;; => throws "Scheduler driven from multiple threads (enqueue-microtask!)"
-```
-
-The same applies to `m/watch` vs `mt/state`:
-
-```clojure
-;; m/watch: off-thread reset! is NOT caught
-@(future (reset! my-atom 42))
-;; => :no-error (silently non-deterministic!)
-
-;; mt/state: off-thread set IS caught
-@(future (set 42))
-;; => throws "Scheduler driven from multiple threads (state set)"
-```
-
-**Summary:**
-
-| Aspect | `m/observe` / `m/watch` | `mt/subject` / `mt/state` |
-|--------|------------------------|---------------------------|
-| Events in trace | No | Yes |
-| Thread safety catches off-thread | No | Yes |
-| Works for simple tests | Yes | Yes |
-
-**Use testkit versions** when you want full traceability or thread safety protection. **Use Missionary built-ins** for simple tests where you control all modifications from within scheduled code.
 
 ### Cancellation Semantics
 
@@ -884,13 +748,7 @@ Missionary uses cooperative single-threaded execution by default. Tasks interlea
 
 ### Thread safety (JVM only)
 
-The scheduler enforces single-threaded access to catch accidental non-determinism from off-thread callbacks:
-
-```clojure
-;; This throws because it's called from wrong thread
-(future ((:emit subject) :value))
-;; => "Scheduler driven from multiple threads (enqueue-microtask!)"
-```
+The scheduler enforces single-threaded access to catch accidental non-determinism from off-thread callbacks. Off-thread operations will throw errors like "Scheduler driven from multiple threads".
 
 This protection is automatic on JVM. ClojureScript is single-threaded so no enforcement is needed.
 

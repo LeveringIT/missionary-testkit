@@ -1,178 +1,142 @@
 (ns examples.testable-flow
-  "Demonstrates how to design flows for testability with missionary-testkit.
+  "Demonstrates how to test flows deterministically with missionary-testkit.
 
-  The key pattern: accept flows as parameters rather than creating them internally.
-  This allows injecting mt/state in tests instead of m/watch on real atoms."
+  Key insight: m/watch and m/signal work deterministically when atom mutations
+  happen inside the controlled task, not from external threads."
   (:require [missionary.core :as m]
             [de.levering-it.missionary-testkit :as mt]))
 
 ;; =============================================================================
-;; THE PROBLEM: Hard-to-test code
+;; Testing with m/watch - Internal Mutations are Deterministic
 ;; =============================================================================
 
-;; This component creates the watch internally - difficult to test deterministically
-(defn counter-display-bad [counter-atom]
-  (m/ap
-    (let [n (m/?< (m/watch counter-atom))]  ; watch is created inside
-      (str "Count: " n))))
-
-;; To test this, you'd need real atoms and real timing:
-;; (def a (atom 0))
-;; (future (Thread/sleep 100) (reset! a 1))  ; non-deterministic!
-
-;; =============================================================================
-;; SOLUTION 1: Accept the flow as a parameter
-;; =============================================================================
+;; When you modify atoms from within the scheduled task, signal propagation
+;; is synchronous and deterministic.
 
 (defn counter-display
-  "Displays counter value. Accepts any continuous flow."
+  "Displays counter value from a continuous flow."
   [counter-flow]
   (m/ap
     (let [n (m/?< counter-flow)]
       (str "Count: " n))))
 
-;; Production usage:
-(comment
-  (def app-state (atom 0))
-  (counter-display (m/watch app-state)))
-
-;; Test usage - fully deterministic:
+;; Test usage - modify atom inside the controlled task:
 (comment
   (mt/with-determinism
     (let [sched (mt/make-scheduler)
-          {:keys [flow set close]} (mt/state sched {:initial 0})]
+          !counter (atom 0)]
       (mt/run sched
         (m/sp
-          (m/? (m/join (fn [_ v] v)
-                 ;; Simulate state changes at controlled times
+          (m/? (m/race
+                 ;; Consumer collects 3 values then stops
+                 (m/reduce (fn [acc v]
+                             (let [acc (conj acc v)]
+                               (if (= 3 (count acc))
+                                 (reduced acc)
+                                 acc)))
+                           [] (counter-display (m/watch !counter)))
+                 ;; Producer - mutations happen at controlled yield points
                  (m/sp
                    (m/? (m/sleep 100))
-                   (set 1)
+                   (swap! !counter inc)  ; signal propagates synchronously
                    (m/? (m/sleep 100))
-                   (set 2)
-                   (m/? (m/sleep 100))
-                   (close))
-                 ;; Test the component
-                 (mt/collect (counter-display flow)))))))))
+                   (swap! !counter inc)
+                   (m/? (m/sleep 100))))))))))
   ;; => ["Count: 0" "Count: 1" "Count: 2"]
 
 ;; =============================================================================
-;; SOLUTION 2: Accept a state source map
+;; Testing with m/signal - DAG propagation is synchronous
 ;; =============================================================================
 
-;; mt/state returns {:flow ... :set ... :close ... :fail ...}
-;; Design components to accept this shape directly
+(defn doubled-counter
+  "Creates a signal that doubles the input signal."
+  [input-signal]
+  (m/signal (m/latest #(* 2 %) input-signal)))
 
-(defn stateful-counter
-  "A counter component that can increment its own state.
-  Accepts a state source with :flow and :set keys."
-  [{:keys [flow set]}]
-  (m/ap
-    (let [n (m/?< flow)]
-      ;; Component can both read and write state
-      {:value n
-       :increment! (fn [] (set (inc n)))})))
-
-;; Production: wrap an atom to match the interface
-(comment
-  (defn atom->state-source [a]
-    {:flow (m/watch a)
-     :set (fn [v] (reset! a v))})
-
-  (def app-state (atom 0))
-  (stateful-counter (atom->state-source app-state)))
-
-;; Test: mt/state already returns the right shape!
 (comment
   (mt/with-determinism
     (let [sched (mt/make-scheduler)
-          state (mt/state sched {:initial 0})]
+          !input (atom 1)]
       (mt/run sched
         (m/sp
-          (m/? (m/join (fn [_ v] v)
-                 (m/sp
-                   (m/? (m/sleep 100))
-                   ((:set state) 42)
-                   (m/? (m/sleep 100))
-                   ((:close state)))
-                 (mt/collect (m/eduction (map :value) (stateful-counter state))))))))))
-  ;; => [0 42]
+          (let [<x (m/signal (m/watch !input))
+                <doubled (doubled-counter <x)
+                results (atom [])]
+            (m/? (m/race
+                   ;; Consumer
+                   (m/reduce (fn [_ v]
+                               (swap! results conj v)
+                               (when (= 3 (count @results))
+                                 (reduced @results)))
+                             nil <doubled)
+                   ;; Producer
+                   (m/sp
+                     (m/? (m/sleep 100))
+                     (swap! !input inc)
+                     (m/? (m/sleep 100))
+                     (swap! !input inc)
+                     (m/? (m/sleep 100)))))))))))
+  ;; => [2 4 6]
 
 ;; =============================================================================
-;; SOLUTION 3: Event streams with mt/subject
+;; Testing discrete flows with m/seed
 ;; =============================================================================
 
-;; Same pattern applies to discrete flows (m/observe -> mt/subject)
-
-(defn event-logger
-  "Logs events from a discrete flow."
+(defn event-processor
+  "Processes events from a discrete flow."
   [event-flow]
   (m/ap
     (let [event (m/?> event-flow)]
-      (println "Event:" event)
-      event)))
+      {:processed true :event event})))
 
-;; Production usage:
-(comment
-  (defn dom-clicks [element]
-    (m/observe (fn [emit!]
-                 (.addEventListener element "click" emit!)
-                 #(.removeEventListener element "click" emit!))))
-
-  (event-logger (dom-clicks my-button)))
-
-;; Test usage:
 (comment
   (mt/with-determinism
-    (let [sched (mt/make-scheduler)
-          {:keys [flow emit close]} (mt/subject sched)]
+    (let [sched (mt/make-scheduler)]
       (mt/run sched
         (m/sp
-          (m/? (m/join (fn [_ v] v)
-                 ;; Simulate click events
-                 (m/sp
-                   (m/? (emit {:type :click :x 100 :y 200}))
-                   (m/? (emit {:type :click :x 150 :y 250}))
-                   (m/? (close)))
-                 ;; Test the logger
-                 (mt/collect (event-logger flow)))))))))
-  ;; => [{:type :click :x 100 :y 200} {:type :click :x 150 :y 250}]
+          (m/? (mt/collect
+                 (event-processor
+                   (m/seed [:click :scroll :keypress])))))))))
+  ;; => [{:processed true :event :click}
+  ;;     {:processed true :event :scroll}
+  ;;     {:processed true :event :keypress}]
 
 ;; =============================================================================
 ;; RUNNING THE EXAMPLES
 ;; =============================================================================
 
 (defn run-examples []
-  (println "=== Example 1: counter-display with mt/state ===")
+  (println "=== Example 1: counter-display with m/watch ===")
   (let [result (mt/with-determinism
                  (let [sched (mt/make-scheduler)
-                       {:keys [flow set close]} (mt/state sched {:initial 0})]
+                       !counter (atom 0)]
                    (mt/run sched
                      (m/sp
-                       (m/? (m/join (fn [_ v] v)
+                       (m/? (m/race
+                              ;; Consumer collects 3 values
+                              (m/reduce (fn [acc v]
+                                          (let [acc (conj acc v)]
+                                            (if (= 3 (count acc))
+                                              (reduced acc)
+                                              acc)))
+                                        [] (counter-display (m/watch !counter)))
+                              ;; Producer
                               (m/sp
                                 (m/? (m/sleep 100))
-                                (set 1)
+                                (swap! !counter inc)
                                 (m/? (m/sleep 100))
-                                (set 2)
-                                (m/? (m/sleep 100))
-                                (close))
-                              (mt/collect (counter-display flow))))))))]
+                                (swap! !counter inc)
+                                (m/? (m/sleep 100)))))))))]
     (println "Result:" result))
 
-  (println "\n=== Example 2: event-logger with mt/subject ===")
+  (println "\n=== Example 2: event-processor with m/seed ===")
   (let [result (mt/with-determinism
-                 (let [sched (mt/make-scheduler)
-                       {:keys [flow emit close]} (mt/subject sched)]
+                 (let [sched (mt/make-scheduler)]
                    (mt/run sched
                      (m/sp
-                       (m/? (m/join (fn [_ v] v)
-                              (m/sp
-                                (m/? (emit :click))
-                                (m/? (emit :scroll))
-                                (m/? (emit :keypress))
-                                (m/? (close)))
-                              (mt/collect (event-logger flow))))))))]
+                       (m/? (mt/collect
+                              (event-processor
+                                (m/seed [:click :scroll :keypress]))))))))]
     (println "Result:" result)))
 
 (comment
