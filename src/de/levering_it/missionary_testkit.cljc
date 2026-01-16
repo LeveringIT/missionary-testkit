@@ -320,9 +320,10 @@
               (let [now (:now-ms s)
                     at-ms (+ now (long delay-ms))
                     order id
-                    ;; Timer tie-breaking: FIFO if no seed, seeded shuffle if seed provided
-                    tie (if-let [seed (:seed sched)]
-                          (seeded-tie seed order)
+                    ;; Timer tie-breaking: seeded only when doing random exploration
+                    ;; (seed provided but no explicit micro-schedule), otherwise FIFO
+                    tie (if (and (:seed sched) (not (:micro-schedule sched)))
+                          (seeded-tie (:seed sched) order)
                           order)
                     k [at-ms tie order id]
                     t {:id id
