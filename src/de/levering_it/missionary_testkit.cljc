@@ -827,9 +827,8 @@
            :label "yield"})
          (fn cancel []
            (when (compare-and-set! done? false true)
-             (enqueue-microtask! sched (fn [] (f (cancelled-ex)))
-                                 {:kind :yield/cancel
-                                  :label "yield-cancel"}))
+             ;; fail synchronously, matching Missionary semantics
+             (f (cancelled-ex)))
            nil))
        ;; Production mode: complete immediately
        (do
@@ -861,10 +860,8 @@
          []
          (when (compare-and-set! done? false true)
            (cancel-timer! sched tok)
-           ;; fail via microtask (deterministic, prompt)
-           (enqueue-microtask! sched (fn [] (f (cancelled-ex)))
-                               {:kind :sleep/cancel
-                                :label "sleep-cancel"}))
+           ;; fail synchronously, matching Missionary semantics
+           (f (cancelled-ex)))
          nil)))))
 
 (defn timeout
@@ -931,9 +928,8 @@
            (cancel-timer! sched @timer-token)
            (when-let [c @cancel-child]
              (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
-           (enqueue-microtask! sched (fn [] (f (cancelled-ex)))
-                               {:kind :timeout/cancel
-                                :label "timeout-cancel"}))
+           ;; fail synchronously, matching Missionary semantics
+           (f (cancelled-ex)))
          nil)))))
 
 ;; -----------------------------------------------------------------------------

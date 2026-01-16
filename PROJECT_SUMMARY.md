@@ -18,7 +18,7 @@ API:
   run=(run start!) ; job=(done? result cancel!)
   vt=(sleep timeout yield) ; integ=(with-determinism collect executor cpu-executor blk-executor)
   interleave=(trace->schedule replay-schedule replay check-interleaving explore-interleavings)
-I: inv={determinism∀f, iface-consistency, time↑only, random@same-time(seeded) unless explicit-schedule, timers→sorted, completion→micro-q, schedule→select if >1}
+I: inv={determinism∀f, iface-consistency, time↑only, random@same-time(seeded) unless explicit-schedule, timers→sorted, completion→micro-q, schedule→select if >1, cancel→sync(match-missionary)}
 DC: det-yes={sleep,timeout,yield,race,join,amb,amb=,seed,sample,relieve,sem,rdv,mbx,dfv,via(cpu|blk),watch(int),signal(int),stream(int),latest,observe(int)} ; det-no={publisher,via(custom),real-IO,observe(ext),watch(ext)}
 EX: coord={mbx,dfv,rdv,sem} ; flows={diamond-dag,glitch-free,nested-diamond,sampling} ; observe={event-emitter,controlled-callbacks} ; manual={run-inspect-edit-replay,manual-stepping,custom-schedule}
 TS: strict⇒drive-only-one-thread ; off-thread-cb⇒fail(::off-scheduler-callback) ; atom⇒safe-reads ; with-determinism⇒global-lock(parallel-safe)
@@ -30,4 +30,4 @@ CMD: repl=clojure -M:nrepl ; build=clojure -T:build ci ; deploy=clojure -T:build
 SAFE: read-only={now-ms pending trace clock done?}
 MUT: advances={step! tick! advance! advance-to! run start! cancel!}
 FS: src=src/de/levering_it/missionary_testkit.cljc ; test=test/de/levering_it/missionary_testkit_test.clj ; build=build.clj ; ex=examples/*.clj
-R: Δ1=schedule-format:bare-ids ; Δ2=+next-tasks ; Δ3=step!:2-arity(task-id) ; Δ4=+manual_schedule.clj ; Δ5=refactor:select-and-remove-task
+R: Δ1=schedule-format:bare-ids ; Δ2=+next-tasks ; Δ3=step!:2-arity(task-id) ; Δ4=+manual_schedule.clj ; Δ5=refactor:select-and-remove-task ; Δ6=cancel→sync(sleep,yield,timeout)

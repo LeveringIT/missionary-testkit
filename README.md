@@ -908,7 +908,7 @@ The testkit's cancellation semantics match real Missionary:
 | `finally` blocks run | ✓ | ✓ |
 | Nested cancellation propagates | ✓ | ✓ |
 
-**One subtle difference:** The testkit delivers `Cancelled` via microtask for deterministic ordering. Real Missionary may deliver it synchronously. This ensures reproducible execution order in tests but means the testkit always processes cancellation in a specific order relative to other pending work.
+The testkit delivers `Cancelled` synchronously, matching Missionary's semantics exactly.
 
 #### Testing cancellation scenarios
 
