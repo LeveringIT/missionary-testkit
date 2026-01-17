@@ -48,21 +48,23 @@
         (is (some? (:id ev))))))
 
   (testing "returns timer info when only timer pending"
-    (let [sched (mt/make-scheduler)]
-      (mt/start! sched (mt/sleep 100 :done) {:label "test-sleep"})
-      (let [ev (mt/next-event sched)]
-        (is (= :timer (:type ev)))
-        (is (= :sleep (:kind ev)))
-        (is (= 100 (:at-ms ev))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        (mt/start! sched (mt/sleep 100 :done) {:label "test-sleep"})
+        (let [ev (mt/next-event sched)]
+          (is (= :timer (:type ev)))
+          (is (= :sleep (:kind ev)))
+          (is (= 100 (:at-ms ev)))))))
 
   (testing "prefers microtask over timer"
-    (let [sched (mt/make-scheduler)]
-      ;; Start a sleep then add a yield - both pending
-      (mt/start! sched (mt/sleep 100 :done) {})
-      (mt/start! sched (mt/yield :immediate) {})
-      ;; Should show microtask (yield), not timer
-      (let [ev (mt/next-event sched)]
-        (is (= :microtask (:type ev)))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        ;; Start a sleep then add a yield - both pending
+        (mt/start! sched (mt/sleep 100 :done) {})
+        (mt/start! sched (mt/yield :immediate) {})
+        ;; Should show microtask (yield), not timer
+        (let [ev (mt/next-event sched)]
+          (is (= :microtask (:type ev))))))))
 
 (deftest advance-test
   (testing "advance-to! moves time forward"
@@ -91,28 +93,31 @@
 
 (deftest sleep-test
   (testing "sleep completes after virtual time advances"
-    (let [sched (mt/make-scheduler)]
-      (let [job (mt/start! sched (mt/sleep 100 :done) {:label "sleep-test"})]
-        (is (not (mt/done? job)))
-        (is (= 1 (count (:timers (mt/pending sched)))))
-        (mt/advance-to! sched 100)
-        (is (mt/done? job))
-        (is (= :done (mt/result job))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched (mt/sleep 100 :done) {:label "sleep-test"})]
+          (is (not (mt/done? job)))
+          (is (= 1 (count (:timers (mt/pending sched)))))
+          (mt/advance-to! sched 100)
+          (is (mt/done? job))
+          (is (= :done (mt/result job)))))))
 
   (testing "sleep with nil result"
-    (let [sched (mt/make-scheduler)]
-      (let [job (mt/start! sched (mt/sleep 50) {})]
-        (mt/advance-to! sched 50)
-        (is (mt/done? job))
-        (is (nil? (mt/result job))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched (mt/sleep 50) {})]
+          (mt/advance-to! sched 50)
+          (is (mt/done? job))
+          (is (nil? (mt/result job)))))))
 
   (testing "cancelled sleep throws Cancelled"
-    (let [sched (mt/make-scheduler)]
-      (let [job (mt/start! sched (mt/sleep 100 :done) {:label "cancel-test"})]
-        (mt/cancel! job)
-        (mt/tick! sched)
-        (is (mt/done? job))
-        (is (thrown? Cancelled (mt/result job)))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched (mt/sleep 100 :done) {:label "cancel-test"})]
+          (mt/cancel! job)
+          (mt/tick! sched)
+          (is (mt/done? job))
+          (is (thrown? Cancelled (mt/result job))))))))
 
 ;; =============================================================================
 ;; Timeout Tests
@@ -120,39 +125,43 @@
 
 (deftest timeout-test
   (testing "timeout passes through when inner task completes first"
-    (let [sched (mt/make-scheduler)]
-      (let [job (mt/start! sched
-                           (mt/timeout (mt/sleep 50 :inner) 100 :timed-out)
-                           {:label "timeout-pass"})]
-        (mt/advance-to! sched 50)
-        (is (mt/done? job))
-        (is (= :inner (mt/result job))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched
+                             (mt/timeout (mt/sleep 50 :inner) 100 :timed-out)
+                             {:label "timeout-pass"})]
+          (mt/advance-to! sched 50)
+          (is (mt/done? job))
+          (is (= :inner (mt/result job)))))))
 
   (testing "timeout fires when inner task takes too long"
-    (let [sched (mt/make-scheduler)]
-      (let [job (mt/start! sched
-                           (mt/timeout (mt/sleep 200 :inner) 100 :timed-out)
-                           {:label "timeout-fire"})]
-        (mt/advance-to! sched 100)
-        (is (mt/done? job))
-        (is (= :timed-out (mt/result job))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched
+                             (mt/timeout (mt/sleep 200 :inner) 100 :timed-out)
+                             {:label "timeout-fire"})]
+          (mt/advance-to! sched 100)
+          (is (mt/done? job))
+          (is (= :timed-out (mt/result job)))))))
 
   (testing "timeout with nil fallback"
-    (let [sched (mt/make-scheduler)]
-      (let [job (mt/start! sched (mt/timeout (mt/sleep 200 :inner) 100) {})]
-        (mt/advance-to! sched 100)
-        (is (mt/done? job))
-        (is (nil? (mt/result job))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched (mt/timeout (mt/sleep 200 :inner) 100) {})]
+          (mt/advance-to! sched 100)
+          (is (mt/done? job))
+          (is (nil? (mt/result job)))))))
 
   (testing "cancelling timeout cancels inner and throws Cancelled"
-    (let [sched (mt/make-scheduler)]
-      (let [job (mt/start! sched
-                           (mt/timeout (mt/sleep 200 :inner) 100 :timed-out)
-                           {:label "timeout-cancel"})]
-        (mt/cancel! job)
-        (mt/tick! sched)
-        (is (mt/done? job))
-        (is (thrown? Cancelled (mt/result job)))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        (let [job (mt/start! sched
+                             (mt/timeout (mt/sleep 200 :inner) 100 :timed-out)
+                             {:label "timeout-cancel"})]
+          (mt/cancel! job)
+          (mt/tick! sched)
+          (is (mt/done? job))
+          (is (thrown? Cancelled (mt/result job))))))))
 
 ;; =============================================================================
 ;; Job Management Tests
@@ -441,9 +450,20 @@
 )
 
 (deftest no-scheduler-test
-  (testing "sleep throws without scheduler"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No TestScheduler"
-                          ((mt/sleep 100 :done) (fn [_]) (fn [_]))))))
+  (testing "sleep falls back to real sleep when *is-deterministic* is false"
+    ;; Outside with-determinism, mt/sleep should delegate to m/sleep (real time)
+    (let [result (atom nil)]
+      ;; Use a short sleep to test fallback behavior
+      ((mt/sleep 10 :done) (fn [v] (reset! result v)) (fn [_]))
+      ;; Give it time to complete (real async)
+      (Thread/sleep 50)
+      (is (= :done @result))))
+
+  (testing "sleep throws in deterministic mode without scheduler"
+    ;; With *is-deterministic* true but no *scheduler*, should throw
+    (binding [mt/*is-deterministic* true]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No TestScheduler"
+                            ((mt/sleep 100 :done) (fn [_]) (fn [_])))))))
 
 ;; =============================================================================
 ;; Integration Tests

@@ -835,102 +835,140 @@
          (s x)
          (fn cancel [] nil))))))
 
+;; Store original missionary implementations at load time
+(def ^:private original-sleep m/sleep)
+(def ^:private original-timeout m/timeout)
+
+(defn- deterministic-sleep
+  "Internal: virtual sleep implementation for deterministic mode."
+  [ms x]
+  (fn [s f]
+    (let [sched (require-scheduler!)
+          done? (atom false)
+          tok (schedule-timer!
+               sched (long ms)
+               (fn []
+                 (when (compare-and-set! done? false true)
+                   (s x)))
+               {:kind :sleep
+                :label "sleep"})]
+      (fn cancel
+        []
+        (when (compare-and-set! done? false true)
+          (cancel-timer! sched tok)
+          ;; fail synchronously, matching Missionary semantics
+          (f (cancelled-ex)))
+        nil))))
+
 (defn sleep
-  "Virtual sleep task.
+  "Sleep task that dispatches based on determinism mode.
 
   (mt/sleep ms)
   (mt/sleep ms x)
 
-  Semantics:
+  Behavior:
+  - In deterministic mode (*is-deterministic* true): uses virtual time via scheduler
+  - In production mode: delegates to original missionary.core/sleep
+
+  The dispatch decision is made at task execution time, not at creation time.
+  This allows tasks created outside with-determinism to still use virtual time
+  when executed inside with-determinism.
+
+  Semantics (both modes):
   - completes after delay with x (or nil)
   - cancelling fails immediately with missionary.Cancelled"
   ([ms] (sleep ms nil))
   ([ms x]
+   ;; Return a task that dispatches at execution time
    (fn [s f]
-     (let [sched (require-scheduler!)
-           done? (atom false)
-           tok (schedule-timer!
-                sched (long ms)
-                (fn []
-                  (when (compare-and-set! done? false true)
-                    (s x)))
-                {:kind :sleep
-                 :label "sleep"})]
-       (fn cancel
-         []
-         (when (compare-and-set! done? false true)
-           (cancel-timer! sched tok)
-           ;; fail synchronously, matching Missionary semantics
-           (f (cancelled-ex)))
-         nil)))))
+     (if *is-deterministic*
+       ((deterministic-sleep ms x) s f)
+       ((original-sleep ms x) s f)))))
+
+(defn- deterministic-timeout
+  "Internal: virtual timeout implementation for deterministic mode."
+  [task ms x]
+  (fn [s f]
+    (let [sched (require-scheduler!)
+          done? (atom false)
+          cancel-child (atom nil)
+          timer-token (atom nil)
+
+          finish! (fn [status v]
+                    (when (compare-and-set! done? false true)
+                      ;; stop timer
+                      (cancel-timer! sched @timer-token)
+                      ;; deliver outcome
+                      (case status
+                        :success (s v)
+                        :failure (f v))))]
+
+      ;; Start child task immediately
+      (try
+        (reset! cancel-child
+                (task
+                 (fn [v]
+                   ;; if child succeeds first, succeed
+                   (enqueue-microtask! sched (fn [] (finish! :success v))
+                                       {:kind :timeout/child-success
+                                        :label "timeout-child-success"}))
+                 (fn [e]
+                   ;; if child fails first, fail
+                   (enqueue-microtask! sched (fn [] (finish! :failure e))
+                                       {:kind :timeout/child-failure
+                                        :label "timeout-child-failure"}))))
+        (catch #?(:clj Throwable :cljs :default) e
+          (finish! :failure e)
+          (reset! cancel-child (fn [] nil))))
+
+      ;; Start timer
+      (reset! timer-token
+              (schedule-timer!
+               sched (long ms)
+               (fn []
+                 (when (compare-and-set! done? false true)
+                   ;; timeout fired first -> cancel child and succeed with fallback
+                   (when-let [c @cancel-child]
+                     (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
+                   (s x)))
+               {:kind :timeout/timer
+                :label "timeout-timer"}))
+
+      ;; cancellation thunk
+      (fn cancel []
+        (when (compare-and-set! done? false true)
+          (cancel-timer! sched @timer-token)
+          (when-let [c @cancel-child]
+            (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
+          ;; fail synchronously, matching Missionary semantics
+          (f (cancelled-ex)))
+        nil))))
 
 (defn timeout
-  "Virtual timeout wrapper task.
+  "Timeout wrapper task that dispatches based on determinism mode.
 
   (mt/timeout task ms)
   (mt/timeout task ms x)
 
-  Semantics:
+  Behavior:
+  - In deterministic mode (*is-deterministic* true): uses virtual time via scheduler
+  - In production mode: delegates to original missionary.core/timeout
+
+  The dispatch decision is made at task execution time, not at creation time.
+  This allows tasks created outside with-determinism to still use virtual time
+  when executed inside with-determinism.
+
+  Semantics (both modes):
   - if input completes before ms, propagate success/failure
   - else, cancel input task and succeed with x (default nil)
   - cancelling the timeout task fails with missionary.Cancelled (and cancels input)."
   ([task ms] (timeout task ms nil))
   ([task ms x]
+   ;; Return a task that dispatches at execution time
    (fn [s f]
-     (let [sched (require-scheduler!)
-           done? (atom false)
-           cancel-child (atom nil)
-           timer-token (atom nil)
-
-           finish! (fn [status v]
-                     (when (compare-and-set! done? false true)
-                       ;; stop timer
-                       (cancel-timer! sched @timer-token)
-                       ;; deliver outcome
-                       (case status
-                         :success (s v)
-                         :failure (f v))))]
-
-       ;; Start child task immediately
-       (try
-         (reset! cancel-child
-                 (task
-                  (fn [v]
-                    ;; if child succeeds first, succeed
-                    (enqueue-microtask! sched (fn [] (finish! :success v))
-                                        {:kind :timeout/child-success
-                                         :label "timeout-child-success"}))
-                  (fn [e]
-                    ;; if child fails first, fail
-                    (enqueue-microtask! sched (fn [] (finish! :failure e))
-                                        {:kind :timeout/child-failure
-                                         :label "timeout-child-failure"}))))
-         (catch #?(:clj Throwable :cljs :default) e
-           (finish! :failure e)
-           (reset! cancel-child (fn [] nil))))
-
-       ;; Start timer
-       (reset! timer-token
-               (schedule-timer!
-                sched (long ms)
-                (fn []
-                  (when (compare-and-set! done? false true)
-                    ;; timeout fired first -> cancel child and succeed with fallback
-                    (when-let [c @cancel-child]
-                      (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
-                    (s x)))
-                {:kind :timeout/timer
-                 :label "timeout-timer"}))
-
-       ;; cancellation thunk
-       (fn cancel []
-         (when (compare-and-set! done? false true)
-           (cancel-timer! sched @timer-token)
-           (when-let [c @cancel-child]
-             (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
-           ;; fail synchronously, matching Missionary semantics
-           (f (cancelled-ex)))
-         nil)))))
+     (if *is-deterministic*
+       ((deterministic-timeout task ms x) s f)
+       ((original-timeout task ms x) s f)))))
 
 ;; -----------------------------------------------------------------------------
 ;; mt/run
@@ -1064,34 +1102,33 @@
 ;; Integration macro: with-determinism
 ;; -----------------------------------------------------------------------------
 
+;; Store original cpu/blk executors at load time (sleep/timeout originals are stored above)
+#?(:clj (def ^:private original-cpu m/cpu))
+#?(:clj (def ^:private original-blk m/blk))
+
 #?(:clj
    (defonce ^{:doc "Global lock and state for with-determinism macro to ensure thread-safe with-redefs.
      This allows parallel test runs without var rebinding conflicts."
               :no-doc true}
      determinism-state
-     (atom {:active-count 0
-            :original-sleep nil
-            :original-timeout nil
-            :original-cpu nil
-            :original-blk nil})))
+     (atom {:active-count 0})))
 
 #?(:clj
    (defonce ^:no-doc determinism-lock (Object.)))
 
 #?(:clj
    (defn ^:no-doc acquire-determinism!
-     "Acquire determinism context. First caller saves originals and rebinds vars.
-     Returns true, always succeeds."
+     "Acquire determinism context. First caller rebinds vars.
+     Returns true, always succeeds.
+
+     Note: sleep and timeout are now dispatching wrappers that check *is-deterministic*,
+     so we just need to point m/sleep -> mt/sleep and m/timeout -> mt/timeout.
+     The mt/ functions will dispatch to originals when not in deterministic mode."
      []
      (locking determinism-lock
        (let [state @determinism-state]
          (when (zero? (:active-count state))
-           ;; First acquirer: save originals and rebind
-           (swap! determinism-state assoc
-                  :original-sleep @#'missionary.core/sleep
-                  :original-timeout @#'missionary.core/timeout
-                  :original-cpu @#'missionary.core/cpu
-                  :original-blk @#'missionary.core/blk)
+           ;; First acquirer: rebind vars to dispatching wrappers
            (alter-var-root #'missionary.core/sleep (constantly sleep))
            (alter-var-root #'missionary.core/timeout (constantly timeout))
            (alter-var-root #'missionary.core/cpu (constantly (cpu-executor)))
@@ -1108,15 +1145,10 @@
        (let [state @determinism-state]
          (when (zero? (:active-count state))
            ;; Last releaser: restore originals
-           (alter-var-root #'missionary.core/sleep (constantly (:original-sleep state)))
-           (alter-var-root #'missionary.core/timeout (constantly (:original-timeout state)))
-           (alter-var-root #'missionary.core/cpu (constantly (:original-cpu state)))
-           (alter-var-root #'missionary.core/blk (constantly (:original-blk state)))
-           (swap! determinism-state assoc
-                  :original-sleep nil
-                  :original-timeout nil
-                  :original-cpu nil
-                  :original-blk nil))))
+           (alter-var-root #'missionary.core/sleep (constantly original-sleep))
+           (alter-var-root #'missionary.core/timeout (constantly original-timeout))
+           (alter-var-root #'missionary.core/cpu (constantly original-cpu))
+           (alter-var-root #'missionary.core/blk (constantly original-blk)))))
      nil))
 
 #?(:clj
@@ -1149,10 +1181,15 @@
 
      Effects:
      - Sets *is-deterministic* to true
-     - missionary.core/sleep    -> mt/sleep
-     - missionary.core/timeout  -> mt/timeout
+     - missionary.core/sleep    -> mt/sleep (dispatches to virtual or original based on *is-deterministic*)
+     - missionary.core/timeout  -> mt/timeout (dispatches to virtual or original based on *is-deterministic*)
      - missionary.core/cpu      -> deterministic executor (JVM only)
      - missionary.core/blk      -> deterministic executor (JVM only)
+
+     DISPATCHING BEHAVIOR: mt/sleep and mt/timeout are wrapper functions that check
+     *is-deterministic* at call time. When true, they use virtual time via the scheduler.
+     When false (outside with-determinism), they delegate to the original missionary
+     implementations, allowing the same code to work in both test and production contexts.
 
      NOTE: m/via with m/cpu or m/blk works correctly because these executors
      are rebound to run work as scheduler microtasks. Do NOT use real executors
