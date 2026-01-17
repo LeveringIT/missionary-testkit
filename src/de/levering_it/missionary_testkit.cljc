@@ -2,7 +2,9 @@
   (:require [missionary.core :as m])
   #?(:clj
      (:import (java.util.concurrent Executor)
-              (missionary Cancelled))))
+              (missionary Cancelled)))
+  #?(:cljs
+     (:import (missionary Cancelled))))
 
 ;; missionary-testkit
 ;;
@@ -514,37 +516,6 @@
   (when-let [[_ t] (first (:timers @(:state sched)))]
     (:at-ms t)))
 
-(defn- execute-microtask!
-  "Internal: execute the microtask and handle interrupts (JVM) and tracing."
-  [^TestScheduler sched state-atom mt now]
-  #?(:clj
-     ;; Clear any pending interrupt before executing microtask.
-     ;; This prevents stale interrupt state from leaking into the task
-     ;; and affecting blocking operations unexpectedly.
-     (let [was-interrupted (Thread/interrupted)]
-       (try
-         ((:f mt))
-         (catch Throwable e
-           (throw e))
-         (finally
-           ;; Clear interrupt flag after execution to keep scheduler stable.
-           ;; Record in trace if interrupt occurred during or before execution.
-           (let [interrupted-after (Thread/interrupted)]
-             (when (and (:trace? sched) (or was-interrupted interrupted-after))
-               (swap! state-atom
-                      maybe-trace-state
-                      {:event :interrupt-cleared
-                       :id (:id mt)
-                       :before was-interrupted
-                       :after interrupted-after
-                       :now-ms now}))))))
-     :cljs
-     (try
-       ((:f mt))
-       (catch :default e
-         (throw e))))
-  (dissoc mt :f))
-
 (defn- select-and-remove-task
   "Select a task from queue and return [mt q' decision rng-state s-after].
   When task-id is provided, selects that specific task.
@@ -606,7 +577,7 @@
                                               :lane (:lane mt)
                                               :now-ms now}))]
                (if (compare-and-set! state-atom s s')
-                 (execute-microtask! sched state-atom mt now)
+                 (do ((:f mt)) mt)
                  (recur))))))))))
 
 (defn tick!
@@ -689,69 +660,69 @@
    (ensure-driver-thread! sched "start!")
    (binding [*scheduler* sched]
      (let [id (next-id! sched)
-         job-state (atom {:status :pending})
-         cancel-cell (atom nil)
+           job-state (atom {:status :pending})
+           cancel-cell (atom nil)
 
-         ;; Complete job via scheduler microtask, so completions become part of deterministic order.
-         complete! (fn [status v]
-                     (enqueue-microtask!
-                      sched
-                      (fn []
-                        (swap! job-state
-                               (fn [st]
-                                 (if (= :pending (:status st))
-                                   (assoc st :status status
-                                          (if (= status :success) :value :error) v)
-                                   st))))
-                      {:label label
-                       :kind :job/complete
-                       :lane :default}))
-
-         ;; Fail job directly without scheduler (for off-thread callback errors).
-         ;; This avoids deadlock when ensure-driver-thread! would throw in enqueue-microtask!.
-         fail-directly! (fn [ex]
+           ;; Complete job via scheduler microtask, so completions become part of deterministic order.
+           complete! (fn [status v]
+                       (enqueue-microtask!
+                        sched
+                        (fn []
                           (swap! job-state
                                  (fn [st]
                                    (if (= :pending (:status st))
-                                     (assoc st :status :failure :error ex)
-                                     st))))]
+                                     (assoc st :status status
+                                            (if (= status :success) :value :error) v)
+                                     st))))
+                        {:label label
+                         :kind :job/complete
+                         :lane :default}))
 
-     ;; Start task immediately (but its completion is always delivered through scheduler microtasks).
-     (try
-       (let [cancel
-             (task
-              (fn [v]
-                ;; Detect off-driver-thread callback (JVM only)
-                #?(:clj
-                   (let [owner (:driver-thread @(:state sched))]
-                     (if (and owner (not= owner (Thread/currentThread)))
-                       ;; Off-thread: fail directly to avoid deadlock
-                       (fail-directly!
-                        (mt-ex off-scheduler-callback sched
-                               "Task success callback invoked off scheduler thread."
-                               {:label label}))
-                       (complete! :success v)))
-                   :cljs
-                   (complete! :success v)))
-              (fn [e]
-                #?(:clj
-                   (let [owner (:driver-thread @(:state sched))]
-                     (if (and owner (not= owner (Thread/currentThread)))
-                       ;; Off-thread: fail directly to avoid deadlock
-                       (fail-directly!
-                        (mt-ex off-scheduler-callback sched
-                               "Task failure callback invoked off scheduler thread."
-                               {:label label
-                                :mt/original-error (pr-str e)}))
-                       (complete! :failure e)))
-                   :cljs
-                   (complete! :failure e))))]
-         (reset! cancel-cell (or cancel (fn [] nil))))
-       (catch #?(:clj Throwable :cljs :default) e
-         (complete! :failure e)
-         (reset! cancel-cell (fn [] nil))))
+           ;; Fail job directly without scheduler (for off-thread callback errors).
+           ;; This avoids deadlock when ensure-driver-thread! would throw in enqueue-microtask!.
+           fail-directly! (fn [ex]
+                            (swap! job-state
+                                   (fn [st]
+                                     (if (= :pending (:status st))
+                                       (assoc st :status :failure :error ex)
+                                       st))))]
 
-      (->Job sched id label job-state cancel-cell)))))
+       ;; Start task immediately (but its completion is always delivered through scheduler microtasks).
+       (try
+         (let [cancel
+               (task
+                (fn [v]
+                  ;; Detect off-driver-thread callback (JVM only)
+                  #?(:clj
+                     (let [owner (:driver-thread @(:state sched))]
+                       (if (and owner (not= owner (Thread/currentThread)))
+                         ;; Off-thread: fail directly to avoid deadlock
+                         (fail-directly!
+                          (mt-ex off-scheduler-callback sched
+                                 "Task success callback invoked off scheduler thread."
+                                 {:label label}))
+                         (complete! :success v)))
+                     :cljs
+                     (complete! :success v)))
+                (fn [e]
+                  #?(:clj
+                     (let [owner (:driver-thread @(:state sched))]
+                       (if (and owner (not= owner (Thread/currentThread)))
+                         ;; Off-thread: fail directly to avoid deadlock
+                         (fail-directly!
+                          (mt-ex off-scheduler-callback sched
+                                 "Task failure callback invoked off scheduler thread."
+                                 {:label label
+                                  :mt/original-error (pr-str e)}))
+                         (complete! :failure e)))
+                     :cljs
+                     (complete! :failure e))))]
+           (reset! cancel-cell (or cancel (fn [] nil))))
+         (catch #?(:clj Throwable :cljs :default) e
+           (complete! :failure e)
+           (reset! cancel-cell (fn [] nil))))
+
+       (->Job sched id label job-state cancel-cell)))))
 
 (defn done?
   "Has the job completed (success or failure)?"
@@ -838,6 +809,7 @@
 ;; Store original missionary implementations at load time
 (def ^:private original-sleep m/sleep)
 (def ^:private original-timeout m/timeout)
+(def ^:private original-via-call m/via-call)
 
 (defn- deterministic-sleep
   "Internal: virtual sleep implementation for deterministic mode."
@@ -1046,154 +1018,144 @@
                  (catch :default e
                    (reject e))))))))
 
-;; -----------------------------------------------------------------------------
-;; Deterministic executors (JVM-only)
-;; -----------------------------------------------------------------------------
 
-;; Store original cpu/blk executors at load time (sleep/timeout originals are stored above)
-#?(:clj (def ^:private original-cpu m/cpu))
-#?(:clj (def ^:private original-blk m/blk))
+(def ^:const unsupported-executor ::unsupported-executor)
+
 
 #?(:clj
-   (defn- make-executor
-     "Factory for deterministic executors. Enqueues runnables as scheduler microtasks.
-     Uses require-scheduler! to get the current scheduler from *scheduler* binding."
-     [lane label]
-     (reify Executor
-       (execute [_ runnable]
-         (let [sched (require-scheduler!)]
-           (enqueue-microtask!
-            sched
-            (fn [] (.run ^Runnable runnable))
-            {:kind :executor
-             :lane lane
-             :label label}))))))
+   (defn deterministic-via-call*
+     "Deterministic replacement for missionary.core/via-call.
 
-#?(:clj
-   (defn executor
-     "Deterministic java.util.concurrent.Executor. Enqueues runnables as scheduler microtasks.
-     Must be called inside with-determinism with a scheduler bound to *scheduler*."
-     []
-     (make-executor :default "executor")))
+      Semantics (deterministic mode):
+      - Ignores real thread hopping: schedules work on the TestScheduler microtask queue.
+      - Runs thunk inside m/sp so `?` and `!` behave as in normal Missionary code.
+      - Cancellation is cooperative: cancels the inner sp and fails with missionary.Cancelled.
+      - DOES NOT interrupt any JVM thread (intentionally diverges from production via semantics)."
+     [exec thunk]
+     (fn [s f]
+       (let [sched (require-scheduler!)
+             ;; Optional: enforce your testkit contract (only cpu/blk are supported deterministically).
+             ;; If you'd rather "ignore exec and still run deterministically", remove this check.
+             _ (when-not (or (identical? exec m/cpu)
+                             (identical? exec m/blk))
+                 (throw (mt-ex unsupported-executor sched
+                               "Deterministic via/via-call only supports m/cpu or m/blk executors."
+                               {:exec (pr-str exec)})))
 
-#?(:cljs
-   (defn executor []
-     (throw (ex-info "mt/executor is JVM-only." {:mt/kind ::unsupported}))))
+             lane (cond
+                    (identical? exec m/cpu) :cpu
+                    (identical? exec m/blk) :blk
+                    :else :default)
 
-#?(:clj
-   (defn cpu-executor
-     "Deterministic CPU executor for m/via. Lane :cpu retained for introspection/trace.
-     Must be called inside with-determinism with a scheduler bound to *scheduler*."
-     []
-     (make-executor :cpu "cpu-executor")))
+             done?        (atom false)
+             cancel-inner (atom nil)]
 
-#?(:cljs
-   (defn cpu-executor []
-     (throw (ex-info "mt/cpu-executor is JVM-only." {:mt/kind ::unsupported}))))
+         ;; Schedule the "executor hop" as a microtask
+         (enqueue-microtask!
+          sched
+          (fn []
+            ;; If cancelled before we start, do nothing.
+            (when-not @done?
+              (let [inner-task
+                    ;; Evaluate thunk in a proper Missionary evaluation context.
+                    (m/sp (thunk))
 
-#?(:clj
-   (defn blk-executor
-     "Deterministic blocking executor for m/via. Lane :blk retained for introspection/trace.
-     Must be called inside with-determinism with a scheduler bound to *scheduler*."
-     []
-     (make-executor :blk "blk-executor")))
+                    cancel
+                    (inner-task
+                     (fn [v]
+                       (when (compare-and-set! done? false true)
+                         (s v)))
+                     (fn [e]
+                       (when (compare-and-set! done? false true)
+                         (f e))))]
+                (reset! cancel-inner (or cancel (fn [] nil))))))
+          {:kind  :via-call
+           :label "via-call"
+           :lane  lane})
 
-#?(:cljs
-   (defn blk-executor []
-     (throw (ex-info "mt/blk-executor is JVM-only." {:mt/kind ::unsupported}))))
+         ;; Cancel thunk
+         (fn cancel []
+           ;; keep determinism: cancellation must happen on the driver thread
+           (ensure-driver-thread! sched "via-call cancel")
+           (when (compare-and-set! done? false true)
+             ;; stop the inner sp if it started
+             (when-let [c @cancel-inner]
+               (try (c) (catch Throwable _ nil)))
+             ;; fail immediately like other cancelled primitives
+             (f (cancelled-ex)))
+           nil))))
+   :cljs
+   (defn deterministic-via-call* [exec thunk]
+     (throw (ex-info "via-call is JVM-only." {:mt/kind ::unsupported}))))
 
-#?(:clj
-   (def cpu
-     "CPU executor that dispatches based on determinism mode.
 
-     Behavior:
-     - In deterministic mode (*is-deterministic* true): enqueues as scheduler microtask
-     - In production mode: delegates to original missionary.core/cpu
+(defn via-call
+  "Deterministic replacement for missionary.core/via-call.
 
-     The dispatch decision is made when execute is called, not at load time."
-     (reify Executor
-       (execute [_ runnable]
-         (if *is-deterministic*
-           (.execute (cpu-executor) runnable)
-           (.execute ^Executor original-cpu runnable))))))
+      Semantics (deterministic mode):
+      - Ignores real thread hopping: schedules work on the TestScheduler microtask queue.
+      - Runs thunk inside m/sp so `?` and `!` behave as in normal Missionary code.
+      - Cancellation is cooperative: cancels the inner sp and fails with missionary.Cancelled.
+      - DOES NOT interrupt any JVM thread (intentionally diverges from production via semantics)."
+  ([exec thunk]
+   ;; Return a task that dispatches at execution time
+   (fn [s f]
+     (if *is-deterministic*
+       ((deterministic-via-call* exec thunk) s f)
 
-#?(:cljs
-   (def cpu
-     "CPU executor - CLJS stub. Not supported in CLJS."
-     nil))
+       ((original-via-call exec thunk) s f)))))
 
-#?(:clj
-   (def blk
-     "Blocking executor that dispatches based on determinism mode.
 
-     Behavior:
-     - In deterministic mode (*is-deterministic* true): enqueues as scheduler microtask
-     - In production mode: delegates to original missionary.core/blk
+  ;; -----------------------------------------------------------------------------
+  ;; Integration macro: with-determinism
+  ;; -----------------------------------------------------------------------------
 
-     The dispatch decision is made when execute is called, not at load time."
-     (reify Executor
-       (execute [_ runnable]
-         (if *is-deterministic*
-           (.execute (blk-executor) runnable)
-           (.execute ^Executor original-blk runnable))))))
-
-#?(:cljs
-   (def blk
-     "Blocking executor - CLJS stub. Not supported in CLJS."
-     nil))
-
-;; -----------------------------------------------------------------------------
-;; Integration macro: with-determinism
-;; -----------------------------------------------------------------------------
-
-#?(:clj
-   (defonce ^{:doc "Global lock and state for with-determinism macro to ensure thread-safe with-redefs.
+  #?(:clj
+     (defonce ^{:doc "Global lock and state for with-determinism macro to ensure thread-safe with-redefs.
      This allows parallel test runs without var rebinding conflicts."
-              :no-doc true}
-     determinism-state
-     (atom {:active-count 0})))
+                :no-doc true}
+       determinism-state
+       (atom {:active-count 0})))
 
-#?(:clj
-   (defonce ^:no-doc determinism-lock (Object.)))
+  #?(:clj
+     (defonce ^:no-doc determinism-lock (Object.)))
 
-#?(:clj
-   (defn ^:no-doc acquire-determinism!
-     "Acquire determinism context. First caller rebinds vars.
+  #?(:clj
+     (defn ^:no-doc acquire-determinism!
+       "Acquire determinism context. First caller rebinds vars.
      Returns true, always succeeds.
 
      Note: sleep, timeout, cpu, and blk are now dispatching wrappers that check
      *is-deterministic*, so we just need to point m/sleep -> mt/sleep, etc.
      The mt/ functions will dispatch to originals when not in deterministic mode."
-     []
-     (locking determinism-lock
-       (let [state @determinism-state]
-         (when (zero? (:active-count state))
-           ;; First acquirer: rebind vars to dispatching wrappers
-           (alter-var-root #'missionary.core/sleep (constantly sleep))
-           (alter-var-root #'missionary.core/timeout (constantly timeout))
-           (alter-var-root #'missionary.core/cpu (constantly cpu))
-           (alter-var-root #'missionary.core/blk (constantly blk)))
-         (swap! determinism-state update :active-count inc)))
-     true))
+       []
+       (locking determinism-lock
+         (let [state @determinism-state]
+           (when (zero? (:active-count state))
+             ;; First acquirer: rebind vars to dispatching wrappers
+             (alter-var-root #'missionary.core/sleep (constantly sleep))
+             (alter-var-root #'missionary.core/timeout (constantly timeout))
+             (alter-var-root #'missionary.core/via-call (constantly via-call)))
+           (swap! determinism-state update :active-count inc)))
+       true))
 
-#?(:clj
-   (defn ^:no-doc release-determinism!
-     "Release determinism context. Last caller restores original vars."
-     []
-     (locking determinism-lock
-       (swap! determinism-state update :active-count dec)
-       (let [state @determinism-state]
-         (when (zero? (:active-count state))
-           ;; Last releaser: restore originals
-           (alter-var-root #'missionary.core/sleep (constantly original-sleep))
-           (alter-var-root #'missionary.core/timeout (constantly original-timeout))
-           (alter-var-root #'missionary.core/cpu (constantly original-cpu))
-           (alter-var-root #'missionary.core/blk (constantly original-blk)))))
-     nil))
+  #?(:clj
+     (defn ^:no-doc release-determinism!
+       "Release determinism context. Last caller restores original vars."
+       []
+       (locking determinism-lock
+         (swap! determinism-state update :active-count dec)
+         (let [state @determinism-state]
+           (when (zero? (:active-count state))
+             ;; Last releaser: restore originals
+             (alter-var-root #'missionary.core/sleep (constantly original-sleep))
+             (alter-var-root #'missionary.core/timeout (constantly original-timeout))
+             (alter-var-root #'missionary.core/via-call (constantly original-via-call)))))
+       nil))
 
-#?(:clj
-   (defmacro with-determinism
-     "Scope deterministic behavior to a test body by rebinding/redefining Missionary vars.
+  #?(:clj
+     (defmacro with-determinism
+       "Scope deterministic behavior to a test body by rebinding/redefining Missionary vars.
 
      IMPORTANT: This macro is the entry point to deterministic behavior. All flows
      and tasks under test MUST be created inside the macro body (or by factory
@@ -1239,60 +1201,55 @@
      NOTE: mt/run and mt/start! automatically bind *scheduler* to sched, so you
      don't need any explicit binding - just pass the scheduler as an argument.
 
-     INTERRUPT BEHAVIOR: When a via task is cancelled before its microtask executes,
-     the via body will run with Thread.interrupted() returning true. Blocking calls
-     in the via body will throw InterruptedException. The interrupt flag is cleared
-     after the via body completes, so the scheduler remains usable.
-
      CONCURRENCY: Uses reference counting to make var rebinding safe for parallel test runs.
      Multiple tests can run concurrently - first acquires the rebindings, last restores originals."
-     [& body]
-     (let [cljs? (boolean &env)]
-       (if cljs?
-         ;; CLJS: single-threaded, use simple with-redefs
-         `(binding [*is-deterministic* true]
-            (with-redefs
-             [missionary.core/sleep sleep
-              missionary.core/timeout timeout]
-              ~@body))
-         ;; CLJ: use reference-counted var rebinding for parallel safety
-         `(do
-            (acquire-determinism!)
-            (try
-              (binding [*is-deterministic* true]
-                ~@body)
-              (finally
-                (release-determinism!))))))))
+       [& body]
+       (let [cljs? (boolean &env)]
+         (if cljs?
+           ;; CLJS: single-threaded, use simple with-redefs
+           `(binding [*is-deterministic* true]
+              (with-redefs
+               [missionary.core/sleep sleep
+                missionary.core/timeout timeout]
+                ~@body))
+           ;; CLJ: use reference-counted var rebinding for parallel safety
+           `(do
+              (acquire-determinism!)
+              (try
+                (binding [*is-deterministic* true]
+                  ~@body)
+                (finally
+                  (release-determinism!))))))))
 
-;; -----------------------------------------------------------------------------
-;; Flow determinism: scheduled-flow + spawn-flow!
-;; -----------------------------------------------------------------------------
+  ;; -----------------------------------------------------------------------------
+  ;; Flow determinism: scheduled-flow + spawn-flow!
+  ;; -----------------------------------------------------------------------------
 
-(defn scheduled-flow
-  "Wrap a flow to marshal readiness/termination signals through the scheduler.
+  (defn scheduled-flow
+    "Wrap a flow to marshal readiness/termination signals through the scheduler.
 
   (mt/scheduled-flow sched flow {:label ...})"
-  ([^TestScheduler sched flow]
-   (scheduled-flow sched flow {}))
-  ([^TestScheduler sched flow {:keys [label]}]
-   (fn [n t]
-     (let [wrap (fn [thunk kind]
-                  (fn []
-                    (enqueue-microtask!
-                     sched
-                     (fn [] (thunk))
-                     {:kind kind
-                      :label label
-                      :lane :default})))]
-       (flow (wrap n :flow/notifier)
-             (wrap t :flow/terminator))))))
+    ([^TestScheduler sched flow]
+     (scheduled-flow sched flow {}))
+    ([^TestScheduler sched flow {:keys [label]}]
+     (fn [n t]
+       (let [wrap (fn [thunk kind]
+                    (fn []
+                      (enqueue-microtask!
+                       sched
+                       (fn [] (thunk))
+                       {:kind kind
+                        :label label
+                        :lane :default})))]
+         (flow (wrap n :flow/notifier)
+               (wrap t :flow/terminator))))))
 
-;; -----------------------------------------------------------------------------
-;; Interleaving: trace extraction and replay
-;; -----------------------------------------------------------------------------
+  ;; -----------------------------------------------------------------------------
+  ;; Interleaving: trace extraction and replay
+  ;; -----------------------------------------------------------------------------
 
-(defn trace->schedule
-  "Extract the sequence of task IDs from a trace for replay.
+  (defn trace->schedule
+    "Extract the sequence of task IDs from a trace for replay.
   Returns a vector of task IDs [id1 id2 id3 ...] that can be used to replay
   the exact same execution order.
 
@@ -1301,13 +1258,13 @@
     ;; => [2 4 3]  ; bare task IDs
     ;; User can inspect/modify: [2 3 4]  ; different order
     (mt/replay-schedule (make-task) schedule)"
-  [trace]
-  (->> trace
-       (filter #(= :select-task (:event %)))
-       (mapv :selected-id)))
+    [trace]
+    (->> trace
+         (filter #(= :select-task (:event %)))
+         (mapv :selected-id)))
 
-(defn replay-schedule
-  "Run a task with the exact schedule from a previous trace.
+  (defn replay-schedule
+    "Run a task with the exact schedule from a previous trace.
   Returns the task result.
 
   IMPORTANT: Must be called inside a with-determinism body.
@@ -1316,21 +1273,21 @@
     (def original-trace (mt/trace sched))
     (with-determinism
       (mt/replay-schedule (make-task) (mt/trace->schedule original-trace)))"
-  ([task schedule]
-   (replay-schedule task schedule {}))
-  ([task schedule {:keys [trace? max-steps max-time-ms]
-                   :or {trace? true
-                        max-steps 100000
-                        max-time-ms 60000}}]
-   (when-not *is-deterministic*
-     (throw (ex-info "replay-schedule must be called inside with-determinism body"
-                     {:mt/kind ::replay-without-determinism})))
-   (let [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
-     (run sched task {:max-steps max-steps
-                      :max-time-ms max-time-ms}))))
+    ([task schedule]
+     (replay-schedule task schedule {}))
+    ([task schedule {:keys [trace? max-steps max-time-ms]
+                     :or {trace? true
+                          max-steps 100000
+                          max-time-ms 60000}}]
+     (when-not *is-deterministic*
+       (throw (ex-info "replay-schedule must be called inside with-determinism body"
+                       {:mt/kind ::replay-without-determinism})))
+     (let [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
+       (run sched task {:max-steps max-steps
+                        :max-time-ms max-time-ms}))))
 
-(defn replay
-  "Replay a failure from check-interleaving.
+  (defn replay
+    "Replay a failure from check-interleaving.
 
   IMPORTANT: Must be called inside a with-determinism body.
 
@@ -1348,44 +1305,44 @@
   - :max-time-ms - max virtual time (default 60000)
 
   Returns the task result (same as replay-schedule)."
-  ([task-fn failure]
-   (replay task-fn failure {}))
-  ([task-fn failure opts]
-   (let [schedule (or (:schedule failure)
-                      (throw (ex-info "Failure bundle missing :schedule"
-                                      {:mt/kind ::invalid-failure-bundle
-                                       :failure failure})))]
-     (replay-schedule (task-fn) schedule opts))))
+    ([task-fn failure]
+     (replay task-fn failure {}))
+    ([task-fn failure opts]
+     (let [schedule (or (:schedule failure)
+                        (throw (ex-info "Failure bundle missing :schedule"
+                                        {:mt/kind ::invalid-failure-bundle
+                                         :failure failure})))]
+       (replay-schedule (task-fn) schedule opts))))
 
 
-;; -----------------------------------------------------------------------------
-;; Interleaving: test helpers
-;; -----------------------------------------------------------------------------
+  ;; -----------------------------------------------------------------------------
+  ;; Interleaving: test helpers
+  ;; -----------------------------------------------------------------------------
 
-(defn- default-base-seed []
-  #?(:clj (System/currentTimeMillis)
-     :cljs (.getTime (js/Date.))))
+  (defn- default-base-seed []
+    #?(:clj (System/currentTimeMillis)
+       :cljs (.getTime (js/Date.))))
 
-(defn- run-with-random-interleaving
-  "Run a task once with random selection seeded by test-seed. Returns map with result info.
+  (defn- run-with-random-interleaving
+    "Run a task once with random selection seeded by test-seed. Returns map with result info.
   Internal helper for check-interleaving and explore-interleavings.
   Must be called inside a with-determinism body."
-  [task {:keys [test-seed max-steps max-time-ms]
-         :or {max-time-ms 60000}}]
-  (let [sched (make-scheduler {:trace? true
-                               :seed test-seed})
-        result (try
-                 {:value (run sched task {:max-steps max-steps
-                                          :max-time-ms max-time-ms})}
-                 (catch #?(:clj Throwable :cljs :default) e
-                   {:error e}))]
-    {:result result
-     :seed test-seed
-     :micro-schedule (trace->schedule (trace sched))
-     :trace (trace sched)}))
+    [task {:keys [test-seed max-steps max-time-ms]
+           :or {max-time-ms 60000}}]
+    (let [sched (make-scheduler {:trace? true
+                                 :seed test-seed})
+          result (try
+                   {:value (run sched task {:max-steps max-steps
+                                            :max-time-ms max-time-ms})}
+                   (catch #?(:clj Throwable :cljs :default) e
+                     {:error e}))]
+      {:result result
+       :seed test-seed
+       :micro-schedule (trace->schedule (trace sched))
+       :trace (trace sched)}))
 
-(defn check-interleaving
-  "Run a task with many different interleavings to find failures.
+  (defn check-interleaving
+    "Run a task with many different interleavings to find failures.
 
   IMPORTANT: Must be called inside a with-determinism body.
 
@@ -1416,36 +1373,36 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-  [task-fn {:keys [num-tests seed property max-steps max-time-ms]
-            :or {num-tests 100
-                 max-steps 10000
-                 max-time-ms 60000}}]
-  (let [base-seed (or seed (default-base-seed))]
-    (loop [i 0]
-      (if (>= i num-tests)
-        {:ok? true :seed base-seed :iterations-run num-tests}
-        (let [run-result (run-with-random-interleaving (task-fn)
-                                                       {:test-seed (+ base-seed i)
-                                                        :max-steps max-steps
-                                                        :max-time-ms max-time-ms})
-              {:keys [result seed micro-schedule trace]} run-result
-              exception? (some? (:error result))
-              property-failed? (and property
-                                    (not exception?)
-                                    (not (property (:value result))))]
-          (if (or exception? property-failed?)
-            {:ok? false
-             :kind (if exception? :exception :property-failed)
-             :seed seed
-             :schedule micro-schedule
-             :trace trace
-             :iteration i
-             :error (when exception? (:error result))
-             :value (when-not exception? (:value result))}
-            (recur (inc i))))))))
+    [task-fn {:keys [num-tests seed property max-steps max-time-ms]
+              :or {num-tests 100
+                   max-steps 10000
+                   max-time-ms 60000}}]
+    (let [base-seed (or seed (default-base-seed))]
+      (loop [i 0]
+        (if (>= i num-tests)
+          {:ok? true :seed base-seed :iterations-run num-tests}
+          (let [run-result (run-with-random-interleaving (task-fn)
+                                                         {:test-seed (+ base-seed i)
+                                                          :max-steps max-steps
+                                                          :max-time-ms max-time-ms})
+                {:keys [result seed micro-schedule trace]} run-result
+                exception? (some? (:error result))
+                property-failed? (and property
+                                      (not exception?)
+                                      (not (property (:value result))))]
+            (if (or exception? property-failed?)
+              {:ok? false
+               :kind (if exception? :exception :property-failed)
+               :seed seed
+               :schedule micro-schedule
+               :trace trace
+               :iteration i
+               :error (when exception? (:error result))
+               :value (when-not exception? (:value result))}
+              (recur (inc i))))))))
 
-(defn explore-interleavings
-  "Explore different interleavings of a task and return a summary.
+  (defn explore-interleavings
+    "Explore different interleavings of a task and return a summary.
 
   IMPORTANT: Must be called inside a with-determinism body.
 
@@ -1464,30 +1421,30 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-  [task-fn {:keys [num-samples seed max-steps]
-            :or {num-samples 100
-                 max-steps 10000}}]
-  (let [base-seed (or seed (default-base-seed))
-        results (for [i (range num-samples)
-                      :let [run-result (run-with-random-interleaving (task-fn)
-                                                                     {:test-seed (+ base-seed i)
-                                                                      :max-steps max-steps})
-                            ;; Extract value or return error map
-                            r (let [res (:result run-result)]
-                                (if (:error res) res (:value res)))]]
-                  {:result r
-                   :micro-schedule (:micro-schedule run-result)})]
-    {:unique-results (count (distinct (map :result results)))
-     :results (vec results)
-     :seed base-seed}))
+    [task-fn {:keys [num-samples seed max-steps]
+              :or {num-samples 100
+                   max-steps 10000}}]
+    (let [base-seed (or seed (default-base-seed))
+          results (for [i (range num-samples)
+                        :let [run-result (run-with-random-interleaving (task-fn)
+                                                                       {:test-seed (+ base-seed i)
+                                                                        :max-steps max-steps})
+                              ;; Extract value or return error map
+                              r (let [res (:result run-result)]
+                                  (if (:error res) res (:value res)))]]
+                    {:result r
+                     :micro-schedule (:micro-schedule run-result)})]
+      {:unique-results (count (distinct (map :result results)))
+       :results (vec results)
+       :seed base-seed}))
 
 
-;; -----------------------------------------------------------------------------
-;; Flow collection convenience
-;; -----------------------------------------------------------------------------
+  ;; -----------------------------------------------------------------------------
+  ;; Flow collection convenience
+  ;; -----------------------------------------------------------------------------
 
-(defn collect
-  "Convenience: consume a flow into a task yielding a vector (or reduced value).
+  (defn collect
+    "Convenience: consume a flow into a task yielding a vector (or reduced value).
 
   (mt/collect flow {:xf (take 10)
                     :timeout-ms 1000
@@ -1495,12 +1452,12 @@
 
   Notes:
   - If :timeout-ms is provided, wraps with mt/timeout and returns ::mt/timeout on expiry."
-  ([flow] (collect flow {}))
-  ([flow {:keys [xf timeout-ms]
-          :or {xf nil}}]
-   (let [f (if xf (m/eduction xf flow) flow)
-         t (m/reduce conj [] f)
-         t (if timeout-ms
-             (timeout t timeout-ms ::timeout)
-             t)]
-     t)))
+    ([flow] (collect flow {}))
+    ([flow {:keys [xf timeout-ms]
+            :or {xf nil}}]
+     (let [f (if xf (m/eduction xf flow) flow)
+           t (m/reduce conj [] f)
+           t (if timeout-ms
+               (timeout t timeout-ms ::timeout)
+               t)]
+       t)))

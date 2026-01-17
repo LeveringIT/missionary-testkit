@@ -960,8 +960,6 @@ Missionary uses cooperative single-threaded execution by default. Tasks interlea
 
 **Important:** Do NOT use real executors (e.g., `Executors/newFixedThreadPool`) inside `with-determinism` - they will cause off-thread callbacks that break determinism.
 
-**Interrupt behavior:** When a via task is cancelled before its microtask executes, the via body will run with `Thread.interrupted()` returning `true`. Blocking calls in the via body will throw `InterruptedException`. The interrupt flag is cleared after the via body completes, so the scheduler remains usable.
-
 ```clojure
 ;; CORRECT: m/via with virtualized executors
 (mt/with-determinism
@@ -980,139 +978,17 @@ Missionary uses cooperative single-threaded execution by default. Tasks interlea
       (m/via real-exec (do-work)))))  ; Fails - off-thread callback
 ```
 
-### Interrupt Handling and m/via Semantic Limitations
+### Cancellation behavior
 
-The testkit clears `Thread.interrupted()` before and after each microtask to ensure interrupt isolation between unrelated tasks. This is necessary for determinism but creates some semantic differences from real Missionary when testing code with `m/via` and blocking operations.
+The testkit uses cooperative cancellation - no threads are interrupted. When a task is cancelled, it receives a `Cancelled` exception at its next suspension point (`m/?`). This differs from production Missionary where `m/via` bodies can be interrupted mid-execution via `Thread.interrupt()`.
 
-#### What works correctly
+This is appropriate for deterministic testing because:
 
-| Scenario | Behavior | Notes |
-|----------|----------|-------|
-| Interrupt isolation | ✓ Correct | Interrupts don't leak between microtasks |
-| `m/!` within via bodies | ✓ Correct | `m/!` uses `Thread.isInterrupted()` (non-clearing), so multiple calls correctly throw `Cancelled` |
-| Blocking calls in cancelled via | ✓ Correct | When via is cancelled before execution, `Thread/sleep` and other blocking calls throw `InterruptedException` |
-| Race between via tasks | ✓ Correct | Loser gets cancelled after completion |
+1. **No real I/O in tests** - Deterministic tests should not perform real blocking I/O, network calls, or `Thread/sleep`. Use virtual time (`m/sleep`) and mocked dependencies instead.
+2. **Coordination logic is testable** - The testkit verifies task ordering, state transitions, and cancellation handling at suspension points.
+3. **Simpler reasoning** - Without mid-execution interruption, test behavior is fully deterministic and reproducible.
 
-```clojure
-;; m/! works correctly - throws Cancelled when task is cancelled
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)
-        job (mt/start! sched
-              (m/via m/blk
-                (try
-                  (m/!)  ; throws Cancelled when interrupted
-                  :not-cancelled
-                  (catch missionary.Cancelled _
-                    :cancelled)))
-              {})]
-    (mt/cancel! job)
-    (mt/tick! sched)
-    (mt/tick! sched)
-    (mt/result job)))
-;; => :cancelled
-```
-
-#### Semantic mismatch: mid-execution cancellation
-
-The **fundamental limitation** is that the testkit cannot simulate cancellation *during* via body execution. In the testkit, everything runs on a single thread, so cancellation can only happen:
-- **Before** the via microtask runs (interrupt flag is set, blocking calls throw)
-- **After** the via body completes (cancellation is processed)
-
-In real Missionary with real threads, cancellation can interrupt a via body *at any point* during execution.
-
-**Affected pattern: timeout + blocking via**
-
-```clojure
-;; Real Missionary: timeout can interrupt Thread/sleep mid-execution
-(let [result (atom nil)]
-  ((m/timeout
-     (m/via m/blk
-       (try
-         (Thread/sleep 500)  ; blocked for 500ms
-         :completed
-         (catch InterruptedException _
-           :interrupted)))
-     100  ; timeout after 100ms
-     :timed-out)
-   #(reset! result %) #(reset! result %))
-  (Thread/sleep 700)
-  @result)
-;; => :timed-out (Thread/sleep was interrupted at 100ms)
-
-;; Testkit: via body runs to completion BEFORE timeout can fire
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)]
-    (mt/run sched
-      (m/timeout
-        (m/via m/blk
-          (try
-            (Thread/sleep 50)  ; real blocking call
-            :completed
-            (catch InterruptedException _
-              :interrupted)))
-        100  ; virtual timeout
-        :timed-out))))
-;; => :completed (via body finished before virtual timeout fired)
-```
-
-**Why this happens:** The testkit executes via bodies as synchronous microtasks. The 50ms `Thread/sleep` blocks the single driver thread, completing before the scheduler can advance virtual time to fire the timeout.
-
-#### Recommendations for testing via with blocking operations
-
-1. **Mock blocking operations** - Inject dependencies that use virtual time:
-
-```clojure
-;; Instead of real Thread/sleep inside via
-(m/via m/blk (Thread/sleep 500))
-
-;; Use a mockable function that uses m/sleep in tests
-(defn delay-ms [ms]
-  (if mt/*is-deterministic*
-    (m/? (m/sleep ms))  ; virtual time
-    (Thread/sleep ms))) ; real time
-
-;; Production code
-(m/sp (m/? (m/via m/blk (delay-ms 500) (do-work))))
-```
-
-2. **Test cancellation at boundaries** - Focus on testing that cancellation is *handled* correctly, not that it interrupts mid-execution:
-
-```clojure
-;; Test that cancelled via sees interrupt flag
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)
-        saw-interrupt (atom false)
-        job (mt/start! sched
-              (m/via m/blk
-                (reset! saw-interrupt (.isInterrupted (Thread/currentThread)))
-                :done)
-              {})]
-    (mt/cancel! job)
-    (mt/tick! sched)
-    @saw-interrupt))
-;; => true
-```
-
-3. **Use real Missionary for true concurrency tests** - For code that depends on mid-execution interruption, test with real threads:
-
-```clojure
-;; Integration test with real Missionary (outside testkit)
-(deftest timeout-interrupts-blocking-io
-  (let [result (promise)]
-    ((m/timeout
-       (m/via m/blk
-         (try
-           (Thread/sleep 5000)
-           :completed
-           (catch InterruptedException _
-             :interrupted)))
-       100
-       :timed-out)
-     #(deliver result %) #(deliver result %))
-    (is (= :timed-out (deref result 1000 :test-timeout)))))
-```
-
-4. **Accept the limitation** - The testkit tests *coordination logic* (task ordering, state transitions, cancellation handling), not true parallel execution. Code with periodic `m/!` checks cannot be tested for partial execution scenarios.
+If you need to test interrupt-based cancellation of blocking operations, use real Missionary outside the testkit.
 
 ### Thread safety (JVM only)
 

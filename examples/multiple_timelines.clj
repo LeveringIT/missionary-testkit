@@ -24,7 +24,7 @@
              ;; Timeline 1: Add 10
              (m/sp
                (let [v @counter]           ; Read current value
-                 (m/? (mt/yield))          ; Scheduling point - can be interrupted!
+                 (m/? (mt/yield))          ; Scheduling point - allows interleaving
                  (reset! counter (+ v 10)))) ; Write (possibly stale) value
 
              ;; Timeline 2: Add 20

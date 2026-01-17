@@ -329,40 +329,6 @@
         (mt/run sched (m/sp (m/? (m/sleep 100 :done))))
         (is (nil? (mt/trace sched)))))))
 
-;; =============================================================================
-;; Executor Tests (JVM only)
-;; =============================================================================
-
-(deftest executor-test
-  (testing "executor runs runnables as microtasks"
-    (let [sched (mt/make-scheduler)]
-      (binding [mt/*scheduler* sched]
-        (let [result (atom nil)
-              exec (mt/executor)]
-          (.execute exec (fn [] (reset! result :executed)))
-          (is (nil? @result))
-          (mt/tick! sched)
-          (is (= :executed @result))))))
-
-  (testing "cpu-executor runs on cpu lane"
-    (let [sched (mt/make-scheduler {:trace? true})]
-      (binding [mt/*scheduler* sched]
-        (let [result (atom nil)
-              exec (mt/cpu-executor)]
-          (.execute exec (fn [] (reset! result :cpu-done)))
-          (mt/tick! sched)
-          (is (= :cpu-done @result))
-          (is (some #(= :cpu (:lane %)) (mt/trace sched)))))))
-
-  (testing "blk-executor runs on blk lane"
-    (let [sched (mt/make-scheduler {:trace? true})]
-      (binding [mt/*scheduler* sched]
-        (let [result (atom nil)
-              exec (mt/blk-executor)]
-          (.execute exec (fn [] (reset! result :blk-done)))
-          (mt/tick! sched)
-          (is (= :blk-done @result))
-          (is (some #(= :blk (:lane %)) (mt/trace sched))))))))
 
 ;; =============================================================================
 ;; m/via with Virtualized Executors
@@ -390,46 +356,7 @@
                              (m/sp
                               (m/? (m/via m/blk
                                           (* 2 3 4)))))]
-          (is (= 24 result))))))
-
-  (testing "cancelled via before tick sees interrupt flag"
-    (mt/with-determinism
-      (let [sched (mt/make-scheduler)]
-        (let [saw-interrupt (atom false)
-              job (mt/start! sched
-                            (m/via m/cpu
-                                   (reset! saw-interrupt (.isInterrupted (Thread/currentThread)))
-                                   :done)
-                            {})]
-          (mt/cancel! job)
-          (mt/tick! sched)
-          (is @saw-interrupt "via body should see interrupt flag when cancelled before tick")))))
-
-  (testing "scheduler remains usable after cancelled via"
-    (mt/with-determinism
-      (let [sched (mt/make-scheduler)]
-        (let [job1 (mt/start! sched (m/via m/cpu :done1) {})]
-          (mt/cancel! job1)
-          (mt/tick! sched)
-          ;; Start another job - should work fine
-          (let [job2 (mt/start! sched (m/via m/cpu :done2) {})]
-            (mt/tick! sched)
-            (is (= :done2 (mt/result job2)))
-            (is (not (.isInterrupted (Thread/currentThread)))
-                "driver thread should not be left interrupted"))))))
-
-  (testing "via with blocking call throws InterruptedException when cancelled"
-    (mt/with-determinism
-      (let [sched (mt/make-scheduler)]
-        (let [job (mt/start! sched
-                            (m/via m/cpu
-                                   (Thread/sleep 100)
-                                   :done)
-                            {})]
-          (mt/cancel! job)
-          (mt/tick! sched)
-          (is (mt/done? job))
-          (is (thrown? InterruptedException (mt/result job))))))))
+          (is (= 24 result)))))))
 
 ;; =============================================================================
 ;; Edge Cases and Error Handling
