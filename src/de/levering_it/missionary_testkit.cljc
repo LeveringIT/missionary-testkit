@@ -1050,6 +1050,10 @@
 ;; Deterministic executors (JVM-only)
 ;; -----------------------------------------------------------------------------
 
+;; Store original cpu/blk executors at load time (sleep/timeout originals are stored above)
+#?(:clj (def ^:private original-cpu m/cpu))
+#?(:clj (def ^:private original-blk m/blk))
+
 #?(:clj
    (defn- make-executor
      "Factory for deterministic executors. Enqueues runnables as scheduler microtasks.
@@ -1098,13 +1102,49 @@
    (defn blk-executor []
      (throw (ex-info "mt/blk-executor is JVM-only." {:mt/kind ::unsupported}))))
 
+#?(:clj
+   (def cpu
+     "CPU executor that dispatches based on determinism mode.
+
+     Behavior:
+     - In deterministic mode (*is-deterministic* true): enqueues as scheduler microtask
+     - In production mode: delegates to original missionary.core/cpu
+
+     The dispatch decision is made when execute is called, not at load time."
+     (reify Executor
+       (execute [_ runnable]
+         (if *is-deterministic*
+           (.execute (cpu-executor) runnable)
+           (.execute ^Executor original-cpu runnable))))))
+
+#?(:cljs
+   (def cpu
+     "CPU executor - CLJS stub. Not supported in CLJS."
+     nil))
+
+#?(:clj
+   (def blk
+     "Blocking executor that dispatches based on determinism mode.
+
+     Behavior:
+     - In deterministic mode (*is-deterministic* true): enqueues as scheduler microtask
+     - In production mode: delegates to original missionary.core/blk
+
+     The dispatch decision is made when execute is called, not at load time."
+     (reify Executor
+       (execute [_ runnable]
+         (if *is-deterministic*
+           (.execute (blk-executor) runnable)
+           (.execute ^Executor original-blk runnable))))))
+
+#?(:cljs
+   (def blk
+     "Blocking executor - CLJS stub. Not supported in CLJS."
+     nil))
+
 ;; -----------------------------------------------------------------------------
 ;; Integration macro: with-determinism
 ;; -----------------------------------------------------------------------------
-
-;; Store original cpu/blk executors at load time (sleep/timeout originals are stored above)
-#?(:clj (def ^:private original-cpu m/cpu))
-#?(:clj (def ^:private original-blk m/blk))
 
 #?(:clj
    (defonce ^{:doc "Global lock and state for with-determinism macro to ensure thread-safe with-redefs.
@@ -1121,8 +1161,8 @@
      "Acquire determinism context. First caller rebinds vars.
      Returns true, always succeeds.
 
-     Note: sleep and timeout are now dispatching wrappers that check *is-deterministic*,
-     so we just need to point m/sleep -> mt/sleep and m/timeout -> mt/timeout.
+     Note: sleep, timeout, cpu, and blk are now dispatching wrappers that check
+     *is-deterministic*, so we just need to point m/sleep -> mt/sleep, etc.
      The mt/ functions will dispatch to originals when not in deterministic mode."
      []
      (locking determinism-lock
@@ -1131,8 +1171,8 @@
            ;; First acquirer: rebind vars to dispatching wrappers
            (alter-var-root #'missionary.core/sleep (constantly sleep))
            (alter-var-root #'missionary.core/timeout (constantly timeout))
-           (alter-var-root #'missionary.core/cpu (constantly (cpu-executor)))
-           (alter-var-root #'missionary.core/blk (constantly (blk-executor))))
+           (alter-var-root #'missionary.core/cpu (constantly cpu))
+           (alter-var-root #'missionary.core/blk (constantly blk)))
          (swap! determinism-state update :active-count inc)))
      true))
 
@@ -1183,16 +1223,17 @@
      - Sets *is-deterministic* to true
      - missionary.core/sleep    -> mt/sleep (dispatches to virtual or original based on *is-deterministic*)
      - missionary.core/timeout  -> mt/timeout (dispatches to virtual or original based on *is-deterministic*)
-     - missionary.core/cpu      -> deterministic executor (JVM only)
-     - missionary.core/blk      -> deterministic executor (JVM only)
+     - missionary.core/cpu      -> mt/cpu (dispatches to deterministic or original based on *is-deterministic*)
+     - missionary.core/blk      -> mt/blk (dispatches to deterministic or original based on *is-deterministic*)
 
-     DISPATCHING BEHAVIOR: mt/sleep and mt/timeout are wrapper functions that check
-     *is-deterministic* at call time. When true, they use virtual time via the scheduler.
-     When false (outside with-determinism), they delegate to the original missionary
-     implementations, allowing the same code to work in both test and production contexts.
+     DISPATCHING BEHAVIOR: mt/sleep, mt/timeout, mt/cpu, and mt/blk are wrapper
+     functions/values that check *is-deterministic* at call/deref time. When true,
+     they use virtual time via the scheduler. When false (outside with-determinism),
+     they delegate to the original missionary implementations, allowing the same code
+     to work in both test and production contexts.
 
      NOTE: m/via with m/cpu or m/blk works correctly because these executors
-     are rebound to run work as scheduler microtasks. Do NOT use real executors
+     dispatch based on *is-deterministic*. Do NOT use real executors
      (e.g., Executors/newFixedThreadPool) inside with-determinism.
 
      NOTE: mt/run and mt/start! automatically bind *scheduler* to sched, so you
