@@ -5,6 +5,31 @@
 
 A deterministic testing toolkit for [Missionary](https://github.com/leonoel/missionary) - the functional effect and streaming library for Clojure/ClojureScript.
 
+## Table of Contents
+
+- [The Problem](#the-problem)
+- [The Solution](#the-solution)
+- [Quickstart](#quickstart)
+- [Core Concepts](#core-concepts)
+  - [The `with-determinism` Entry Point](#the-with-determinism-entry-point)
+  - [Checking Deterministic Mode](#checking-deterministic-mode)
+  - [TestScheduler](#testscheduler)
+  - [Using Clock in Production Code](#using-clock-in-production-code)
+  - [Time Control](#time-control)
+  - [Running Tasks](#running-tasks)
+- [Testing Flows](#testing-flows)
+- [Coordination Primitives](#coordination-primitives)
+- [Continuous Flows and Diamond DAGs](#continuous-flows-and-diamond-dags)
+- [Testing Discrete Flows with m/observe](#testing-discrete-flows-with-mobserve)
+- [Debugging with Traces](#debugging-with-traces)
+- [Concurrency Bug Testing](#concurrency-bug-testing)
+- [Error Detection](#error-detection)
+- [Common Pitfalls](#common-pitfalls)
+- [API Reference](#api-reference)
+- [Determinism Contract](#determinism-contract)
+- [Limitations](#limitations)
+- [License](#license)
+
 ## The Problem
 
 Testing asynchronous code with real time is painful:
@@ -645,6 +670,91 @@ The scheduler automatically detects common problems:
 ;; throws: "Time budget exceeded"
 ```
 
+## Common Pitfalls
+
+### 1. Tasks created outside `with-determinism`
+
+```clojure
+;; ❌ WRONG: Task captures real m/sleep at def time
+(def my-task (m/sp (m/? (m/sleep 100)) :done))
+
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)]
+    (mt/run sched my-task)))  ; Uses REAL time, not virtual!
+
+;; ✅ CORRECT: Use a factory function
+(defn make-task [] (m/sp (m/? (m/sleep 100)) :done))
+
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)]
+    (mt/run sched (make-task))))  ; Uses virtual time
+```
+
+### 2. Using real executors inside `with-determinism`
+
+```clojure
+;; ❌ WRONG: Real executor - throws unsupported-executor error
+(import '[java.util.concurrent Executors])
+(def pool (Executors/newFixedThreadPool 4))
+
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)]
+    (mt/run sched
+      (m/sp (m/? (m/via pool (do-work)))))))  ; Throws! Only m/cpu and m/blk supported
+
+;; ✅ CORRECT: Use m/cpu or m/blk (executor is ignored, work runs on driver thread)
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)]
+    (mt/run sched
+      (m/sp (m/? (m/via m/cpu (do-work)))))))  ; Works deterministically
+```
+
+### 3. Modifying atoms from outside the task
+
+```clojure
+;; ❌ WRONG: External thread modifies atom - causes deadlock
+(def !state (atom 0))
+(future (Thread/sleep 100) (swap! !state inc))  ; External modification!
+
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)]
+    (mt/run sched
+      (m/sp (m/? (m/reduce ... (m/watch !state)))))))  ; Deadlock!
+
+;; ✅ CORRECT: Modify atoms inside the task at yield points
+(mt/with-determinism
+  (let [sched (mt/make-scheduler)
+        !state (atom 0)]
+    (mt/run sched
+      (m/sp
+        (m/? (m/race
+               (m/reduce ... (m/watch !state))
+               (m/sp
+                 (m/? (m/sleep 100))
+                 (swap! !state inc))))))))  ; Deterministic!
+```
+
+### 4. Forgetting to specify `:seed` for reproducible tests
+
+```clojure
+;; ❌ FRAGILE: Uses system time as seed - not reproducible
+(mt/check-interleaving make-task {:num-tests 100})
+
+;; ✅ REPRODUCIBLE: Always specify seed
+(mt/check-interleaving make-task {:num-tests 100 :seed 42})
+```
+
+### 5. Using `check-interleaving` outside `with-determinism`
+
+```clojure
+;; ❌ WRONG: Missing with-determinism wrapper
+(mt/check-interleaving make-task {:seed 42})  ; Throws!
+
+;; ✅ CORRECT: Wrap in with-determinism
+(mt/with-determinism
+  (mt/check-interleaving make-task {:seed 42}))
+```
+
 ## API Reference
 
 ### Scheduler Creation
@@ -681,9 +791,6 @@ The scheduler automatically detects common problems:
 
 ### Utilities
 - `(collect flow)` / `(collect flow opts)` - collect flow to vector task
-- `(executor)` - deterministic `java.util.concurrent.Executor` (requires `*scheduler*` bound)
-- `(cpu-executor)` - deterministic CPU executor (requires `*scheduler*` bound)
-- `(blk-executor)` - deterministic blocking executor (requires `*scheduler*` bound)
 
 ### Dynamic Vars
 - `*scheduler*` - the current TestScheduler (bound automatically by `run` and `start!`)
@@ -702,8 +809,8 @@ The scheduler automatically detects common problems:
 ## Running Tests
 
 ```bash
-# Run tests
-clojure -X:test cognitect.test-runner.api/test
+# Run all tests
+clojure -M:test -m cognitect.test-runner
 ```
 
 ## Determinism Contract
@@ -799,8 +906,7 @@ The testkit virtualizes **time-based primitives** only:
 | `m/timeout` | Yes | Uses virtual time |
 | `mt/clock` | Yes | Returns virtual time in tests, real time in production |
 | `mt/yield` | Yes | Scheduling point in tests, no-op in production |
-| `m/cpu` | Yes (JVM) | Deterministic executor |
-| `m/blk` | Yes (JVM) | Deterministic executor |
+| `m/via` with `m/cpu`/`m/blk` | Yes (JVM) | `via-call` is patched; executor is ignored, work runs on driver thread |
 | `m/race`, `m/join`, `m/amb=` | No (not needed) | Pure combinators, work correctly with virtualized primitives |
 
 ### What is NOT virtualized
@@ -809,32 +915,7 @@ The testkit virtualizes **time-based primitives** only:
 - **External `m/observe` callbacks** - Events from external sources (DOM, network) are not controlled
 - **External `m/watch` modifications** - Atom changes from threads outside the task are not controlled
 
-**Solution:** Keep atom mutations inside the controlled task. See [Why `m/signal` and `m/watch` Work](#why-msignal-and-mwatch-work).
-
-```clojure
-;; Modify atoms inside the controlled task for deterministic behavior
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)
-        !counter (atom 0)]
-    (mt/run sched
-      (m/sp
-        (m/? (m/race
-               ;; Consumer
-               (m/reduce (fn [acc v]
-                           (let [acc (conj acc v)]
-                             (if (= 3 (count acc))
-                               (reduced acc)
-                               acc)))
-                         [] (m/watch !counter))
-               ;; Producer - mutations at controlled yield points
-               (m/sp
-                 (m/? (m/sleep 10))
-                 (swap! !counter inc)  ; signal propagates synchronously
-                 (m/? (m/sleep 10))
-                 (swap! !counter inc)
-                 (m/? (m/sleep 10)))))))))
-;; => [0 1 2]
-```
+**Solution:** Keep atom mutations inside the controlled task. See [Why `m/signal` and `m/watch` Work](#why-msignal-and-mwatch-work) for detailed examples.
 
 ### Cancellation Semantics
 
@@ -896,55 +977,7 @@ When a race is decided, the execution order is:
 ;; => [:winner-done :loser-cleanup :after-race]
 ```
 
-#### Comparison with real Missionary
-
-The testkit's cancellation semantics match real Missionary:
-
-| Behavior | Testkit | Real Missionary |
-|----------|---------|-----------------|
-| `Cancelled` exception thrown | ✓ | ✓ |
-| Immediate cancellation | ✓ | ✓ |
-| Sleep value not delivered | ✓ | ✓ |
-| `finally` blocks run | ✓ | ✓ |
-| Nested cancellation propagates | ✓ | ✓ |
-
-The testkit delivers `Cancelled` synchronously, matching Missionary's semantics exactly.
-
-#### Testing cancellation scenarios
-
-Use the testkit to verify your code handles cancellation correctly:
-
-```clojure
-;; Test that resources are cleaned up on cancellation
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)
-        resource-released? (atom false)]
-    (mt/run sched
-      (m/sp
-        (m/? (m/timeout
-               (m/sp
-                 (try
-                   (m/? (m/sleep 1000))
-                   (finally
-                     (reset! resource-released? true))))
-               100
-               :timed-out))))
-    (is @resource-released?)))
-
-;; Test that catch blocks can recover from cancellation
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)]
-    (is (= :recovered
-           (mt/run sched
-             (m/sp
-               (m/? (m/race
-                      (m/sp
-                        (try
-                          (m/? (m/sleep 200))
-                          (catch missionary.Cancelled _
-                            :recovered)))
-                      (m/sleep 100 :winner)))))))))
-```
+The testkit's cancellation semantics match real Missionary exactly: `Cancelled` is thrown synchronously, `finally` blocks run, and nested cancellation propagates correctly.
 
 ### Threading model
 
@@ -952,35 +985,45 @@ Missionary uses cooperative single-threaded execution by default. Tasks interlea
 
 1. **Virtual time** - Which sleeps/timeouts complete first
 2. **Task ordering** - Which ready task runs next (via schedule)
-3. **Built-in executors** - `m/cpu` and `m/blk` are rebound to deterministic executors
+3. **`m/via` calls** - `via-call` is patched to run work on the driver thread (executor is ignored)
 
 ### m/via Behavior
 
-`m/via m/cpu` and `m/via m/blk` work correctly because those executors are rebound by `with-determinism` to run work as scheduler microtasks. The via body executes synchronously on the driver thread.
+`m/via m/cpu` and `m/via m/blk` work deterministically because `via-call` is patched by `with-determinism`. The executor argument is ignored - work runs as a scheduler microtask on the driver thread, not on a separate thread pool.
 
-**Important:** Do NOT use real executors (e.g., `Executors/newFixedThreadPool`) inside `with-determinism` - they will cause off-thread callbacks that break determinism.
+**Important:** Only `m/cpu` and `m/blk` are supported as executors. Custom executors will throw an error. See [Common Pitfalls](#common-pitfalls) for examples.
+
+#### Via body cannot be cancelled mid-work
+
+In single-threaded deterministic mode, the `m/via` body runs synchronously once started. **Cancellation can only occur:**
+
+1. **Before the body starts** - If a race is decided before the via's microtask runs, the body never executes
+2. **After the body completes** - The result is discarded, but the body has already run
 
 ```clojure
-;; CORRECT: m/via with virtualized executors
 (mt/with-determinism
-  (let [sched (mt/make-scheduler)]
+  (let [sched (mt/make-scheduler)
+        log (atom [])]
     (mt/run sched
       (m/sp
-        (m/? (m/via m/cpu (+ 1 2 3)))))))  ; Works - runs on driver thread
-;; => 6
-
-;; WRONG: m/via with real executor
-(import '[java.util.concurrent Executors])
-(def real-exec (Executors/newSingleThreadExecutor))
-(mt/with-determinism
-  (let [sched (mt/make-scheduler)]
-    (mt/run sched
-      (m/via real-exec (do-work)))))  ; Fails - off-thread callback
+        (m/? (m/race
+               (m/via m/cpu
+                 ;; This body runs synchronously - cannot be interrupted
+                 (swap! log conj :step-1)
+                 (swap! log conj :step-2)
+                 (swap! log conj :step-3)
+                 :via-done)
+               ;; If this wins before via's microtask, via body never runs
+               (m/sp :instant-winner)))))
+    @log))
+;; => [] (via body never executed because m/sp won instantly)
 ```
+
+This is a fundamental limitation of single-threaded execution: there is no separate thread to interrupt. For testing via bodies that need cancellation points, structure your code so cancellation-sensitive logic is outside the via body.
 
 ### Cancellation behavior
 
-The testkit uses cooperative cancellation - no threads are interrupted. When a task is cancelled, it receives a `Cancelled` exception at its next suspension point (`m/?`). This differs from production Missionary where `m/via` bodies can be interrupted mid-execution via `Thread.interrupt()`.
+The testkit uses cooperative cancellation - **no threads are interrupted**. When a task is cancelled, it receives a `Cancelled` exception at its next suspension point (`m/?`). Do not expect `Thread.interrupt()` signals - the testkit intentionally avoids thread interruption to maintain deterministic behavior.
 
 This is appropriate for deterministic testing because:
 
@@ -998,7 +1041,7 @@ This protection is automatic on JVM. ClojureScript is single-threaded so no enfo
 
 ### Parallel test execution
 
-`with-determinism` uses reference-counted var rebinding for safe parallel test runs. The first test to enter rebinds `m/sleep`, `m/timeout`, `m/cpu`, and `m/blk` to their virtual equivalents; the last test to exit restores the originals. Tests run fully concurrently with correct isolation via thread-local `*is-deterministic*` binding.
+`with-determinism` uses reference-counted var rebinding for safe parallel test runs. The first test to enter rebinds `m/sleep`, `m/timeout`, and `m/via-call` to their virtual equivalents; the last test to exit restores the originals. Tests run fully concurrently with correct isolation via thread-local `*is-deterministic*` binding.
 
 ### Flow forking
 

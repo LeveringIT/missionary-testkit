@@ -1047,8 +1047,7 @@
                     (identical? exec m/blk) :blk
                     :else :default)
 
-             done?        (atom false)
-             cancel-inner (atom nil)]
+             done?        (atom false)]
 
          ;; Schedule the "executor hop" as a microtask
          (enqueue-microtask!
@@ -1056,19 +1055,16 @@
           (fn []
             ;; If cancelled before we start, do nothing.
             (when-not @done?
-              (let [inner-task
-                    ;; Evaluate thunk in a proper Missionary evaluation context.
-                    (m/sp (thunk))
-
-                    cancel
-                    (inner-task
-                     (fn [v]
-                       (when (compare-and-set! done? false true)
-                         (s v)))
-                     (fn [e]
-                       (when (compare-and-set! done? false true)
-                         (f e))))]
-                (reset! cancel-inner (or cancel (fn [] nil))))))
+              (let [cont (try
+                           (let [x (thunk)]
+                             #(s x))
+                           (catch Exception e
+                             #(f e))
+                           (catch missionary.Cancelled t
+                             nil))]
+                (when (compare-and-set! done? false true)
+                  (when cont
+                    (cont))))))
           {:kind  :via-call
            :label "via-call"
            :lane  lane})
@@ -1078,9 +1074,7 @@
            ;; keep determinism: cancellation must happen on the driver thread
            (ensure-driver-thread! sched "via-call cancel")
            (when (compare-and-set! done? false true)
-             ;; stop the inner sp if it started
-             (when-let [c @cancel-inner]
-               (try (c) (catch Throwable _ nil)))
+             ;; we could cancel thunk here, but it does not make sense in a single threaded context
              ;; fail immediately like other cancelled primitives
              (f (cancelled-ex)))
            nil))))
@@ -1106,56 +1100,52 @@
        ((original-via-call exec thunk) s f)))))
 
 
-  ;; -----------------------------------------------------------------------------
-  ;; Integration macro: with-determinism
-  ;; -----------------------------------------------------------------------------
-
-  #?(:clj
-     (defonce ^{:doc "Global lock and state for with-determinism macro to ensure thread-safe with-redefs.
+#?(:clj
+   (defonce ^{:doc "Global lock and state for with-determinism macro to ensure thread-safe with-redefs.
      This allows parallel test runs without var rebinding conflicts."
-                :no-doc true}
-       determinism-state
-       (atom {:active-count 0})))
+              :no-doc true}
+     determinism-state
+     (atom {:active-count 0})))
 
-  #?(:clj
-     (defonce ^:no-doc determinism-lock (Object.)))
+#?(:clj
+   (defonce ^:no-doc determinism-lock (Object.)))
 
-  #?(:clj
-     (defn ^:no-doc acquire-determinism!
-       "Acquire determinism context. First caller rebinds vars.
+#?(:clj
+   (defn ^:no-doc acquire-determinism!
+     "Acquire determinism context. First caller rebinds vars.
      Returns true, always succeeds.
 
      Note: sleep, timeout, cpu, and blk are now dispatching wrappers that check
      *is-deterministic*, so we just need to point m/sleep -> mt/sleep, etc.
      The mt/ functions will dispatch to originals when not in deterministic mode."
-       []
-       (locking determinism-lock
-         (let [state @determinism-state]
-           (when (zero? (:active-count state))
-             ;; First acquirer: rebind vars to dispatching wrappers
-             (alter-var-root #'missionary.core/sleep (constantly sleep))
-             (alter-var-root #'missionary.core/timeout (constantly timeout))
-             (alter-var-root #'missionary.core/via-call (constantly via-call)))
-           (swap! determinism-state update :active-count inc)))
-       true))
+     []
+     (locking determinism-lock
+       (let [state @determinism-state]
+         (when (zero? (:active-count state))
+           ;; First acquirer: rebind vars to dispatching wrappers
+           (alter-var-root #'missionary.core/sleep (constantly sleep))
+           (alter-var-root #'missionary.core/timeout (constantly timeout))
+           (alter-var-root #'missionary.core/via-call (constantly via-call)))
+         (swap! determinism-state update :active-count inc)))
+     true))
 
-  #?(:clj
-     (defn ^:no-doc release-determinism!
-       "Release determinism context. Last caller restores original vars."
-       []
-       (locking determinism-lock
-         (swap! determinism-state update :active-count dec)
-         (let [state @determinism-state]
-           (when (zero? (:active-count state))
-             ;; Last releaser: restore originals
-             (alter-var-root #'missionary.core/sleep (constantly original-sleep))
-             (alter-var-root #'missionary.core/timeout (constantly original-timeout))
-             (alter-var-root #'missionary.core/via-call (constantly original-via-call)))))
-       nil))
+#?(:clj
+   (defn ^:no-doc release-determinism!
+     "Release determinism context. Last caller restores original vars."
+     []
+     (locking determinism-lock
+       (swap! determinism-state update :active-count dec)
+       (let [state @determinism-state]
+         (when (zero? (:active-count state))
+           ;; Last releaser: restore originals
+           (alter-var-root #'missionary.core/sleep (constantly original-sleep))
+           (alter-var-root #'missionary.core/timeout (constantly original-timeout))
+           (alter-var-root #'missionary.core/via-call (constantly original-via-call)))))
+     nil))
 
-  #?(:clj
-     (defmacro with-determinism
-       "Scope deterministic behavior to a test body by rebinding/redefining Missionary vars.
+#?(:clj
+   (defmacro with-determinism
+     "Scope deterministic behavior to a test body by rebinding/redefining Missionary vars.
 
      IMPORTANT: This macro is the entry point to deterministic behavior. All flows
      and tasks under test MUST be created inside the macro body (or by factory
@@ -1203,53 +1193,53 @@
 
      CONCURRENCY: Uses reference counting to make var rebinding safe for parallel test runs.
      Multiple tests can run concurrently - first acquires the rebindings, last restores originals."
-       [& body]
-       (let [cljs? (boolean &env)]
-         (if cljs?
-           ;; CLJS: single-threaded, use simple with-redefs
-           `(binding [*is-deterministic* true]
-              (with-redefs
-               [missionary.core/sleep sleep
-                missionary.core/timeout timeout]
-                ~@body))
-           ;; CLJ: use reference-counted var rebinding for parallel safety
-           `(do
-              (acquire-determinism!)
-              (try
-                (binding [*is-deterministic* true]
-                  ~@body)
-                (finally
-                  (release-determinism!))))))))
+     [& body]
+     (let [cljs? (boolean &env)]
+       (if cljs?
+         ;; CLJS: single-threaded, use simple with-redefs
+         `(binding [*is-deterministic* true]
+            (with-redefs
+             [missionary.core/sleep sleep
+              missionary.core/timeout timeout]
+              ~@body))
+         ;; CLJ: use reference-counted var rebinding for parallel safety
+         `(do
+            (acquire-determinism!)
+            (try
+              (binding [*is-deterministic* true]
+                ~@body)
+              (finally
+                (release-determinism!))))))))
 
-  ;; -----------------------------------------------------------------------------
-  ;; Flow determinism: scheduled-flow + spawn-flow!
-  ;; -----------------------------------------------------------------------------
+;; -----------------------------------------------------------------------------
+;; Flow determinism: scheduled-flow + spawn-flow!
+;; -----------------------------------------------------------------------------
 
-  (defn scheduled-flow
-    "Wrap a flow to marshal readiness/termination signals through the scheduler.
+(defn scheduled-flow
+  "Wrap a flow to marshal readiness/termination signals through the scheduler.
 
   (mt/scheduled-flow sched flow {:label ...})"
-    ([^TestScheduler sched flow]
-     (scheduled-flow sched flow {}))
-    ([^TestScheduler sched flow {:keys [label]}]
-     (fn [n t]
-       (let [wrap (fn [thunk kind]
-                    (fn []
-                      (enqueue-microtask!
-                       sched
-                       (fn [] (thunk))
-                       {:kind kind
-                        :label label
-                        :lane :default})))]
-         (flow (wrap n :flow/notifier)
-               (wrap t :flow/terminator))))))
+  ([^TestScheduler sched flow]
+   (scheduled-flow sched flow {}))
+  ([^TestScheduler sched flow {:keys [label]}]
+   (fn [n t]
+     (let [wrap (fn [thunk kind]
+                  (fn []
+                    (enqueue-microtask!
+                     sched
+                     (fn [] (thunk))
+                     {:kind kind
+                      :label label
+                      :lane :default})))]
+       (flow (wrap n :flow/notifier)
+             (wrap t :flow/terminator))))))
 
-  ;; -----------------------------------------------------------------------------
-  ;; Interleaving: trace extraction and replay
-  ;; -----------------------------------------------------------------------------
+;; -----------------------------------------------------------------------------
+;; Interleaving: trace extraction and replay
+;; -----------------------------------------------------------------------------
 
-  (defn trace->schedule
-    "Extract the sequence of task IDs from a trace for replay.
+(defn trace->schedule
+  "Extract the sequence of task IDs from a trace for replay.
   Returns a vector of task IDs [id1 id2 id3 ...] that can be used to replay
   the exact same execution order.
 
@@ -1258,13 +1248,13 @@
     ;; => [2 4 3]  ; bare task IDs
     ;; User can inspect/modify: [2 3 4]  ; different order
     (mt/replay-schedule (make-task) schedule)"
-    [trace]
-    (->> trace
-         (filter #(= :select-task (:event %)))
-         (mapv :selected-id)))
+  [trace]
+  (->> trace
+       (filter #(= :select-task (:event %)))
+       (mapv :selected-id)))
 
-  (defn replay-schedule
-    "Run a task with the exact schedule from a previous trace.
+(defn replay-schedule
+  "Run a task with the exact schedule from a previous trace.
   Returns the task result.
 
   IMPORTANT: Must be called inside a with-determinism body.
@@ -1273,21 +1263,21 @@
     (def original-trace (mt/trace sched))
     (with-determinism
       (mt/replay-schedule (make-task) (mt/trace->schedule original-trace)))"
-    ([task schedule]
-     (replay-schedule task schedule {}))
-    ([task schedule {:keys [trace? max-steps max-time-ms]
-                     :or {trace? true
-                          max-steps 100000
-                          max-time-ms 60000}}]
-     (when-not *is-deterministic*
-       (throw (ex-info "replay-schedule must be called inside with-determinism body"
-                       {:mt/kind ::replay-without-determinism})))
-     (let [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
-       (run sched task {:max-steps max-steps
-                        :max-time-ms max-time-ms}))))
+  ([task schedule]
+   (replay-schedule task schedule {}))
+  ([task schedule {:keys [trace? max-steps max-time-ms]
+                   :or {trace? true
+                        max-steps 100000
+                        max-time-ms 60000}}]
+   (when-not *is-deterministic*
+     (throw (ex-info "replay-schedule must be called inside with-determinism body"
+                     {:mt/kind ::replay-without-determinism})))
+   (let [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
+     (run sched task {:max-steps max-steps
+                      :max-time-ms max-time-ms}))))
 
-  (defn replay
-    "Replay a failure from check-interleaving.
+(defn replay
+  "Replay a failure from check-interleaving.
 
   IMPORTANT: Must be called inside a with-determinism body.
 
@@ -1305,44 +1295,44 @@
   - :max-time-ms - max virtual time (default 60000)
 
   Returns the task result (same as replay-schedule)."
-    ([task-fn failure]
-     (replay task-fn failure {}))
-    ([task-fn failure opts]
-     (let [schedule (or (:schedule failure)
-                        (throw (ex-info "Failure bundle missing :schedule"
-                                        {:mt/kind ::invalid-failure-bundle
-                                         :failure failure})))]
-       (replay-schedule (task-fn) schedule opts))))
+  ([task-fn failure]
+   (replay task-fn failure {}))
+  ([task-fn failure opts]
+   (let [schedule (or (:schedule failure)
+                      (throw (ex-info "Failure bundle missing :schedule"
+                                      {:mt/kind ::invalid-failure-bundle
+                                       :failure failure})))]
+     (replay-schedule (task-fn) schedule opts))))
 
 
-  ;; -----------------------------------------------------------------------------
-  ;; Interleaving: test helpers
-  ;; -----------------------------------------------------------------------------
+;; -----------------------------------------------------------------------------
+;; Interleaving: test helpers
+;; -----------------------------------------------------------------------------
 
-  (defn- default-base-seed []
-    #?(:clj (System/currentTimeMillis)
-       :cljs (.getTime (js/Date.))))
+(defn- default-base-seed []
+  #?(:clj (System/currentTimeMillis)
+     :cljs (.getTime (js/Date.))))
 
-  (defn- run-with-random-interleaving
-    "Run a task once with random selection seeded by test-seed. Returns map with result info.
+(defn- run-with-random-interleaving
+  "Run a task once with random selection seeded by test-seed. Returns map with result info.
   Internal helper for check-interleaving and explore-interleavings.
   Must be called inside a with-determinism body."
-    [task {:keys [test-seed max-steps max-time-ms]
-           :or {max-time-ms 60000}}]
-    (let [sched (make-scheduler {:trace? true
-                                 :seed test-seed})
-          result (try
-                   {:value (run sched task {:max-steps max-steps
-                                            :max-time-ms max-time-ms})}
-                   (catch #?(:clj Throwable :cljs :default) e
-                     {:error e}))]
-      {:result result
-       :seed test-seed
-       :micro-schedule (trace->schedule (trace sched))
-       :trace (trace sched)}))
+  [task {:keys [test-seed max-steps max-time-ms]
+         :or {max-time-ms 60000}}]
+  (let [sched (make-scheduler {:trace? true
+                               :seed test-seed})
+        result (try
+                 {:value (run sched task {:max-steps max-steps
+                                          :max-time-ms max-time-ms})}
+                 (catch #?(:clj Throwable :cljs :default) e
+                   {:error e}))]
+    {:result result
+     :seed test-seed
+     :micro-schedule (trace->schedule (trace sched))
+     :trace (trace sched)}))
 
-  (defn check-interleaving
-    "Run a task with many different interleavings to find failures.
+(defn check-interleaving
+  "Run a task with many different interleavings to find failures.
 
   IMPORTANT: Must be called inside a with-determinism body.
 
@@ -1373,36 +1363,36 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-    [task-fn {:keys [num-tests seed property max-steps max-time-ms]
-              :or {num-tests 100
-                   max-steps 10000
-                   max-time-ms 60000}}]
-    (let [base-seed (or seed (default-base-seed))]
-      (loop [i 0]
-        (if (>= i num-tests)
-          {:ok? true :seed base-seed :iterations-run num-tests}
-          (let [run-result (run-with-random-interleaving (task-fn)
-                                                         {:test-seed (+ base-seed i)
-                                                          :max-steps max-steps
-                                                          :max-time-ms max-time-ms})
-                {:keys [result seed micro-schedule trace]} run-result
-                exception? (some? (:error result))
-                property-failed? (and property
-                                      (not exception?)
-                                      (not (property (:value result))))]
-            (if (or exception? property-failed?)
-              {:ok? false
-               :kind (if exception? :exception :property-failed)
-               :seed seed
-               :schedule micro-schedule
-               :trace trace
-               :iteration i
-               :error (when exception? (:error result))
-               :value (when-not exception? (:value result))}
-              (recur (inc i))))))))
+  [task-fn {:keys [num-tests seed property max-steps max-time-ms]
+            :or {num-tests 100
+                 max-steps 10000
+                 max-time-ms 60000}}]
+  (let [base-seed (or seed (default-base-seed))]
+    (loop [i 0]
+      (if (>= i num-tests)
+        {:ok? true :seed base-seed :iterations-run num-tests}
+        (let [run-result (run-with-random-interleaving (task-fn)
+                                                       {:test-seed (+ base-seed i)
+                                                        :max-steps max-steps
+                                                        :max-time-ms max-time-ms})
+              {:keys [result seed micro-schedule trace]} run-result
+              exception? (some? (:error result))
+              property-failed? (and property
+                                    (not exception?)
+                                    (not (property (:value result))))]
+          (if (or exception? property-failed?)
+            {:ok? false
+             :kind (if exception? :exception :property-failed)
+             :seed seed
+             :schedule micro-schedule
+             :trace trace
+             :iteration i
+             :error (when exception? (:error result))
+             :value (when-not exception? (:value result))}
+            (recur (inc i))))))))
 
-  (defn explore-interleavings
-    "Explore different interleavings of a task and return a summary.
+(defn explore-interleavings
+  "Explore different interleavings of a task and return a summary.
 
   IMPORTANT: Must be called inside a with-determinism body.
 
@@ -1421,30 +1411,30 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-    [task-fn {:keys [num-samples seed max-steps]
-              :or {num-samples 100
-                   max-steps 10000}}]
-    (let [base-seed (or seed (default-base-seed))
-          results (for [i (range num-samples)
-                        :let [run-result (run-with-random-interleaving (task-fn)
-                                                                       {:test-seed (+ base-seed i)
-                                                                        :max-steps max-steps})
-                              ;; Extract value or return error map
-                              r (let [res (:result run-result)]
-                                  (if (:error res) res (:value res)))]]
-                    {:result r
-                     :micro-schedule (:micro-schedule run-result)})]
-      {:unique-results (count (distinct (map :result results)))
-       :results (vec results)
-       :seed base-seed}))
+  [task-fn {:keys [num-samples seed max-steps]
+            :or {num-samples 100
+                 max-steps 10000}}]
+  (let [base-seed (or seed (default-base-seed))
+        results (for [i (range num-samples)
+                      :let [run-result (run-with-random-interleaving (task-fn)
+                                                                     {:test-seed (+ base-seed i)
+                                                                      :max-steps max-steps})
+                            ;; Extract value or return error map
+                            r (let [res (:result run-result)]
+                                (if (:error res) res (:value res)))]]
+                  {:result r
+                   :micro-schedule (:micro-schedule run-result)})]
+    {:unique-results (count (distinct (map :result results)))
+     :results (vec results)
+     :seed base-seed}))
 
 
-  ;; -----------------------------------------------------------------------------
-  ;; Flow collection convenience
-  ;; -----------------------------------------------------------------------------
+;; -----------------------------------------------------------------------------
+;; Flow collection convenience
+;; -----------------------------------------------------------------------------
 
-  (defn collect
-    "Convenience: consume a flow into a task yielding a vector (or reduced value).
+(defn collect
+  "Convenience: consume a flow into a task yielding a vector (or reduced value).
 
   (mt/collect flow {:xf (take 10)
                     :timeout-ms 1000
@@ -1452,12 +1442,12 @@
 
   Notes:
   - If :timeout-ms is provided, wraps with mt/timeout and returns ::mt/timeout on expiry."
-    ([flow] (collect flow {}))
-    ([flow {:keys [xf timeout-ms]
-            :or {xf nil}}]
-     (let [f (if xf (m/eduction xf flow) flow)
-           t (m/reduce conj [] f)
-           t (if timeout-ms
-               (timeout t timeout-ms ::timeout)
-               t)]
-       t)))
+  ([flow] (collect flow {}))
+  ([flow {:keys [xf timeout-ms]
+          :or {xf nil}}]
+   (let [f (if xf (m/eduction xf flow) flow)
+         t (m/reduce conj [] f)
+         t (if timeout-ms
+             (timeout t timeout-ms ::timeout)
+             t)]
+     t)))

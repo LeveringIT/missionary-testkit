@@ -1319,3 +1319,49 @@
         ;; All results should be permutations of the 3 events
         (is (every? #(= (set %) #{:click :scroll :keypress}) results)
             "Each result should contain exactly the 3 events")))))
+
+;; =============================================================================
+;; Via Cancellation Tests
+;; =============================================================================
+;;
+;; The testkit patches m/via-call to run on the microtask queue instead of
+;; real executors. The via body runs synchronously once started.
+;;
+;; LIMITATION: In single-threaded deterministic mode, via body cannot be
+;; cancelled mid-work. Cancellation can only happen:
+;; 1. Before the body starts (at the initial microtask scheduling point)
+;; 2. After the body completes (result is discarded)
+;;
+;; The testkit does NOT use Thread.interrupt() - cancellation is cooperative.
+
+(deftest via-cancellation-test
+  (testing "via body runs to completion when not cancelled"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            execution-log (atom [])]
+        (mt/run sched
+                (m/sp
+                  (m/? (m/via m/cpu
+                         (swap! execution-log conj :step-1)
+                         (swap! execution-log conj :step-2)
+                         (swap! execution-log conj :step-3)
+                         :via-done))))
+        (is (= [:step-1 :step-2 :step-3] @execution-log)
+            "Via body should run to completion"))))
+
+  (testing "via cancellation before body starts - body never executes"
+    ;; When the race winner completes before via's microtask executes,
+    ;; the via body never runs
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            via-body-ran (atom false)]
+        (mt/run sched
+                (m/sp
+                  (m/? (m/race
+                         (m/via m/cpu
+                           (reset! via-body-ran true)
+                           :via-done)
+                         ;; Winner completes immediately via m/sp
+                         (m/sp :instant-winner)))))
+        (is (false? @via-body-ran)
+            "Via body should not execute when cancelled before microtask runs")))))
