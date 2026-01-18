@@ -134,8 +134,8 @@
 
   Options:
   {:initial-ms     0
-   :seed           nil | number        ; nil (default) = FIFO ordering
-                                       ; number = random ordering with that seed
+   :seed           nil | number        ; nil (default) = FIFO task selection
+                                       ; number = random selection with that seed
    :trace?         true|false
    :micro-schedule nil | vector        ; explicit selection decisions (overrides seed)
    :duration-range nil | [lower upper] ; virtual duration range for microtasks
@@ -143,11 +143,17 @@
                                        ; [lo hi] = random duration in [lo,hi]ms per task
    :timer-policy   :promote-first | :microtasks-first}
 
-  Ordering behavior:
-  - No seed (or nil): FIFO ordering for both timers and microtasks.
+  Task selection behavior:
+  - No seed (or nil): FIFO selection from the microtask queue.
     Predictable, good for unit tests with specific expected order.
-  - With seed: Random ordering (seeded RNG) for both timers and microtasks.
+  - With seed: Random selection from the microtask queue (seeded RNG).
     Deterministic but shuffled, good for fuzz/property testing.
+
+  Timer promotion:
+  - Timers are always promoted to the microtask queue in FIFO order (by id)
+    when their at-ms is reached.
+  - Random tie-breaking for same-time timers happens at selection time,
+    not at promotion time. This is captured in :select-task trace events.
 
   Duration behavior:
   - No duration-range (or nil): All microtasks complete instantly (0ms).
@@ -190,7 +196,7 @@
       (atom {:now-ms (long initial-ms)
              :next-id 0
              :micro-q empty-queue
-             ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
+             ;; timers: sorted-map keyed by [at-ms id] -> timer-map (FIFO within same at-ms)
              :timers (sorted-map)
              ;; trace is either nil or vector
              :trace (when trace? [])
@@ -310,12 +316,6 @@
      #?(:clj (if (some? cause) (ex-info msg data cause) (ex-info msg data))
         :cljs (ex-info msg data)))))
 
-(defn- seeded-tie
-  "Deterministic tie-break value for :seeded policy.
-  Uses arithmetic kept well within 2^53 for CLJS stability."
-  [seed order]
-  (let [x (+ (* 1664525 (long order)) (long seed))]
-    (long (mod x 4294967296)))) ; 2^32
 
 (defn- rand-in-range
   "Generate a random integer in [lo, hi] inclusive using RNG state.
@@ -408,7 +408,10 @@
      id)))
 
 (defn- schedule-timer!
-  "Schedule f to run at now+delay-ms as a timer; returns a cancellation token."
+  "Schedule f to run at now+delay-ms as a timer; returns a cancellation token.
+  Timers are stored in a sorted-map keyed by [at-ms id] for FIFO ordering
+  among timers with the same at-ms. Random tie-breaking happens at selection
+  time from the microtask queue, not at promotion time."
   ([^TestScheduler sched delay-ms f] (schedule-timer! sched delay-ms f {}))
   ([^TestScheduler sched delay-ms f {:keys [label kind lane]
                                      :or {kind :timer
@@ -420,13 +423,7 @@
             (fn [s]
               (let [now (:now-ms s)
                     at-ms (+ now (long delay-ms))
-                    order id
-                    ;; Timer tie-breaking: seeded only when doing random exploration
-                    ;; (seed provided but no explicit micro-schedule), otherwise FIFO
-                    tie (if (and (:seed sched) (not (:micro-schedule sched)))
-                          (seeded-tie (:seed sched) order)
-                          order)
-                    k [at-ms tie order id]
+                    k [at-ms id]
                     t {:id id
                        :kind kind
                        :label label

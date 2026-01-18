@@ -200,7 +200,7 @@ The scheduler manages virtual time and a queue of pending tasks:
 
 ```clojure
 (def sched (mt/make-scheduler {:initial-ms      0         ; starting time
-                                :seed            42        ; seed for random ordering (nil = FIFO)
+                                :seed            42        ; seed for random task selection (nil = FIFO)
                                 :trace?          true      ; enable execution trace
                                 :micro-schedule  nil       ; explicit decisions (see Schedule Decisions)
                                 :duration-range  [10 50]   ; virtual duration [lo hi] for yield/via-call
@@ -211,9 +211,13 @@ The scheduler manages virtual time and a queue of pending tasks:
 (mt/trace sched)    ; => [{:event :enqueue-timer ...} ...]
 ```
 
-**Ordering behavior:**
-- **No seed (default):** FIFO ordering for both timers and microtasks. Predictable, good for unit tests.
-- **With seed:** Random ordering (seeded RNG) for both timers and microtasks. Deterministic but shuffled, good for fuzz/property testing.
+**Task selection behavior:**
+- **No seed (default):** FIFO selection from the microtask queue. Predictable, good for unit tests.
+- **With seed:** Random selection from the microtask queue (seeded RNG). Deterministic but shuffled, good for fuzz/property testing.
+
+**Timer promotion:**
+- Timers are always promoted to the microtask queue in FIFO order (by id) when their `at-ms` is reached.
+- Random tie-breaking for same-time timers happens at selection time, not promotion time. This is captured in `:select-task` trace events.
 
 **Virtual task duration:**
 - **No duration-range (default):** All user work completes instantly (0ms virtual time).
@@ -229,11 +233,11 @@ The scheduler manages virtual time and a queue of pending tasks:
 - During replay, schedule + seed + duration-range produces identical behavior.
 
 ```clojure
-;; FIFO ordering (default) - predictable for unit tests
+;; FIFO selection (default) - predictable for unit tests
 (mt/make-scheduler)
 (mt/make-scheduler {:trace? true})
 
-;; Random ordering - for exploring interleavings
+;; Random selection - for exploring interleavings
 (mt/make-scheduler {:seed 42})
 ```
 
@@ -666,8 +670,8 @@ Schedules control task selection when the queue has multiple ready tasks. Schedu
 ```
 
 **Run-time selection** (when no explicit schedule):
-- No seed: FIFO ordering (first in, first out)
-- With seed: Random ordering (deterministic via seed)
+- No seed: FIFO selection (first in, first out)
+- With seed: Random selection (deterministic via seed)
 
 ### Manual Stepping
 
@@ -832,7 +836,7 @@ The scheduler automatically detects common problems:
 - `(trace sched)` - execution trace (if enabled)
 
 ### Time Control
-- `(step! sched)` - run one microtask (FIFO/random selection), returns `::mt/idle` if none
+- `(step! sched)` - run one microtask (FIFO or random selection based on seed), returns `::mt/idle` if none
 - `(step! sched task-id)` - run specific microtask by ID (for manual stepping)
 - `(tick! sched)` - run all microtasks at current time, returns count
 - `(advance! sched dt-ms)` - advance by delta, run due tasks
