@@ -110,7 +110,7 @@ Add to your `deps.edn`:
 
 ### The `with-determinism` Entry Point
 
-**IMPORTANT:** The `with-determinism` macro is the entry point to all deterministic behavior. All flows and tasks under test **must** be created inside the macro body (or by factory functions called from within the body).
+**IMPORTANT:** The `with-determinism` macro is the entry point to all deterministic behavior. All flows and tasks under test **must** be both created **and** executed inside the macro body. Tasks can be created directly in the body or by factory functions called from within the body.
 
 ```clojure
 ;; ✅ CORRECT: Task created inside with-determinism
@@ -137,11 +137,24 @@ Add to your `deps.edn`:
 (mt/with-determinism
   (let [sched (mt/make-scheduler)]
     (mt/run sched my-task)))  ; m/sleep was captured at def time, NOT virtualized!
+
+;; ❌ WRONG: Task created inside but executed OUTSIDE with-determinism
+(def my-task
+  (mt/with-determinism
+    (m/sp (m/? (m/sleep 100)) :done)))  ; Created inside...
+
+(let [sched (mt/make-scheduler)]
+  (mt/run sched my-task))  ; ...but executed outside! Uses real time.
 ```
 
-**Why this matters:** The `with-determinism` macro rebinds `m/sleep`, `m/timeout`, and the executors (`m/cpu`, `m/blk`) to their virtual-time equivalents. If you create a task *before* entering the macro, those tasks capture the *real* versions of these primitives, and your tests will use real time instead of virtual time—defeating the purpose of the testkit.
+**Why this matters:** The `with-determinism` macro rebinds `m/sleep`, `m/timeout`, and the executors (`m/cpu`, `m/blk`) to their virtual-time equivalents. Tasks must be both created **and** executed inside `with-determinism`:
 
-All flows, tasks, and atoms that you test must be created and modified inside `with-determinism` to ensure proper scheduling.
+- If you create a task *before* entering the macro, the task captures the *real* versions of these primitives
+- If you execute a task *outside* the macro, the scheduler won't have access to the virtual time bindings
+
+Either case causes your tests to use real time instead of virtual time—defeating the purpose of the testkit.
+
+All flows, tasks, and atoms that you test must be created, modified, and executed inside `with-determinism` to ensure proper scheduling.
 
 ### Checking Deterministic Mode
 
@@ -672,7 +685,7 @@ The scheduler automatically detects common problems:
 
 ## Common Pitfalls
 
-### 1. Tasks created outside `with-determinism`
+### 1. Tasks created or executed outside `with-determinism`
 
 ```clojure
 ;; ❌ WRONG: Task captures real m/sleep at def time
@@ -682,7 +695,15 @@ The scheduler automatically detects common problems:
   (let [sched (mt/make-scheduler)]
     (mt/run sched my-task)))  ; Uses REAL time, not virtual!
 
-;; ✅ CORRECT: Use a factory function
+;; ❌ WRONG: Task created inside but executed outside
+(def my-task
+  (mt/with-determinism
+    (m/sp (m/? (m/sleep 100)) :done)))
+
+(let [sched (mt/make-scheduler)]
+  (mt/run sched my-task))  ; Uses REAL time, not virtual!
+
+;; ✅ CORRECT: Use a factory function, create AND execute inside
 (defn make-task [] (m/sp (m/? (m/sleep 100)) :done))
 
 (mt/with-determinism
@@ -797,7 +818,7 @@ The scheduler automatically detects common problems:
 - `*is-deterministic*` - `true` when inside `with-determinism` scope
 
 ### Integration Macro
-- `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be created inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point)). `run` and `start!` automatically bind `*scheduler*` to the passed scheduler.
+- `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be both created and executed inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point)). `run` and `start!` automatically bind `*scheduler*` to the passed scheduler.
 
 ### Interleaving (Concurrency Testing)
 - `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:ok? true :seed s ...}` or `{:ok? false :kind ... :schedule ... :seed s ...}`.

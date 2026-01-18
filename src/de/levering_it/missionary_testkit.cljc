@@ -67,6 +67,7 @@
 
 (def ^:const illegal-blocking-emission ::illegal-blocking-emission)
 (def ^:const illegal-transfer ::illegal-transfer)
+(def ^:const microtask-exception ::microtask-exception)
 
 ;; -----------------------------------------------------------------------------
 ;; Dynamic scheduler binding
@@ -539,8 +540,22 @@
               [mt q' new-rng] (select-from-queue q decision (:rng-state s-after))]
           [mt q' decision new-rng s-after])))))
 
+(defn- promote-due-timers!
+  "Promote all timers due at current time to microtask queue."
+  [^TestScheduler sched]
+  (let [state-atom (:state sched)]
+    (loop []
+      (let [s @state-atom
+            s' (promote-due-timers-in-state sched s)]
+        (when-not (identical? s s')
+          (when-not (compare-and-set! state-atom s s')
+            (recur)))))))
+
 (defn step!
   "Run exactly 1 microtask. Returns ::idle if no microtasks.
+
+  Timers due at the current time are automatically promoted to microtasks
+  before selection.
 
   (step! sched)        - select next task per schedule/FIFO/random
   (step! sched task-id) - run specific task by ID (for manual stepping)
@@ -550,6 +565,8 @@
   ([^TestScheduler sched task-id]
    (ensure-driver-thread! sched "step!")
    (binding [*scheduler* sched]
+     ;; Promote due timers before checking microtask queue
+     (promote-due-timers! sched)
      (let [state-atom (:state sched)]
        (loop []
          (let [s @state-atom
@@ -577,11 +594,29 @@
                                               :lane (:lane mt)
                                               :now-ms now}))]
                (if (compare-and-set! state-atom s s')
-                 (do ((:f mt)) mt)
+                 (do
+                   (try
+                     ((:f mt))
+                     (catch #?(:clj Throwable :cljs :default) e
+                       (throw (ex-info (str "Microtask threw: " (ex-message e))
+                                       (cond-> {:mt/kind ::microtask-exception
+                                                :mt/now-ms now
+                                                :mt/task {:id (:id mt)
+                                                          :kind (:kind mt)
+                                                          :label (:label mt)
+                                                          :lane (:lane mt)}
+                                                :mt/pending (pending sched)}
+                                         (:trace? sched)
+                                         (assoc :mt/recent-trace (vec (take-last 10 (trace sched)))))
+                                       e))))
+                   mt)
                  (recur))))))))))
 
 (defn tick!
   "Drain all microtasks at current virtual time. Returns number of microtasks executed.
+
+  Timers due at the current time are automatically promoted to microtasks
+  before draining (via step!).
 
   Binds *scheduler* to sched for the duration of execution."
   [^TestScheduler sched]
@@ -893,18 +928,19 @@
           (finish! :failure e)
           (reset! cancel-child (fn [] nil))))
 
-      ;; Start timer
-      (reset! timer-token
-              (schedule-timer!
-               sched (long ms)
-               (fn []
-                 (when (compare-and-set! done? false true)
-                   ;; timeout fired first -> cancel child and succeed with fallback
-                   (when-let [c @cancel-child]
-                     (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
-                   (s x)))
-               {:kind :timeout/timer
-                :label "timeout-timer"}))
+      ;; Start timer only if child didn't already complete (e.g., threw on start)
+      (when-not @done?
+        (reset! timer-token
+                (schedule-timer!
+                 sched (long ms)
+                 (fn []
+                   (when (compare-and-set! done? false true)
+                     ;; timeout fired first -> cancel child and succeed with fallback
+                     (when-let [c @cancel-child]
+                       (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
+                     (s x)))
+                 {:kind :timeout/timer
+                  :label "timeout-timer"})))
 
       ;; cancellation thunk
       (fn cancel []

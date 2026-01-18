@@ -5,12 +5,12 @@ A: core=TestScheduler(state:atom) ; edge={public-api,macros} ; infra={build,cloj
 E: ns=de.levering-it.missionary-testkit as mt ; build-ns=build
 D: state{:now-ms :next-id :micro-q :timers :trace :driver-thread :schedule-idx :rng-state} ; timer-order∈{:fifo,:seeded} ; seed≠0⇒:seeded(default) ; seed=0⇒:fifo(default) ; schedule=nil|vec(task-ids) ; schedule-format=[id1 id2 id3] (bare ints)
 X: model=micro-q(FIFO) + timers(sorted-map[at tie order id]→timer) ; time=virtual(manual) ; strict⇒1-driver-thread
-Δ: timers→promote(now>=at)→micro-q ; microtask→may enqueue ; completion→via micro-q ; schedule⇒override(>1 item)
+Δ: timers→promote(now>=at)→micro-q ; microtask→may enqueue ; completion→via micro-q ; schedule⇒override(>1 item) ; step!/tick!⇒auto-promote
 T: cmd=clojure -M:test -m cognitect.test-runner ; reload-before-test=require:reload ; cover≈32t/176a
 M: tools={Clojure-edit,Clojure-eval} ; struct≻str ; light⇒paren✓post ; miss<5%⇒form(type+name)
 S: if≻cond1 ; cond≻if(n>1) ; if-let|when-let≻let+if ; ->|->>≻lets ; nil≻flag-obj ; ¬comments
 V: vars{*scheduler* *is-deterministic*} ; *is-deterministic*=bool(not fn)
-E!: ex-data[:mt/kind]∈{::deadlock ::budget-exceeded ::off-scheduler-callback ::illegal-transfer ::no-scheduler ::replay-without-determinism ::task-id-not-found ::unknown-decision} ; ::idle=return
+E!: ex-data[:mt/kind]∈{::deadlock ::budget-exceeded ::off-scheduler-callback ::illegal-transfer ::no-scheduler ::replay-without-determinism ::task-id-not-found ::unknown-decision ::microtask-exception} ; ::idle=return
 API:
   make=(make-scheduler [opts])
   read=(now-ms pending trace clock next-tasks next-event)
@@ -29,4 +29,4 @@ CMD: repl=clojure -M:nrepl ; build=clojure -T:build ci ; deploy=clojure -T:build
 SAFE: read-only={now-ms pending trace clock done?}
 MUT: advances={step! tick! advance! advance-to! run start! cancel!}
 FS: src=src/de/levering_it/missionary_testkit.cljc ; test=test/de/levering_it/missionary_testkit_test.clj ; build=build.clj ; ex=examples/*.clj
-R: Δ1=schedule-format:bare-ids ; Δ2=+next-tasks ; Δ3=step!:2-arity(task-id) ; Δ4=+manual_schedule.clj ; Δ5=refactor:select-and-remove-task ; Δ6=cancel→sync(sleep,yield,timeout)
+R: Δ1=schedule-format:bare-ids ; Δ2=+next-tasks ; Δ3=step!:2-arity(task-id) ; Δ4=+manual_schedule.clj ; Δ5=refactor:select-and-remove-task ; Δ6=cancel→sync(sleep,yield,timeout) ; Δ7=docs:with-determinism(create+execute) ; Δ8=step!/tick!:auto-promote-due-timers ; Δ9=fix:timeout-timer-leak-on-child-throw ; Δ10=step!:wrap-microtask-exceptions
