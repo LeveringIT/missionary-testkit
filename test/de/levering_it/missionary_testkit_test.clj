@@ -836,6 +836,46 @@
         (is (every? #(contains? % :micro-schedule) (:results result)))
         (is (every? #(contains? % :result) (:results result)))))))
 
+(deftest check-interleaving-requires-determinism-test
+  (testing "check-interleaving throws when called outside with-determinism"
+    (let [task-fn (fn [] (m/sp :done))]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"check-interleaving must be called inside mt/with-determinism body"
+           (mt/check-interleaving task-fn {:num-tests 1 :seed 42})))
+      ;; Verify the exception has the right kind
+      (try
+        (mt/check-interleaving task-fn {:num-tests 1})
+        (catch clojure.lang.ExceptionInfo e
+          (is (= ::mt/not-in-deterministic-mode (:mt/kind (ex-data e))))
+          (is (= "check-interleaving" (:fn (ex-data e))))))))
+
+  (testing "check-interleaving works inside with-determinism"
+    (mt/with-determinism
+      (let [task-fn (fn [] (m/sp :done))
+            result (mt/check-interleaving task-fn {:num-tests 3 :seed 42})]
+        (is (:ok? result))))))
+
+(deftest explore-interleavings-requires-determinism-test
+  (testing "explore-interleavings throws when called outside with-determinism"
+    (let [task-fn (fn [] (m/sp :done))]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"explore-interleavings must be called inside mt/with-determinism body"
+           (mt/explore-interleavings task-fn {:num-samples 1 :seed 42})))
+      ;; Verify the exception has the right kind
+      (try
+        (mt/explore-interleavings task-fn {:num-samples 1})
+        (catch clojure.lang.ExceptionInfo e
+          (is (= ::mt/not-in-deterministic-mode (:mt/kind (ex-data e))))
+          (is (= "explore-interleavings" (:fn (ex-data e))))))))
+
+  (testing "explore-interleavings works inside with-determinism"
+    (mt/with-determinism
+      (let [task-fn (fn [] (m/sp :done))
+            result (mt/explore-interleavings task-fn {:num-samples 3 :seed 42})]
+        (is (= 3 (count (:results result))))))))
+
 (deftest select-task-trace-event-test
   (testing "select-task events are traced when queue has multiple items"
     (mt/with-determinism

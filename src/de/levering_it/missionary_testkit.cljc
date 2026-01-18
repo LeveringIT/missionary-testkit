@@ -68,6 +68,7 @@
 (def ^:const illegal-blocking-emission ::illegal-blocking-emission)
 (def ^:const illegal-transfer ::illegal-transfer)
 (def ^:const microtask-exception ::microtask-exception)
+(def ^:const not-in-deterministic-mode ::not-in-deterministic-mode)
 
 ;; -----------------------------------------------------------------------------
 ;; Dynamic scheduler binding
@@ -87,6 +88,17 @@
   ([msg]
    (or *scheduler*
        (throw (ex-info msg {:mt/kind ::no-scheduler})))))
+
+(defn- require-deterministic-mode!
+  "Throw if not inside with-determinism scope. Used by functions that require
+  deterministic mode to work correctly (e.g., check-interleaving)."
+  [fn-name]
+  (when-not *is-deterministic*
+    (throw (ex-info (str fn-name " must be called inside mt/with-determinism body. "
+                         "Without with-determinism, m/sleep and m/timeout use real time, "
+                         "breaking deterministic interleaving exploration.")
+                    {:mt/kind ::not-in-deterministic-mode
+                     :fn fn-name}))))
 
 ;; -----------------------------------------------------------------------------
 ;; Cross-platform queue helpers
@@ -347,13 +359,13 @@
   Used by yield and via-call to assign durations to user work."
   [^TestScheduler sched]
   (if-let [[lo hi] (:duration-range sched)]
-    (let [result (atom nil)]
-      (swap! (:state sched)
-             (fn [s]
-               (let [[duration new-rng] (rand-in-range (:rng-duration s) lo hi)]
-                 (reset! result duration)
-                 (assoc s :rng-duration new-rng))))
-      @result)
+    (let [state-atom (:state sched)]
+      (loop []
+        (let [s @state-atom
+              [duration new-rng] (rand-in-range (:rng-duration s) lo hi)]
+          (if (compare-and-set! state-atom s (assoc s :rng-duration new-rng))
+            duration
+            (recur)))))
     0))
 
 (defn- next-id!
@@ -432,30 +444,28 @@
                                           lane :default}}]
    (ensure-driver-thread! sched "schedule-timer!")
    (let [id (next-id! sched)
-         token (atom nil)]
+         now (:now-ms @(:state sched))
+         at-ms (+ now (long delay-ms))
+         k [at-ms id]
+         t {:id id
+            :kind kind
+            :label label
+            :lane lane
+            :at-ms at-ms
+            :key k
+            :f f}]
      (swap! (:state sched)
             (fn [s]
-              (let [now (:now-ms s)
-                    at-ms (+ now (long delay-ms))
-                    k [at-ms id]
-                    t {:id id
-                       :kind kind
-                       :label label
-                       :lane lane
-                       :at-ms at-ms
-                       :key k
-                       :f f}]
-                (reset! token k)
-                (-> s
-                    (update :timers assoc k t)
-                    (maybe-trace-state {:event :enqueue-timer
-                                        :id id
-                                        :at-ms at-ms
-                                        :kind kind
-                                        :label label
-                                        :lane lane
-                                        :now-ms now})))))
-     @token)))
+              (-> s
+                  (update :timers assoc k t)
+                  (maybe-trace-state {:event :enqueue-timer
+                                      :id id
+                                      :at-ms at-ms
+                                      :kind kind
+                                      :label label
+                                      :lane lane
+                                      :now-ms now}))))
+     k)))
 
 (defn- cancel-timer!
   [^TestScheduler sched timer-token]
@@ -504,24 +514,25 @@
   store the microtask ID and want to cancel before execution."
   [^TestScheduler sched microtask-id]
   (ensure-driver-thread! sched "cancel-microtask!")
-  (let [found? (atom false)]
-    (swap! (:state sched)
-           (fn [s]
-             (let [q (:micro-q s)
-                   v (vec (seq q))
-                   idx (first (keep-indexed (fn [i mt] (when (= microtask-id (:id mt)) i)) v))]
-               (if idx
-                 (let [mt (nth v idx)]
-                   (reset! found? true)
-                   (-> s
+  (let [state-atom (:state sched)]
+    (loop []
+      (let [s @state-atom
+            q (:micro-q s)
+            v (vec (seq q))
+            idx (first (keep-indexed (fn [i mt] (when (= microtask-id (:id mt)) i)) v))]
+        (if idx
+          (let [mt (nth v idx)
+                s' (-> s
                        (assoc :micro-q (remove-microtask-by-id q microtask-id))
                        (maybe-trace-state {:event :cancel-microtask
                                            :id microtask-id
                                            :kind (:kind mt)
                                            :label (:label mt)
-                                           :now-ms (:now-ms s)})))
-                 s))))
-    @found?))
+                                           :now-ms (:now-ms s)}))]
+            (if (compare-and-set! state-atom s s')
+              true
+              (recur)))
+          false)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Queue selection for interleaving
@@ -779,8 +790,7 @@
 (defn- complete-one-in-flight!
   "Complete a single in-flight task. Returns the task or nil if none ready."
   [^TestScheduler sched]
-  (let [state-atom (:state sched)
-        result (atom nil)]
+  (let [state-atom (:state sched)]
     (loop []
       (let [s @state-atom]
         (when-let [[key mt] (next-in-flight-completion s)]
@@ -801,9 +811,8 @@
                                       (:trace? sched)
                                       (assoc :mt/recent-trace (vec (take-last 10 (trace sched)))))
                                     e))))
-                (reset! result mt))
-              (recur))))))
-    @result))
+                mt)
+              (recur))))))))
 
 (defn- start-task-in-flight!
   "Start a task as in-flight (with duration > 0). Returns the task."
@@ -918,22 +927,20 @@
              (if (q-empty? available-q)
                ;; No tasks can start - either queue empty or all lanes full
                idle
-               (let [[mt q' decision new-rng s-after] (select-and-remove-task sched s q task-id)
+               ;; Select from available-q (tasks with lane capacity), but remove from original q
+               (let [[mt _ decision new-rng s-after] (select-and-remove-task sched s available-q task-id)
+                     q' (remove-microtask-by-id q (:id mt))
                      duration (:duration-ms mt 0)]
-                 ;; Check if selected task's lane has capacity
-                 (if-not (lane-has-capacity? sched s (:lane mt))
-                   ;; Lane full - can't start this task
-                   idle
-                   ;; Lane has capacity - start or run the task
-                   (if (pos? duration)
-                     ;; Task has duration: start as in-flight
-                     (if-let [result (start-task-in-flight! sched s mt q' decision new-rng s-after)]
-                       result
-                       (recur))
-                     ;; No duration: run immediately (backward compatible)
-                     (if-let [result (run-task-immediately! sched s mt q' decision new-rng s-after)]
-                       result
-                       (recur)))))))))))))
+                 ;; Lane has capacity (guaranteed by available-q filter) - start or run the task
+                 (if (pos? duration)
+                   ;; Task has duration: start as in-flight
+                   (if-let [result (start-task-in-flight! sched s mt q' decision new-rng s-after)]
+                     result
+                     (recur))
+                   ;; No duration: run immediately (backward compatible)
+                   (if-let [result (run-task-immediately! sched s mt q' decision new-rng s-after)]
+                     result
+                     (recur))))))))))))
 
 (defn tick!
   "Drain all microtasks at current virtual time. Returns number of microtasks executed.
@@ -1672,9 +1679,7 @@
   ([task schedule]
    (replay-schedule task schedule {}))
   ([task schedule opts]
-   (when-not *is-deterministic*
-     (throw (ex-info "replay-schedule must be called inside with-determinism body"
-                     {:mt/kind ::replay-without-determinism})))
+   (require-deterministic-mode! "replay-schedule")
    (let [sched (make-scheduler (assoc opts :micro-schedule schedule))]
      (run sched task (select-keys opts [:max-steps :max-time-ms])))))
 
@@ -1784,6 +1789,7 @@
                  initial-ms 0
                  timer-policy :promote-first
                  cpu-threads 8}}]
+  (require-deterministic-mode! "check-interleaving")
   (let [base-seed (or seed (default-base-seed))]
     (loop [i 0]
       (if (>= i num-tests)
@@ -1850,6 +1856,7 @@
                  max-steps 10000
                  timer-policy :promote-first
                  cpu-threads 8}}]
+  (require-deterministic-mode! "explore-interleavings")
   (let [base-seed (or seed (default-base-seed))
         results (for [i (range num-samples)
                       :let [run-result (run-with-random-interleaving (task-fn)
