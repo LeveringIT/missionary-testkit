@@ -3,8 +3,8 @@
 C: purpose=deterministic-testkit|missionary-async ; elim={real-time,rand,nondet} ; prod
 A: core=TestScheduler(state:atom) ; edge={public-api,macros} ; infra={build,clojars,nrepl}
 E: ns=de.levering-it.missionary-testkit as mt ; build-ns=build
-D: state{:now-ms :next-id :micro-q :timers :trace :driver-thread :schedule-idx :rng-state} ; timer-order∈{:fifo,:seeded} ; seed≠0⇒:seeded(default) ; seed=0⇒:fifo(default) ; schedule=nil|vec(task-ids) ; schedule-format=[id1 id2 id3] (bare ints) ; duration-range=nil|[lo,hi]
-X: model=micro-q(FIFO) + timers(sorted-map[at tie order id]→timer) ; time=virtual(manual) ; strict⇒1-driver-thread ; microtask{:duration-ms}
+D: state{:now-ms :next-id :micro-q :timers :trace :driver-thread :schedule-idx :rng-state} ; timer-order∈{:fifo,:seeded} ; seed≠0⇒:seeded(default) ; seed=0⇒:fifo(default) ; schedule=nil|vec(task-ids) ; schedule-format=[id1 id2 id3] (bare ints) ; duration-range=nil|[lo,hi]⇒yield/via-call-only
+X: model=micro-q(FIFO) + timers(sorted-map[at tie order id]→timer) ; time=virtual(manual) ; strict⇒1-driver-thread ; duration-ms⇒yield+via-call(user-work) ; infra-microtasks⇒0ms
 Δ: timers→promote(now>=at)→micro-q ; microtask→may enqueue ; completion→via micro-q ; schedule⇒override(>1 item) ; step!/tick!⇒auto-promote ; step!→advance-time-by-duration→promote-due-timers→exec
 T: cmd=clojure -M:test -m cognitect.test-runner ; reload-before-test=require:reload ; cover≈32t/176a
 M: tools={Clojure-edit,Clojure-eval} ; struct≻str ; light⇒paren✓post ; miss<5%⇒form(type+name)
@@ -29,4 +29,4 @@ CMD: repl=clojure -M:nrepl ; build=clojure -T:build ci ; deploy=clojure -T:build
 SAFE: read-only={now-ms pending trace clock done?}
 MUT: advances={step! tick! advance! advance-to! run start! cancel!}
 FS: src=src/de/levering_it/missionary_testkit.cljc ; test=test/de/levering_it/missionary_testkit_test.clj ; build=build.clj ; ex=examples/*.clj
-R: Δ1=schedule-format:bare-ids ; Δ2=+next-tasks ; Δ3=step!:2-arity(task-id) ; Δ4=+manual_schedule.clj ; Δ5=refactor:select-and-remove-task ; Δ6=cancel→sync(sleep,yield,timeout) ; Δ7=docs:with-determinism(create+execute) ; Δ8=step!/tick!:auto-promote-due-timers ; Δ9=fix:timeout-timer-leak-on-child-throw ; Δ10=step!:wrap-microtask-exceptions ; Δ11=+duration-range:virtual-task-duration ; Δ12=yield:opts{:duration-fn}
+R: Δ1=schedule-format:bare-ids ; Δ2=+next-tasks ; Δ3=step!:2-arity(task-id) ; Δ4=+manual_schedule.clj ; Δ5=refactor:select-and-remove-task ; Δ6=cancel→sync(sleep,yield,timeout) ; Δ7=docs:with-determinism(create+execute) ; Δ8=step!/tick!:auto-promote-due-timers ; Δ9=fix:timeout-timer-leak-on-child-throw ; Δ10=step!:wrap-microtask-exceptions ; Δ11=+duration-range:virtual-task-duration ; Δ12=yield:opts{:duration-fn} ; Δ13=duration-range⇒yield+via-call-only(user-work)

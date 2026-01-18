@@ -108,7 +108,7 @@ Add to your `deps.edn`:
 
 ### Testing Realistic Timeout Races
 
-By default, microtasks complete instantly (0ms). Use `:duration-range` to give tasks realistic virtual durations, enabling timeout races where work competes with deadlines:
+By default, user work (`yield`, `via-call`) completes instantly (0ms). Use `:duration-range` to give these operations realistic virtual durations, enabling timeout races where work competes with deadlines:
 
 ```clojure
 (mt/with-determinism
@@ -126,6 +126,8 @@ By default, microtasks complete instantly (0ms). Use `:duration-range` to give t
                :timed-out))))))
 ;; => :timed-out (work takes 30ms, timeout fires at 25ms)
 ```
+
+Only `yield` and `via-call` get durations from `:duration-range` - these represent user work. Infrastructure microtasks (timer callbacks, job completion) always complete instantly.
 
 With different seeds, the race outcome may differ because task selection order affects which completes first when both are ready.
 
@@ -201,7 +203,7 @@ The scheduler manages virtual time and a queue of pending tasks:
                                 :seed            42        ; seed for random ordering (nil = FIFO)
                                 :trace?          true      ; enable execution trace
                                 :micro-schedule  nil       ; explicit decisions (see Schedule Decisions)
-                                :duration-range  [10 50]}))  ; virtual task duration range [lo hi]
+                                :duration-range  [10 50]}))  ; virtual duration [lo hi] for yield/via-call
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
 (mt/pending sched)  ; => {:microtasks [...] :timers [...]}
@@ -213,8 +215,8 @@ The scheduler manages virtual time and a queue of pending tasks:
 - **With seed:** Random ordering (seeded RNG) for both timers and microtasks. Deterministic but shuffled, good for fuzz/property testing.
 
 **Virtual task duration:**
-- **No duration-range (default):** All microtasks complete instantly (0ms virtual time).
-- **With duration-range:** Each microtask takes a pseudo-random virtual duration between `[lo hi]` (inclusive). This enables realistic timeout testing where work can take varying amounts of time.
+- **No duration-range (default):** All user work completes instantly (0ms virtual time).
+- **With duration-range:** Each `yield` and `via-call` (user work) takes a pseudo-random virtual duration between `[lo hi]` (inclusive). This enables realistic timeout testing where work can take varying amounts of time. Infrastructure microtasks (job completion, timer callbacks, etc.) always complete instantly.
 
 ```clojure
 ;; FIFO ordering (default) - predictable for unit tests

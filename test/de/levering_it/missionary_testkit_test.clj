@@ -1390,6 +1390,7 @@
     ;; Time advances BEFORE a microtask's continuation executes.
     ;; So: yield enqueues continuation → time advances by duration → continuation runs
     ;; When we observe time right after yield returns, time has already passed.
+    ;; Note: Only yield and via-call get durations; job completion is infrastructure (0ms).
     (mt/with-determinism
       (let [sched (mt/make-scheduler {:duration-range [10 10] :seed 42})
             times (atom [])]
@@ -1404,7 +1405,7 @@
         (is (= 0 (first @times)) "First observation at t=0")
         (is (= 10 (second @times)) "Second observation at t=10 (after first yield)")
         (is (= 20 (nth @times 2)) "Third observation at t=20 (after second yield)")
-        (is (= 30 (mt/now-ms sched)) "Final time is 30ms (3 microtasks × 10ms each)"))))
+        (is (= 20 (mt/now-ms sched)) "Final time is 20ms (2 yields × 10ms each)"))))
 
   (testing "duration-range generates varied durations with seed"
     (mt/with-determinism
@@ -1416,13 +1417,15 @@
                   (m/? (mt/yield))
                   :done))
         (let [trace (mt/trace sched)
+              ;; Only yields get durations from duration-range; filter by :kind :yield
               durations (->> trace
-                             (filter #(= :enqueue-microtask (:event %)))
+                             (filter #(and (= :enqueue-microtask (:event %))
+                                           (= :yield (:kind %))))
                              (map :duration-ms))]
-          ;; Should have multiple microtasks with durations in range
-          (is (seq durations))
+          ;; Should have 3 yields with durations in range
+          (is (= 3 (count durations)) "Should have exactly 3 yield microtasks")
           (is (every? #(and (>= % 1) (<= % 100)) durations)
-              "All durations should be within [1, 100]"))))))
+              "All yield durations should be within [1, 100]"))))))
 
 (deftest duration-range-timer-promotion-test
   (testing "duration advance promotes due timers"
@@ -1460,9 +1463,9 @@
     ;; When work duration > timeout, the timer becomes due during the work's duration.
     ;; After duration advances, both the timer callback and work-success callback
     ;; are in the queue. The outcome depends on which is selected first.
-    ;; With seed 0, timeout wins; with seed 42, work wins.
+    ;; With seed 1, timeout wins; with seed 0, work wins.
     (mt/with-determinism
-      (let [sched (mt/make-scheduler {:duration-range [100 100] :seed 0})]
+      (let [sched (mt/make-scheduler {:duration-range [100 100] :seed 1})]
         (is (= :timed-out
                (mt/run sched
                        (m/sp
@@ -1472,7 +1475,7 @@
                                   :work-completed)
                                 50 ;; 50ms timeout
                                 :timed-out)))))
-            "With seed 0, timeout wins the race"))))
+            "With seed 1, timeout wins the race"))))
 
   (testing "work beats timeout when work duration is less than timeout"
     ;; When work duration < timeout, work completes before timeout is due.

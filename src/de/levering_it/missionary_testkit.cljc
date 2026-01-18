@@ -300,6 +300,21 @@
         value (+ (long lo) (mod next-rng range-size))]
     [value next-rng]))
 
+(defn- next-duration!
+  "Get next duration from scheduler's duration-range, atomically updating RNG.
+  Returns duration in ms (0 if no duration-range configured).
+  Used by yield and via-call to assign durations to user work."
+  [^TestScheduler sched]
+  (if-let [[lo hi] (:duration-range sched)]
+    (let [result (atom nil)]
+      (swap! (:state sched)
+             (fn [s]
+               (let [[duration new-rng] (rand-in-range (:rng-state s) lo hi)]
+                 (reset! result duration)
+                 (assoc s :rng-state new-rng))))
+      @result)
+    0))
+
 (defn- next-id!
   [^TestScheduler sched]
   (:next-id (swap! (:state sched) update :next-id inc)))
@@ -333,26 +348,19 @@
    (defn- ensure-driver-thread! [_ _] true))
 
 (defn- enqueue-microtask!
+  "Enqueue a microtask. Duration is only applied if explicitly provided.
+  Use next-duration! to get a duration from the scheduler's duration-range
+  for operations that represent user work (yield, via-call)."
   ([^TestScheduler sched f] (enqueue-microtask! sched f {}))
   ([^TestScheduler sched f {:keys [label kind lane duration-ms]
                             :or {kind :microtask
                                  lane :default}}]
    (ensure-driver-thread! sched "enqueue-microtask!")
-   (let [id (next-id! sched)]
+   (let [id (next-id! sched)
+         duration (or duration-ms 0)]
      (swap! (:state sched)
             (fn [s]
               (let [now (:now-ms s)
-                    ;; Determine duration: explicit override > random from range > 0
-                    [duration new-rng]
-                    (if (some? duration-ms)
-                      ;; Explicit duration provided
-                      [duration-ms (:rng-state s)]
-                      ;; Check for duration-range on scheduler
-                      (if-let [[lo hi] (:duration-range sched)]
-                        ;; Generate random duration from range
-                        (rand-in-range (:rng-state s) lo hi)
-                        ;; No range, default to 0
-                        [0 (:rng-state s)]))
                     mt {:id id
                         :kind kind
                         :label label
@@ -362,7 +370,6 @@
                         :duration-ms duration
                         :f f}]
                 (-> s
-                    (assoc :rng-state new-rng)
                     (update :micro-q q-conj mt)
                     (maybe-trace-state {:event :enqueue-microtask
                                         :id id
@@ -896,17 +903,18 @@
        ;; Test mode: create a scheduling point via microtask
        (let [sched (require-scheduler!)
              done? (atom false)
-             ;; Call duration-fn before enqueueing if provided
-             duration-ms (when-let [duration-fn (:duration-fn opts)]
-                           (duration-fn))]
+             ;; Duration priority: explicit :duration-fn > scheduler's duration-range > 0
+             duration-ms (if-let [duration-fn (:duration-fn opts)]
+                           (duration-fn)
+                           (next-duration! sched))]
          (enqueue-microtask!
           sched
           (fn []
             (when (compare-and-set! done? false true)
               (s x)))
-          (cond-> {:kind :yield
-                   :label "yield"}
-            (some? duration-ms) (assoc :duration-ms duration-ms)))
+          {:kind :yield
+           :label "yield"
+           :duration-ms duration-ms})
          (fn cancel []
            (when (compare-and-set! done? false true)
              ;; fail synchronously, matching Missionary semantics
@@ -1159,7 +1167,8 @@
                     (identical? exec m/blk) :blk
                     :else :default)
 
-             done?        (atom false)]
+             done?        (atom false)
+             duration-ms  (next-duration! sched)]
 
          ;; Schedule the "executor hop" as a microtask
          (enqueue-microtask!
@@ -1179,7 +1188,8 @@
                     (cont))))))
           {:kind  :via-call
            :label "via-call"
-           :lane  lane})
+           :lane  lane
+           :duration-ms duration-ms})
 
          ;; Cancel thunk
          (fn cancel []
