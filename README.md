@@ -204,7 +204,8 @@ The scheduler manages virtual time and a queue of pending tasks:
                                 :trace?          true      ; enable execution trace
                                 :micro-schedule  nil       ; explicit decisions (see Schedule Decisions)
                                 :duration-range  [10 50]   ; virtual duration [lo hi] for yield/via-call
-                                :timer-policy    :promote-first}))  ; or :microtasks-first
+                                :timer-policy    :promote-first  ; or :microtasks-first
+                                :cpu-threads     8}))      ; CPU thread pool size (default 8)
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
 (mt/pending sched)  ; => {:microtasks [...] :timers [...]}
@@ -226,6 +227,13 @@ The scheduler manages virtual time and a queue of pending tasks:
 **Timer policy (microtasks vs timers at same virtual time):**
 - **:promote-first (default):** Promote due timers to microtask queue first, then select among all available. More adversarial; timers compete equally with microtasks.
 - **:microtasks-first:** Drain existing microtasks first, then promote/run timers due at that time. JS-like microtask priority; more realistic.
+
+**Thread pool modeling:**
+- **`:default` lane** (microtask queue): Single-threaded. Tasks execute one at a time.
+- **`:cpu` lane** (`m/via m/cpu`): Thread pool with `:cpu-threads` capacity (default 8). Multiple CPU tasks can be in-flight concurrently.
+- **`:blk` lane** (`m/via m/blk`): Unlimited threads. Every blocking task gets its own virtual thread.
+
+When `:duration-range` is set, `m/via` tasks take virtual time and occupy their lane's threads while in-flight. This models real thread pool behavior where CPU-bound work competes for limited threads while blocking I/O can run unboundedly in parallel.
 
 **Split RNG streams:**
 - Uses separate RNG streams for task selection (`:rng-select`) and duration generation (`:rng-duration`).
@@ -556,6 +564,23 @@ Enable tracing to see exactly what happened:
 ;;     ...]
 ```
 
+### Trace Events
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `:enqueue-microtask` | Task added to microtask queue | `:id`, `:kind`, `:lane`, `:now-ms` |
+| `:enqueue-timer` | Timer scheduled | `:id`, `:at-ms`, `:now-ms` |
+| `:run-microtask` | Task executed (0ms duration) | `:id`, `:kind`, `:now-ms` |
+| `:task-start` | Task with duration started | `:id`, `:kind`, `:duration-ms`, `:end-ms`, `:now-ms` |
+| `:task-complete` | In-flight task completed | `:id`, `:kind`, `:now-ms` |
+| `:select-task` | Task selected from multiple options | `:id`, `:kind`, `:now-ms` |
+| `:promote-timers` | Due timers moved to queue | `:ids`, `:count`, `:now-ms` |
+| `:advance-to` | Virtual time advanced | `:from`, `:to`, `:now-ms` |
+| `:cancel-timer` | Timer cancelled | `:id`, `:now-ms` |
+| `:cancel-microtask` | Microtask cancelled | `:id`, `:now-ms` |
+
+When `:duration-range` is set, tasks with duration go through `:task-start` → `:task-complete` instead of `:run-microtask`. This shows the split execution model where tasks occupy thread capacity while in-flight.
+
 ## Concurrency Bug Testing
 
 missionary-testkit can explore different task interleavings to find race conditions and concurrency bugs.
@@ -868,9 +893,9 @@ The scheduler automatically detects common problems:
 - `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be both created and executed inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point)). `run` and `start!` automatically bind `*scheduler*` to the passed scheduler.
 
 ### Interleaving (Concurrency Testing)
-- `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:ok? true :seed s ...}` or `{:ok? false :kind ... :schedule ... :seed s ...}`. Options: `:num-tests`, `:seed`, `:property`, `:duration-range`, `:timer-policy`.
-- `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`. Options: `:num-samples`, `:seed`, `:duration-range`, `:timer-policy`.
-- `(replay task-fn failure)` - replay a failure bundle from `check-interleaving`. The failure bundle contains all config needed (schedule, seed, duration-range, timer-policy).
+- `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:ok? true :seed s ...}` or `{:ok? false :kind ... :schedule ... :seed s ...}`. Options: `:num-tests`, `:seed`, `:property`, `:duration-range`, `:timer-policy`, `:cpu-threads`.
+- `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`. Options: `:num-samples`, `:seed`, `:duration-range`, `:timer-policy`, `:cpu-threads`.
+- `(replay task-fn failure)` - replay a failure bundle from `check-interleaving`. The failure bundle contains all config needed (schedule, seed, duration-range, timer-policy, cpu-threads).
 - `(replay-schedule task schedule opts)` - replay exact execution order with explicit opts (task created inside `with-determinism`)
 - `(trace->schedule trace)` - extract schedule (vector of task IDs) from trace
 - `(cancel-microtask! sched id)` - cancel an enqueued microtask by ID, removing it from the queue

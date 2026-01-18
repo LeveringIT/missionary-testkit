@@ -120,7 +120,7 @@
 ;; -----------------------------------------------------------------------------
 
 (defrecord TestScheduler
-           [state seed trace? micro-schedule duration-range timer-policy])
+           [state seed trace? micro-schedule duration-range timer-policy cpu-threads])
 
 (defn- maybe-trace-state
   "If tracing enabled (state has non-nil :trace vector), append event."
@@ -141,7 +141,8 @@
    :duration-range nil | [lower upper] ; virtual duration range for microtasks
                                        ; nil (default) = 0ms duration (instant)
                                        ; [lo hi] = random duration in [lo,hi]ms per task
-   :timer-policy   :promote-first | :microtasks-first}
+   :timer-policy   :promote-first | :microtasks-first
+   :cpu-threads    8}                  ; CPU thread pool size (default 8)
 
   Task selection behavior:
   - No seed (or nil): FIFO selection from the microtask queue.
@@ -168,6 +169,14 @@
   - :microtasks-first - drain existing microtasks first, then promote/run
     timers due at that time. JS-like microtask priority; more realistic.
 
+  Thread pool modeling:
+  - :cpu-threads (default 8) - simulates a fixed-size CPU thread pool.
+    When cpu-threads tasks are in-flight, additional :cpu lane tasks must wait.
+  - :blk lane - unlimited threads, each blocking call gets its own thread.
+  - :default lane - single-threaded microtask queue (like JS event loop).
+  - Tasks with duration > 0 occupy their thread for that duration.
+  - Multiple in-flight tasks can have overlapping execution times.
+
   RNG streams:
   - Uses separate RNG streams for task selection and duration generation.
   - This means enabling :duration-range won't change interleaving order.
@@ -180,12 +189,13 @@
   thread. Cross-thread callbacks will throw an error to catch accidental nondeterminism."
   ([]
    (make-scheduler {}))
-  ([{:keys [initial-ms seed trace? micro-schedule duration-range timer-policy]
+  ([{:keys [initial-ms seed trace? micro-schedule duration-range timer-policy cpu-threads]
      :or {initial-ms 0
           trace? false
           micro-schedule nil
           duration-range nil
-          timer-policy :promote-first}}]
+          timer-policy :promote-first
+          cpu-threads 8}}]
    ;; Derive separate RNG seeds for selection and duration
    ;; Using different offsets ensures independent streams
    (let [base-seed (if seed (long seed) 0)
@@ -208,8 +218,13 @@
              ;; :rng-select - used for task selection (interleaving)
              ;; :rng-duration - used for duration generation
              :rng-select select-seed
-             :rng-duration duration-seed})
-      seed (boolean trace?) micro-schedule duration-range timer-policy))))
+             :rng-duration duration-seed
+             ;; Thread pool state: in-flight tasks and active thread counts
+             ;; in-flight: sorted-map keyed by [end-ms id] -> task-info
+             :in-flight (sorted-map)
+             ;; active-threads: count of threads currently executing per lane
+             :active-threads {:default 0 :cpu 0 :blk 0}})
+      seed (boolean trace?) micro-schedule duration-range timer-policy cpu-threads))))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -315,7 +330,6 @@
                      (dissoc extra :label))]
      #?(:clj (if (some? cause) (ex-info msg data cause) (ex-info msg data))
         :cljs (ex-info msg data)))))
-
 
 (defn- rand-in-range
   "Generate a random integer in [lo, hi] inclusive using RNG state.
@@ -632,6 +646,80 @@
   (when-let [[_ t] (first (:timers @(:state sched)))]
     (:at-ms t)))
 
+;; -----------------------------------------------------------------------------
+;; Thread pool / in-flight task management
+;; -----------------------------------------------------------------------------
+
+(defn- lane-max-threads
+  "Get maximum threads for a lane. :default=1, :cpu=configurable, :blk=unlimited."
+  [^TestScheduler sched lane]
+  (case lane
+    :default 1
+    :cpu (or (:cpu-threads sched) 8)
+    :blk Long/MAX_VALUE
+    ;; Unknown lanes default to 1 (safe)
+    1))
+
+(defn- lane-has-capacity?
+  "Check if a lane has capacity for another task."
+  [^TestScheduler sched s lane]
+  (let [active (get-in s [:active-threads lane] 0)
+        max-threads (lane-max-threads sched lane)]
+    (< active max-threads)))
+
+(defn- filter-by-capacity
+  "Filter queue items to only those whose lane has capacity."
+  [^TestScheduler sched s q]
+  (let [v (q->vec q)]
+    (vec->q (filterv #(lane-has-capacity? sched s (:lane %)) v))))
+
+(defn- next-in-flight-completion
+  "Get the next in-flight task that can complete (end-ms <= now).
+  Returns [key task-info] or nil."
+  [s]
+  (when-let [[k t] (first (:in-flight s))]
+    (when (<= (first k) (:now-ms s))
+      [k t])))
+
+(defn- next-in-flight-time
+  "Get the earliest end-ms of any in-flight task, or nil if none."
+  [s]
+  (when-let [[k _] (first (:in-flight s))]
+    (first k)))
+
+(defn- start-in-flight!
+  "Mark a task as in-flight: increment lane thread count, add to in-flight map."
+  [s ^TestScheduler sched mt]
+  (let [lane (:lane mt)
+        duration (:duration-ms mt 0)
+        end-ms (+ (:now-ms s) (long duration))
+        key [end-ms (:id mt)]]
+    (-> s
+        (update-in [:active-threads lane] (fnil inc 0))
+        (assoc-in [:in-flight key] mt)
+        (maybe-trace-state {:event :task-start
+                            :id (:id mt)
+                            :kind (:kind mt)
+                            :label (:label mt)
+                            :lane lane
+                            :duration-ms duration
+                            :end-ms end-ms
+                            :now-ms (:now-ms s)}))))
+
+(defn- complete-in-flight!
+  "Complete an in-flight task: decrement lane thread count, remove from in-flight."
+  [s ^TestScheduler _sched key mt]
+  (let [lane (:lane mt)]
+    (-> s
+        (update-in [:active-threads lane] (fnil dec 1))
+        (update :in-flight dissoc key)
+        (maybe-trace-state {:event :task-complete
+                            :id (:id mt)
+                            :kind (:kind mt)
+                            :label (:label mt)
+                            :lane lane
+                            :now-ms (:now-ms s)}))))
+
 (defn- select-and-remove-task
   "Select a task from queue and return [mt q' decision rng-select s-after].
   When task-id is provided, selects that specific task.
@@ -688,19 +776,120 @@
           (when-not (compare-and-set! state-atom s s')
             (recur)))))))
 
+(defn- complete-one-in-flight!
+  "Complete a single in-flight task. Returns the task or nil if none ready."
+  [^TestScheduler sched]
+  (let [state-atom (:state sched)
+        result (atom nil)]
+    (loop []
+      (let [s @state-atom]
+        (when-let [[key mt] (next-in-flight-completion s)]
+          (let [s' (complete-in-flight! s sched key mt)]
+            (if (compare-and-set! state-atom s s')
+              (do
+                (try
+                  ((:f mt))
+                  (catch #?(:clj Throwable :cljs :default) e
+                    (throw (ex-info (str "In-flight task completion threw: " (ex-message e))
+                                    (cond-> {:mt/kind ::microtask-exception
+                                             :mt/now-ms (:now-ms s')
+                                             :mt/task {:id (:id mt)
+                                                       :kind (:kind mt)
+                                                       :label (:label mt)
+                                                       :lane (:lane mt)}
+                                             :mt/pending (pending sched)}
+                                      (:trace? sched)
+                                      (assoc :mt/recent-trace (vec (take-last 10 (trace sched)))))
+                                    e))))
+                (reset! result mt))
+              (recur))))))
+    @result))
+
+(defn- start-task-in-flight!
+  "Start a task as in-flight (with duration > 0). Returns the task."
+  [^TestScheduler sched s mt q' decision new-rng s-after]
+  (let [state-atom (:state sched)
+        now (:now-ms s-after)
+        q-size (count (:micro-q s))
+        select-trace (when (> q-size 1)
+                       {:event :select-task
+                        :decision decision
+                        :queue-size q-size
+                        :selected-id (:id mt)
+                        :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec (:micro-q s))))
+                        :now-ms now})
+        s' (-> s-after
+               (assoc :micro-q q')
+               (assoc :rng-select new-rng)
+               (cond-> select-trace (maybe-trace-state select-trace))
+               (start-in-flight! sched mt))]
+    (if (compare-and-set! state-atom s s')
+      mt
+      nil)))
+
+(defn- run-task-immediately!
+  "Run a task immediately (duration == 0). Returns the task."
+  [^TestScheduler sched s mt q' decision new-rng s-after]
+  (let [state-atom (:state sched)
+        now (:now-ms s-after)
+        duration (:duration-ms mt 0)
+        q-size (count (:micro-q s))
+        select-trace (when (> q-size 1)
+                       {:event :select-task
+                        :decision decision
+                        :queue-size q-size
+                        :selected-id (:id mt)
+                        :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec (:micro-q s))))
+                        :now-ms now})
+        s' (-> s-after
+               (assoc :micro-q q')
+               (assoc :rng-select new-rng)
+               (cond-> select-trace (maybe-trace-state select-trace))
+               (maybe-trace-state {:event :run-microtask
+                                   :id (:id mt)
+                                   :kind (:kind mt)
+                                   :label (:label mt)
+                                   :lane (:lane mt)
+                                   :duration-ms duration
+                                   :now-ms now}))]
+    (if (compare-and-set! state-atom s s')
+      (do
+        (try
+          ((:f mt))
+          (catch #?(:clj Throwable :cljs :default) e
+            (throw (ex-info (str "Microtask threw: " (ex-message e))
+                            (cond-> {:mt/kind ::microtask-exception
+                                     :mt/now-ms now
+                                     :mt/task {:id (:id mt)
+                                               :kind (:kind mt)
+                                               :label (:label mt)
+                                               :lane (:lane mt)}
+                                     :mt/pending (pending sched)}
+                              (:trace? sched)
+                              (assoc :mt/recent-trace (vec (take-last 10 (trace sched)))))
+                            e))))
+        mt)
+      nil)))
+
 (defn step!
-  "Run exactly 1 microtask. Returns ::idle if no microtasks.
+  "Execute one scheduler step: complete an in-flight task OR start a new one.
+
+  Thread pool model:
+  - :default lane: single-threaded (max 1 concurrent task)
+  - :cpu lane: fixed thread pool (configurable via :cpu-threads, default 8)
+  - :blk lane: unlimited threads (each blocking call gets its own)
+
+  Step behavior:
+  1. Promote due timers (based on :timer-policy)
+  2. Complete any in-flight task whose end-ms <= now (runs completion callback)
+  3. If no completions, start a new task from queue (if lane has capacity):
+     - Tasks with duration > 0: start as in-flight, thread occupied until end-ms
+     - Tasks with duration == 0: execute immediately (backward compatible)
+  4. Return ::idle if nothing can be done
 
   Timer promotion behavior depends on :timer-policy:
   - :promote-first (default): promote due timers first, then select among all.
-    Timers compete equally with microtasks. More adversarial for testing.
   - :microtasks-first: only promote timers when microtask queue is empty.
-    Drain microtasks first, like JS event loop. More realistic.
-
-  Before executing the callback, virtual time advances by the task's duration-ms
-  (if any), and newly-due timers are promoted. This models \"work completed\" -
-  the continuation sees post-work time, and any timers it schedules are relative
-  to that post-work time.
 
   (step! sched)        - select next task per schedule/FIFO/random
   (step! sched task-id) - run specific task by ID (for manual stepping)
@@ -713,60 +902,38 @@
      ;; Timer promotion based on policy
      (let [policy (or (:timer-policy sched) :promote-first)
            q-before (:micro-q @(:state sched))]
-       ;; :promote-first - always promote due timers before selection
-       ;; :microtasks-first - only promote if queue is empty
        (when (or (= policy :promote-first)
                  (and (= policy :microtasks-first) (q-empty? q-before)))
          (promote-due-timers! sched)))
-     (let [state-atom (:state sched)]
-       (loop []
-         (let [s @state-atom
-               q (:micro-q s)]
-           (if (q-empty? q)
-             idle
-             (let [q-size (count q)
-                   [mt q' decision new-rng s-after] (select-and-remove-task sched s q task-id)
-                   now (:now-ms s-after)
-                   duration (:duration-ms mt 0)
-                   select-trace (when (> q-size 1)
-                                  {:event :select-task
-                                   :decision decision
-                                   :queue-size q-size
-                                   :selected-id (:id mt)
-                                   :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec q)))
-                                   :now-ms now})
-                   s' (-> s-after
-                          (assoc :micro-q q')
-                          (assoc :rng-select new-rng)
-                          (cond-> select-trace (maybe-trace-state select-trace))
-                          (maybe-trace-state {:event :run-microtask
-                                              :id (:id mt)
-                                              :kind (:kind mt)
-                                              :label (:label mt)
-                                              :lane (:lane mt)
-                                              :duration-ms duration
-                                              :now-ms now}))]
-               (if (compare-and-set! state-atom s s')
-                 (do
-                   ;; Advance time by duration BEFORE executing the callback
-                   ;; This models "work completed" - the continuation sees post-work time
-                   (advance-time-by-duration! sched duration)
-                   (try
-                     ((:f mt))
-                     (catch #?(:clj Throwable :cljs :default) e
-                       (throw (ex-info (str "Microtask threw: " (ex-message e))
-                                       (cond-> {:mt/kind ::microtask-exception
-                                                :mt/now-ms now
-                                                :mt/task {:id (:id mt)
-                                                          :kind (:kind mt)
-                                                          :label (:label mt)
-                                                          :lane (:lane mt)}
-                                                :mt/pending (pending sched)}
-                                         (:trace? sched)
-                                         (assoc :mt/recent-trace (vec (take-last 10 (trace sched)))))
-                                       e))))
-                   mt)
-                 (recur))))))))))
+     ;; First: try to complete an in-flight task
+     (if-let [completed (complete-one-in-flight! sched)]
+       completed
+       ;; Second: try to start a new task from the queue
+       (let [state-atom (:state sched)]
+         (loop []
+           (let [s @state-atom
+                 q (:micro-q s)
+                 ;; Filter queue to tasks whose lane has capacity
+                 available-q (filter-by-capacity sched s q)]
+             (if (q-empty? available-q)
+               ;; No tasks can start - either queue empty or all lanes full
+               idle
+               (let [[mt q' decision new-rng s-after] (select-and-remove-task sched s q task-id)
+                     duration (:duration-ms mt 0)]
+                 ;; Check if selected task's lane has capacity
+                 (if-not (lane-has-capacity? sched s (:lane mt))
+                   ;; Lane full - can't start this task
+                   idle
+                   ;; Lane has capacity - start or run the task
+                   (if (pos? duration)
+                     ;; Task has duration: start as in-flight
+                     (if-let [result (start-task-in-flight! sched s mt q' decision new-rng s-after)]
+                       result
+                       (recur))
+                     ;; No duration: run immediately (backward compatible)
+                     (if-let [result (run-task-immediately! sched s mt q' decision new-rng s-after)]
+                       result
+                       (recur)))))))))))))
 
 (defn tick!
   "Drain all microtasks at current virtual time. Returns number of microtasks executed.
@@ -1190,23 +1357,31 @@
               (throw (mt-ex deadlock sched
                             "Deadlock: task not done after draining microtasks, and auto-advance? is false."
                             {:label label})))
-            (if-let [t-next (next-timer-time sched)]
-              (do
-                ;; enforce time budget even if we jump forward
-                (when (> (- t-next start-time) (long max-time-ms))
-                  (throw (mt-ex budget-exceeded sched
-                                (str "Time budget exceeded before advancing: next timer at " t-next "ms.")
-                                {:label label
-                                 :mt/next-timer-ms t-next
-                                 :mt/start-ms start-time
-                                 :mt/max-time-ms max-time-ms})))
-                (recur (+ total-steps (advance-to! sched t-next))))
-              ;; Recheck done? to handle off-thread callbacks that may have completed the job
-              (if (done? job)
-                (result job)
-                (throw (mt-ex deadlock sched
-                              "Deadlock: no microtasks, no timers, and task still pending."
-                              {:label label}))))))))))
+            ;; Find next event: timer or in-flight task completion, whichever is sooner
+            (let [timer-time (next-timer-time sched)
+                  in-flight-time (next-in-flight-time @(:state sched))
+                  t-next (cond
+                           (and timer-time in-flight-time) (min timer-time in-flight-time)
+                           timer-time timer-time
+                           in-flight-time in-flight-time
+                           :else nil)]
+              (if t-next
+                (do
+                  ;; enforce time budget even if we jump forward
+                  (when (> (- t-next start-time) (long max-time-ms))
+                    (throw (mt-ex budget-exceeded sched
+                                  (str "Time budget exceeded before advancing: next event at " t-next "ms.")
+                                  {:label label
+                                   :mt/next-event-ms t-next
+                                   :mt/start-ms start-time
+                                   :mt/max-time-ms max-time-ms})))
+                  (recur (+ total-steps (advance-to! sched t-next))))
+                ;; Recheck done? to handle off-thread callbacks that may have completed the job
+                (if (done? job)
+                  (result job)
+                  (throw (mt-ex deadlock sched
+                                "Deadlock: no microtasks, no timers, no in-flight tasks, and task still pending."
+                                {:label label})))))))))))
 
 (defn run
   "Run task deterministically to completion (or throw).
@@ -1229,9 +1404,7 @@
                  (catch :default e
                    (reject e))))))))
 
-
 (def ^:const unsupported-executor ::unsupported-executor)
-
 
 #?(:clj
    (defn deterministic-via-call*
@@ -1269,8 +1442,8 @@
                     (identical? exec m/blk) :blk
                     :else :default)
 
-             done?        (atom false)
-             duration-ms  (next-duration! sched)
+             done? (atom false)
+             duration-ms (next-duration! sched)
              ;; Store microtask ID for cancellation
              mt-id (enqueue-microtask!
                     sched
@@ -1287,9 +1460,9 @@
                           (when (compare-and-set! done? false true)
                             (when cont
                               (cont))))))
-                    {:kind  :via-call
+                    {:kind :via-call
                      :label "via-call"
-                     :lane  lane
+                     :lane lane
                      :duration-ms duration-ms})]
 
          ;; Cancel thunk
@@ -1305,7 +1478,6 @@
    :cljs
    (defn deterministic-via-call* [exec thunk]
      (throw (ex-info "via-call is JVM-only." {:mt/kind ::unsupported}))))
-
 
 (defn via-call
   "Execute thunk on executor, with dispatch based on determinism mode.
@@ -1335,7 +1507,6 @@
      (if *is-deterministic*
        ((deterministic-via-call* exec thunk) s f)
        ((original-via-call exec thunk) s f)))))
-
 
 #?(:clj
    (defonce ^{:doc "Global lock and state for with-determinism macro to ensure thread-safe with-redefs.
@@ -1528,7 +1699,6 @@
                                       :failure failure})))]
     (replay-schedule (task-fn) schedule failure)))
 
-
 ;; -----------------------------------------------------------------------------
 ;; Interleaving: test helpers
 ;; -----------------------------------------------------------------------------
@@ -1541,15 +1711,17 @@
   "Run a task once with random selection seeded by test-seed. Returns map with result info.
   Internal helper for check-interleaving and explore-interleavings.
   Must be called inside a with-determinism body."
-  [task {:keys [test-seed max-steps max-time-ms duration-range initial-ms timer-policy]
+  [task {:keys [test-seed max-steps max-time-ms duration-range initial-ms timer-policy cpu-threads]
          :or {max-time-ms 60000
               initial-ms 0
-              timer-policy :promote-first}}]
+              timer-policy :promote-first
+              cpu-threads 8}}]
   (let [sched (make-scheduler {:trace? true
                                :seed test-seed
                                :duration-range duration-range
                                :initial-ms initial-ms
-                               :timer-policy timer-policy})
+                               :timer-policy timer-policy
+                               :cpu-threads cpu-threads})
         result (try
                  {:value (run sched task {:max-steps max-steps
                                           :max-time-ms max-time-ms})}
@@ -1579,6 +1751,8 @@
                       This enables realistic timeout races and timing exploration.
   - :timer-policy   - :promote-first (default) or :microtasks-first
                       Controls whether timers compete with microtasks at same time.
+  - :cpu-threads    - CPU thread pool size (default 8)
+                      Controls max concurrent :cpu lane tasks.
 
   Returns on success:
   {:ok?            true
@@ -1592,6 +1766,7 @@
    :schedule       schedule that caused failure (for replay)
    :duration-range [lo hi] if timing fuzz was enabled (for replay)
    :timer-policy   timer policy if non-default (for replay)
+   :cpu-threads    cpu thread pool size if non-default (for replay)
    :trace          full trace
    :iteration      which iteration failed
    :error          exception (present when :kind is :exception)
@@ -1601,13 +1776,14 @@
   system time is used, making results non-reproducible across runs.
 
   The failure bundle contains all information needed to reproduce the exact
-  failure using mt/replay, including timing configuration."
-  [task-fn {:keys [num-tests seed property max-steps max-time-ms duration-range initial-ms timer-policy]
+  failure using mt/replay, including timing and thread pool configuration."
+  [task-fn {:keys [num-tests seed property max-steps max-time-ms duration-range initial-ms timer-policy cpu-threads]
             :or {num-tests 100
                  max-steps 10000
                  max-time-ms 60000
                  initial-ms 0
-                 timer-policy :promote-first}}]
+                 timer-policy :promote-first
+                 cpu-threads 8}}]
   (let [base-seed (or seed (default-base-seed))]
     (loop [i 0]
       (if (>= i num-tests)
@@ -1618,7 +1794,8 @@
                                                         :max-time-ms max-time-ms
                                                         :duration-range duration-range
                                                         :initial-ms initial-ms
-                                                        :timer-policy timer-policy})
+                                                        :timer-policy timer-policy
+                                                        :cpu-threads cpu-threads})
               {:keys [result seed micro-schedule trace]} run-result
               exception? (some? (:error result))
               property-failed? (and property
@@ -1635,6 +1812,7 @@
               duration-range (assoc :duration-range duration-range)
               (not= 0 initial-ms) (assoc :initial-ms initial-ms)
               (not= :promote-first timer-policy) (assoc :timer-policy timer-policy)
+              (not= 8 cpu-threads) (assoc :cpu-threads cpu-threads)
               ;; Include result data
               exception? (assoc :error (:error result))
               (not exception?) (assoc :value (:value result)))
@@ -1657,6 +1835,8 @@
                       This enables realistic timeout races and timing exploration.
   - :timer-policy   - :promote-first (default) or :microtasks-first
                       Controls whether timers compete with microtasks at same time.
+  - :cpu-threads    - CPU thread pool size (default 8)
+                      Controls max concurrent :cpu lane tasks.
 
   Returns:
   {:unique-results - count of distinct results seen
@@ -1665,17 +1845,19 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-  [task-fn {:keys [num-samples seed max-steps duration-range timer-policy]
+  [task-fn {:keys [num-samples seed max-steps duration-range timer-policy cpu-threads]
             :or {num-samples 100
                  max-steps 10000
-                 timer-policy :promote-first}}]
+                 timer-policy :promote-first
+                 cpu-threads 8}}]
   (let [base-seed (or seed (default-base-seed))
         results (for [i (range num-samples)
                       :let [run-result (run-with-random-interleaving (task-fn)
                                                                      {:test-seed (+ base-seed i)
                                                                       :max-steps max-steps
                                                                       :duration-range duration-range
-                                                                      :timer-policy timer-policy})
+                                                                      :timer-policy timer-policy
+                                                                      :cpu-threads cpu-threads})
                             ;; Extract value or return error map
                             r (let [res (:result run-result)]
                                 (if (:error res) res (:value res)))]]
@@ -1684,7 +1866,6 @@
     {:unique-results (count (distinct (map :result results)))
      :results (vec results)
      :seed base-seed}))
-
 
 ;; -----------------------------------------------------------------------------
 ;; Flow collection convenience

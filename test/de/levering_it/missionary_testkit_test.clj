@@ -1560,17 +1560,18 @@
           (let [enqueue-events (filter #(= :enqueue-microtask (:event %)) trace)]
             (is (every? #(contains? % :duration-ms) enqueue-events)
                 "All enqueue events should have :duration-ms"))
-          ;; Check run-microtask events have duration-ms
-          (let [run-events (filter #(= :run-microtask (:event %)) trace)]
-            (is (every? #(contains? % :duration-ms) run-events)
-                "All run events should have :duration-ms"))
-          ;; Check duration-advance events exist
-          (let [advance-events (filter #(= :duration-advance (:event %)) trace)]
-            (is (seq advance-events) "Should have duration-advance events")
-            (is (every? #(and (contains? % :from-ms)
-                              (contains? % :to-ms)
-                              (contains? % :duration-ms)) advance-events)
-                "Advance events should have from-ms, to-ms, and duration-ms")))))))
+          ;; Check task-start events (replaces duration-advance in split execution model)
+          (let [start-events (filter #(= :task-start (:event %)) trace)]
+            (is (seq start-events) "Should have task-start events for tasks with duration")
+            (is (every? #(and (contains? % :duration-ms)
+                              (contains? % :end-ms)
+                              (contains? % :lane)) start-events)
+                "Start events should have duration-ms, end-ms, and lane"))
+          ;; Check task-complete events
+          (let [complete-events (filter #(= :task-complete (:event %)) trace)]
+            (is (seq complete-events) "Should have task-complete events")
+            (is (every? #(contains? % :lane) complete-events)
+                "Complete events should have lane")))))))
 
 (deftest yield-duration-fn-test
   (testing "yield with :duration-fn overrides scheduler duration-range"
@@ -1786,3 +1787,253 @@
             schedule2 (mt/trace->schedule (mt/trace sched2))]
         (is (= schedule1 schedule2)
             "Different duration-range should produce same interleaving")))))
+
+;; -----------------------------------------------------------------------------
+;; Thread pool tests
+;; -----------------------------------------------------------------------------
+
+(deftest cpu-thread-pool-test
+  (testing "cpu-threads limits concurrent CPU tasks"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:cpu-threads 2 :duration-range [100 100] :trace? true})
+            timeline (atom [])]
+        (mt/run sched
+                (m/sp
+                  (m/? (m/join vector
+                         (m/sp (swap! timeline conj [:cpu1-start (mt/now-ms sched)])
+                               (m/? (m/via m/cpu :cpu1))
+                               (swap! timeline conj [:cpu1-end (mt/now-ms sched)]))
+                         (m/sp (swap! timeline conj [:cpu2-start (mt/now-ms sched)])
+                               (m/? (m/via m/cpu :cpu2))
+                               (swap! timeline conj [:cpu2-end (mt/now-ms sched)]))
+                         (m/sp (swap! timeline conj [:cpu3-start (mt/now-ms sched)])
+                               (m/? (m/via m/cpu :cpu3))
+                               (swap! timeline conj [:cpu3-end (mt/now-ms sched)]))))))
+        ;; With cpu-threads=2 and 100ms duration each:
+        ;; - cpu1 and cpu2 start at 0, complete at 100
+        ;; - cpu3 can't start until 100 (pool full), completes at 200
+        (let [ends (filter #(= :end (second (first %))) (partition 2 @timeline))]
+          ;; First two complete at 100ms
+          (is (= 100 (second (first (filter #(#{:cpu1-end :cpu2-end} (first %)) @timeline))))
+              "First CPU task should complete at 100ms")
+          ;; Third completes at 200ms
+          (is (= 200 (second (first (filter #(= :cpu3-end (first %)) @timeline))))
+              "Third CPU task should complete at 200ms (had to wait for pool slot)")))))
+
+  (testing "default cpu-threads is 8"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [100 100] :trace? true})]
+        (mt/run sched
+                (m/sp
+                  ;; Start 10 CPU tasks - only 8 should be concurrent
+                  (m/? (apply m/join vector
+                              (for [i (range 10)]
+                                (m/sp (m/? (m/via m/cpu i))))))))
+        ;; Count max concurrent task-starts at any given time
+        (let [trace (mt/trace sched)
+              starts (filter #(and (= :task-start (:event %))
+                                   (= :cpu (:lane %))) trace)
+              ;; Group by start time
+              starts-by-time (group-by :now-ms starts)]
+          ;; At time 0, should have at most 8 starts
+          (is (<= (count (get starts-by-time 0 [])) 8)
+              "Should start at most 8 CPU tasks at time 0"))))))
+
+(deftest blk-unlimited-threads-test
+  (testing "blk lane has unlimited threads"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [100 100] :trace? true})
+            timeline (atom [])]
+        (mt/run sched
+                (m/sp
+                  (m/? (apply m/join vector
+                              (for [i (range 20)]
+                                (m/sp
+                                  (swap! timeline conj [:start i (mt/now-ms sched)])
+                                  (m/? (m/via m/blk i))
+                                  (swap! timeline conj [:end i (mt/now-ms sched)])))))))
+        ;; All 20 BLK tasks should start at t=0 and complete at t=100
+        (let [starts (filter #(= :start (first %)) @timeline)
+              ends (filter #(= :end (first %)) @timeline)]
+          (is (every? #(= 0 (nth % 2)) starts)
+              "All BLK tasks should start at t=0")
+          (is (every? #(= 100 (nth % 2)) ends)
+              "All BLK tasks should complete at t=100"))))))
+
+(deftest default-lane-single-threaded-test
+  (testing "default lane is single-threaded"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [100 100] :trace? true})
+            timeline (atom [])]
+        (mt/run sched
+                (m/sp
+                  (m/? (m/join vector
+                         (m/sp (swap! timeline conj [:a-start (mt/now-ms sched)])
+                               (m/? (mt/yield))
+                               (swap! timeline conj [:a-end (mt/now-ms sched)]))
+                         (m/sp (swap! timeline conj [:b-start (mt/now-ms sched)])
+                               (m/? (mt/yield))
+                               (swap! timeline conj [:b-end (mt/now-ms sched)]))))))
+        ;; Default lane is single-threaded, so tasks run sequentially
+        ;; Both start at t=0 (enqueued), but execute one at a time
+        ;; First yield completes at t=100, second at t=200
+        (let [ends (->> @timeline
+                        (filter #(#{:a-end :b-end} (first %)))
+                        (sort-by second))]
+          (is (= 100 (second (first ends)))
+              "First task should complete at 100ms")
+          (is (= 200 (second (second ends)))
+              "Second task should complete at 200ms (sequential execution)"))))))
+
+(deftest mixed-lanes-concurrent-test
+  (testing "different lanes run concurrently"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:cpu-threads 2 :duration-range [100 100] :trace? true})
+            timeline (atom [])]
+        (mt/run sched
+                (m/sp
+                  (m/? (m/join vector
+                         ;; CPU task
+                         (m/sp (swap! timeline conj [:cpu-start (mt/now-ms sched)])
+                               (m/? (m/via m/cpu :cpu))
+                               (swap! timeline conj [:cpu-end (mt/now-ms sched)]))
+                         ;; BLK task
+                         (m/sp (swap! timeline conj [:blk-start (mt/now-ms sched)])
+                               (m/? (m/via m/blk :blk))
+                               (swap! timeline conj [:blk-end (mt/now-ms sched)]))
+                         ;; Another CPU task
+                         (m/sp (swap! timeline conj [:cpu2-start (mt/now-ms sched)])
+                               (m/? (m/via m/cpu :cpu2))
+                               (swap! timeline conj [:cpu2-end (mt/now-ms sched)]))))))
+        ;; All three should run concurrently (different lanes or same lane with capacity)
+        ;; and complete at 100ms
+        (let [ends (filter #(#{:cpu-end :blk-end :cpu2-end} (first %)) @timeline)]
+          (is (every? #(= 100 (second %)) ends)
+              "All tasks from different lanes should complete at 100ms"))))))
+
+(deftest complex-mixed-lanes-exploration-test
+  (testing "explore interleavings with mixed CPU/BLK/default lanes"
+    ;; This test explores how CPU pool limits, BLK unlimited threads, and default lane
+    ;; interact to create different possible execution orderings while maintaining correctness
+    (mt/with-determinism
+      (let [make-task (fn []
+                        (let [results (atom {})]
+                          (m/sp
+                            (m/? (m/join vector
+                                   ;; Two CPU tasks competing for pool slots
+                                   (m/sp
+                                     (let [v (m/? (m/via m/cpu (* 2 21)))]
+                                       (swap! results assoc :cpu1 v)
+                                       v))
+                                   (m/sp
+                                     (let [v (m/? (m/via m/cpu (* 3 14)))]
+                                       (swap! results assoc :cpu2 v)
+                                       v))
+                                   ;; Three BLK tasks (should all run concurrently)
+                                   (m/sp
+                                     (let [v (m/? (m/via m/blk :io-1))]
+                                       (swap! results assoc :blk1 v)
+                                       v))
+                                   (m/sp
+                                     (let [v (m/? (m/via m/blk :io-2))]
+                                       (swap! results assoc :blk2 v)
+                                       v))
+                                   (m/sp
+                                     (let [v (m/? (m/via m/blk :io-3))]
+                                       (swap! results assoc :blk3 v)
+                                       v))
+                                   ;; Two yield tasks on default lane
+                                   (m/sp
+                                     (let [v (m/? (mt/yield :micro-1))]
+                                       (swap! results assoc :yield1 v)
+                                       v))
+                                   (m/sp
+                                     (let [v (m/? (mt/yield :micro-2))]
+                                       (swap! results assoc :yield2 v)
+                                       v))))
+                            @results)))
+
+            ;; Use check-interleaving to verify correctness across many orderings
+            result (mt/check-interleaving
+                     make-task
+                     {:num-tests 100
+                      :seed 54321
+                      :duration-range [10 50]
+                      :property (fn [r]
+                                  ;; All computations must produce correct results
+                                  (and (= 42 (:cpu1 r))
+                                       (= 42 (:cpu2 r))
+                                       (= :io-1 (:blk1 r))
+                                       (= :io-2 (:blk2 r))
+                                       (= :io-3 (:blk3 r))
+                                       (= :micro-1 (:yield1 r))
+                                       (= :micro-2 (:yield2 r))))})]
+        (is (:ok? result)
+            (str "All interleavings should produce correct results. Failure: "
+                 (when-not (:ok? result) (:value result))))
+        (is (= 100 (:iterations-run result))
+            "Should complete all iterations"))))
+
+  (testing "explore-interleavings reveals different orderings with mixed lanes"
+    (mt/with-determinism
+      (let [make-task (fn []
+                        (let [order (atom [])]
+                          (m/sp
+                            (m/? (m/join vector
+                                   (m/sp (m/? (m/via m/cpu (swap! order conj :cpu))) :cpu)
+                                   (m/sp (m/? (m/via m/blk (swap! order conj :blk))) :blk)
+                                   (m/sp (m/? (mt/yield (swap! order conj :yield))) :yield)))
+                            @order)))
+
+            exploration (mt/explore-interleavings
+                          make-task
+                          {:num-samples 50
+                           :seed 99999
+                           :duration-range [10 30]})]
+
+        ;; Should see multiple unique orderings due to concurrent execution
+        (is (> (:unique-results exploration) 1)
+            "Should observe multiple unique execution orderings")
+
+        ;; All results should have exactly 3 elements
+        (is (every? #(= 3 (count (:result %))) (:results exploration))
+            "Each result should capture exactly 3 operations")
+
+        ;; Each result should contain all three operations
+        (is (every? #(= #{:cpu :blk :yield} (set (:result %))) (:results exploration))
+            "Each result should contain :cpu, :blk, and :yield"))))
+
+  (testing "CPU pool saturation causes sequential execution for excess tasks"
+    (mt/with-determinism
+      ;; With cpu-threads=2 and duration=100, 4 tasks run in batches:
+      ;; First batch (2 tasks): ends at 100ms
+      ;; Second batch (2 tasks): ends at 200ms
+      (let [sched (mt/make-scheduler {:cpu-threads 2 :duration-range [100 100] :seed 11111})
+            timeline (atom [])
+            _ (mt/run sched
+                (m/sp
+                  (m/? (m/join vector
+                         (m/sp
+                           (swap! timeline conj [:t1-start (mt/clock)])
+                           (m/? (m/via m/cpu :t1))
+                           (swap! timeline conj [:t1-end (mt/clock)]))
+                         (m/sp
+                           (swap! timeline conj [:t2-start (mt/clock)])
+                           (m/? (m/via m/cpu :t2))
+                           (swap! timeline conj [:t2-end (mt/clock)]))
+                         (m/sp
+                           (swap! timeline conj [:t3-start (mt/clock)])
+                           (m/? (m/via m/cpu :t3))
+                           (swap! timeline conj [:t3-end (mt/clock)]))
+                         (m/sp
+                           (swap! timeline conj [:t4-start (mt/clock)])
+                           (m/? (m/via m/cpu :t4))
+                           (swap! timeline conj [:t4-end (mt/clock)]))))))
+            ends (->> @timeline
+                      (filter #(#{:t1-end :t2-end :t3-end :t4-end} (first %)))
+                      (map second)
+                      sort
+                      vec)]
+        ;; First two tasks end at 100, next two at 200
+        (is (= [100 100 200 200] ends)
+            (str "CPU pool should cause batched execution. Got: " ends))))))

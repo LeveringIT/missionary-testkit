@@ -2,23 +2,13 @@
 All notable changes to this project will be documented in this file. This change log follows the conventions of [keepachangelog.com](http://keepachangelog.com/).
 
 ## [Unreleased]
-### Changed
-- Add a new arity to `make-widget-async` to provide a different widget shape.
-
-## [0.1.1] - 2026-01-13
-### Changed
-- Documentation on how to make the widgets.
-
-### Removed
-- `make-widget-sync` - we're all async, all the time.
-
-### Fixed
-- Fixed widget maker to keep working when daylight savings switches over.
-
-## 0.1.0 - 2026-01-13
 ### Added
-- Files from the new template.
-- Widget maker public API - `make-widget-sync`.
+- Thread pool modeling with `:cpu-threads` option for `make-scheduler` (default 8)
+- Lane-based concurrency: `:default` (single-threaded), `:cpu` (thread pool), `:blk` (unlimited)
+- `:task-start` and `:task-complete` trace events for tasks with duration
+- `:cpu-threads` option for `check-interleaving` and `explore-interleavings`
+- `cpu-threads` included in failure bundles for faithful replay
 
-[Unreleased]: https://github.com/de.levering-it/missionary-testkit/compare/0.1.1...HEAD
-[0.1.1]: https://github.com/de.levering-it/missionary-testkit/compare/0.1.0...0.1.1
+### Changed
+- Tasks with duration now go through split execution (start → in-flight → complete) instead of instant execution
+- CPU tasks respect thread pool capacity; BLK tasks can run concurrently without limit
