@@ -203,7 +203,8 @@ The scheduler manages virtual time and a queue of pending tasks:
                                 :seed            42        ; seed for random ordering (nil = FIFO)
                                 :trace?          true      ; enable execution trace
                                 :micro-schedule  nil       ; explicit decisions (see Schedule Decisions)
-                                :duration-range  [10 50]}))  ; virtual duration [lo hi] for yield/via-call
+                                :duration-range  [10 50]   ; virtual duration [lo hi] for yield/via-call
+                                :timer-policy    :promote-first}))  ; or :microtasks-first
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
 (mt/pending sched)  ; => {:microtasks [...] :timers [...]}
@@ -217,6 +218,15 @@ The scheduler manages virtual time and a queue of pending tasks:
 **Virtual task duration:**
 - **No duration-range (default):** All user work completes instantly (0ms virtual time).
 - **With duration-range:** Each `yield` and `via-call` (user work) takes a pseudo-random virtual duration between `[lo hi]` (inclusive). This enables realistic timeout testing where work can take varying amounts of time. Infrastructure microtasks (job completion, timer callbacks, etc.) always complete instantly.
+
+**Timer policy (microtasks vs timers at same virtual time):**
+- **:promote-first (default):** Promote due timers to microtask queue first, then select among all available. More adversarial; timers compete equally with microtasks.
+- **:microtasks-first:** Drain existing microtasks first, then promote/run timers due at that time. JS-like microtask priority; more realistic.
+
+**Split RNG streams:**
+- Uses separate RNG streams for task selection (`:rng-select`) and duration generation (`:rng-duration`).
+- Enabling `:duration-range` won't change interleaving order - the streams are independent.
+- During replay, schedule + seed + duration-range produces identical behavior.
 
 ```clojure
 ;; FIFO ordering (default) - predictable for unit tests
@@ -607,16 +617,18 @@ This is useful for:
 When `check-interleaving` finds a bug, you can replay the exact schedule:
 
 ```clojure
-;; Replay using the failure bundle directly
+;; Replay using the failure bundle directly (recommended)
+;; The failure bundle contains all config needed for faithful replay:
+;; :schedule, :seed, :duration-range, :initial-ms, :timer-policy
 (mt/with-determinism
   (mt/replay make-buggy-task result))
 
-;; Or extract the schedule manually
+;; Or use replay-schedule for manual control
 (mt/with-determinism
-  (mt/replay-schedule (make-buggy-task) (:schedule result)))
+  (mt/replay-schedule (make-buggy-task) (:schedule result) result))
 ```
 
-**Note:** `replay` takes a task factory and the failure bundle. `replay-schedule` takes a task instance directly. Both must be called inside `with-determinism`.
+**Note:** `replay` takes a task factory and the failure bundle - it extracts all configuration automatically. `replay-schedule` takes a task instance, schedule, and opts map. Both must be called inside `with-determinism`.
 
 ### Exploring All Outcomes
 
@@ -852,11 +864,12 @@ The scheduler automatically detects common problems:
 - `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be both created and executed inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point)). `run` and `start!` automatically bind `*scheduler*` to the passed scheduler.
 
 ### Interleaving (Concurrency Testing)
-- `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:ok? true :seed s ...}` or `{:ok? false :kind ... :schedule ... :seed s ...}`. Options: `:num-tests`, `:seed`, `:property`, `:duration-range`.
-- `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`. Options: `:num-samples`, `:seed`, `:duration-range`.
-- `(replay task-fn failure)` - replay a failure bundle from `check-interleaving`
-- `(replay-schedule task schedule)` - replay exact execution order (task created inside `with-determinism`)
+- `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:ok? true :seed s ...}` or `{:ok? false :kind ... :schedule ... :seed s ...}`. Options: `:num-tests`, `:seed`, `:property`, `:duration-range`, `:timer-policy`.
+- `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`. Options: `:num-samples`, `:seed`, `:duration-range`, `:timer-policy`.
+- `(replay task-fn failure)` - replay a failure bundle from `check-interleaving`. The failure bundle contains all config needed (schedule, seed, duration-range, timer-policy).
+- `(replay-schedule task schedule opts)` - replay exact execution order with explicit opts (task created inside `with-determinism`)
 - `(trace->schedule trace)` - extract schedule (vector of task IDs) from trace
+- `(cancel-microtask! sched id)` - cancel an enqueued microtask by ID, removing it from the queue
 
 ## Running Tests
 

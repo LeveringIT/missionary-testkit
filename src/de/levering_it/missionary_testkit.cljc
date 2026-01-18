@@ -102,11 +102,25 @@
 (defn- q-conj [q x] (conj q x))
 
 ;; -----------------------------------------------------------------------------
+;; RNG helpers (needed by make-scheduler, defined early)
+;; -----------------------------------------------------------------------------
+
+(defn- lcg-next
+  "Linear Congruential Generator step. Returns next RNG state.
+  Uses parameters that work well within 32-bit range for CLJS compatibility."
+  [rng-state]
+  (let [;; LCG parameters (same as MINSTD)
+        a 48271
+        m 2147483647 ; 2^31 - 1
+        next-state (mod (* a (long rng-state)) m)]
+    (if (zero? next-state) 1 next-state)))
+
+;; -----------------------------------------------------------------------------
 ;; Scheduler
 ;; -----------------------------------------------------------------------------
 
 (defrecord TestScheduler
-           [state seed trace? micro-schedule duration-range])
+           [state seed trace? micro-schedule duration-range timer-policy])
 
 (defn- maybe-trace-state
   "If tracing enabled (state has non-nil :trace vector), append event."
@@ -126,7 +140,8 @@
    :micro-schedule nil | vector        ; explicit selection decisions (overrides seed)
    :duration-range nil | [lower upper] ; virtual duration range for microtasks
                                        ; nil (default) = 0ms duration (instant)
-                                       ; [lo hi] = random duration in [lo,hi]ms per task}
+                                       ; [lo hi] = random duration in [lo,hi]ms per task
+   :timer-policy   :promote-first | :microtasks-first}
 
   Ordering behavior:
   - No seed (or nil): FIFO ordering for both timers and microtasks.
@@ -141,6 +156,17 @@
     at enqueue time. After execution, virtual time advances by that duration.
     This enables realistic timeout races and timing-dependent interleaving.
 
+  Timer policy (microtasks vs timers at same virtual time):
+  - :promote-first (default) - promote due timers to microtask queue first,
+    then select among all available. More adversarial; timers compete equally.
+  - :microtasks-first - drain existing microtasks first, then promote/run
+    timers due at that time. JS-like microtask priority; more realistic.
+
+  RNG streams:
+  - Uses separate RNG streams for task selection and duration generation.
+  - This means enabling :duration-range won't change interleaving order.
+  - During replay, schedule + seed + duration-range produces identical behavior.
+
   The :micro-schedule option provides explicit control over microtask selection
   when you need to replay a specific interleaving or test a particular order.
 
@@ -148,26 +174,36 @@
   thread. Cross-thread callbacks will throw an error to catch accidental nondeterminism."
   ([]
    (make-scheduler {}))
-  ([{:keys [initial-ms seed trace? micro-schedule duration-range]
+  ([{:keys [initial-ms seed trace? micro-schedule duration-range timer-policy]
      :or {initial-ms 0
           trace? false
           micro-schedule nil
-          duration-range nil}}]
-   (->TestScheduler
-    (atom {:now-ms (long initial-ms)
-           :next-id 0
-           :micro-q empty-queue
-           ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
-           :timers (sorted-map)
-           ;; trace is either nil or vector
-           :trace (when trace? [])
-           ;; JVM-only "driver thread" captured lazily for thread safety enforcement
-           :driver-thread #?(:clj nil :cljs ::na)
-           ;; interleaving: micro-schedule index (consumed as used)
-           :schedule-idx 0
-           ;; deterministic RNG state for :random selection (LCG)
-           :rng-state (if seed (long seed) 0)})
-    seed (boolean trace?) micro-schedule duration-range)))
+          duration-range nil
+          timer-policy :promote-first}}]
+   ;; Derive separate RNG seeds for selection and duration
+   ;; Using different offsets ensures independent streams
+   (let [base-seed (if seed (long seed) 0)
+         select-seed base-seed
+         ;; Offset duration seed to avoid correlation
+         duration-seed (if seed (lcg-next (+ base-seed 1000000)) 0)]
+     (->TestScheduler
+      (atom {:now-ms (long initial-ms)
+             :next-id 0
+             :micro-q empty-queue
+             ;; timers: sorted-map keyed by [at-ms tie order id] -> timer-map
+             :timers (sorted-map)
+             ;; trace is either nil or vector
+             :trace (when trace? [])
+             ;; JVM-only "driver thread" captured lazily for thread safety enforcement
+             :driver-thread #?(:clj nil :cljs ::na)
+             ;; interleaving: micro-schedule index (consumed as used)
+             :schedule-idx 0
+             ;; Split RNG streams for independent randomization
+             ;; :rng-select - used for task selection (interleaving)
+             ;; :rng-duration - used for duration generation
+             :rng-select select-seed
+             :rng-duration duration-seed})
+      seed (boolean trace?) micro-schedule duration-range timer-policy))))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -281,16 +317,6 @@
   (let [x (+ (* 1664525 (long order)) (long seed))]
     (long (mod x 4294967296)))) ; 2^32
 
-(defn- lcg-next
-  "Linear Congruential Generator step. Returns next RNG state.
-  Uses parameters that work well within 32-bit range for CLJS compatibility."
-  [rng-state]
-  (let [;; LCG parameters (same as MINSTD)
-        a 48271
-        m 2147483647 ; 2^31 - 1
-        next-state (mod (* a (long rng-state)) m)]
-    (if (zero? next-state) 1 next-state)))
-
 (defn- rand-in-range
   "Generate a random integer in [lo, hi] inclusive using RNG state.
   Returns [value new-rng-state]."
@@ -303,15 +329,16 @@
 (defn- next-duration!
   "Get next duration from scheduler's duration-range, atomically updating RNG.
   Returns duration in ms (0 if no duration-range configured).
+  Uses :rng-duration stream (separate from :rng-select for interleaving).
   Used by yield and via-call to assign durations to user work."
   [^TestScheduler sched]
   (if-let [[lo hi] (:duration-range sched)]
     (let [result (atom nil)]
       (swap! (:state sched)
              (fn [s]
-               (let [[duration new-rng] (rand-in-range (:rng-state s) lo hi)]
+               (let [[duration new-rng] (rand-in-range (:rng-duration s) lo hi)]
                  (reset! result duration)
-                 (assoc s :rng-state new-rng))))
+                 (assoc s :rng-duration new-rng))))
       @result)
     0))
 
@@ -436,6 +463,55 @@
                s))))
   nil)
 
+(defn- remove-microtask-by-id
+  "Remove a microtask from the queue by its ID. Returns the updated queue."
+  [q target-id]
+  (let [v (vec (seq q))]
+    (reduce (fn [acc mt]
+              (if (= target-id (:id mt))
+                acc ; skip this one
+                (conj acc mt)))
+            #?(:clj clojure.lang.PersistentQueue/EMPTY
+               :cljs cljs.core/PersistentQueue.EMPTY)
+            v)))
+
+(defn cancel-microtask!
+  "Cancel an enqueued microtask by its ID, removing it from the microtask queue.
+
+  This is a scheduler-level cancellation that completely removes the microtask
+  from the queue, so it won't consume a scheduler step or advance virtual time.
+
+  Returns true if the microtask was found and removed, false otherwise.
+
+  Usage:
+    (let [id (mt/enqueue-microtask! sched work-fn {:label \"work\"})]
+      ;; Later, before it executes:
+      (mt/cancel-microtask! sched id))
+
+  Note: For yield/timeout/via-call, the cancel thunk returned at creation time
+  will call this internally. Direct use is for advanced scenarios where you
+  store the microtask ID and want to cancel before execution."
+  [^TestScheduler sched microtask-id]
+  (ensure-driver-thread! sched "cancel-microtask!")
+  (let [found? (atom false)]
+    (swap! (:state sched)
+           (fn [s]
+             (let [q (:micro-q s)
+                   v (vec (seq q))
+                   idx (first (keep-indexed (fn [i mt] (when (= microtask-id (:id mt)) i)) v))]
+               (if idx
+                 (let [mt (nth v idx)]
+                   (reset! found? true)
+                   (-> s
+                       (assoc :micro-q (remove-microtask-by-id q microtask-id))
+                       (maybe-trace-state {:event :cancel-microtask
+                                           :id microtask-id
+                                           :kind (:kind mt)
+                                           :label (:label mt)
+                                           :now-ms (:now-ms s)})))
+                 s))))
+    @found?))
+
 ;; -----------------------------------------------------------------------------
 ;; Queue selection for interleaving
 ;; -----------------------------------------------------------------------------
@@ -499,6 +575,7 @@
       [(q-peek q) (q-pop q) rng-state]
 
       ;; :random - random selection (run-time with seed)
+      ;; Uses :rng-select stream for interleaving decisions
       (= decision :random)
       (let [v (q->vec q)
             n (count v)
@@ -559,9 +636,10 @@
     (:at-ms t)))
 
 (defn- select-and-remove-task
-  "Select a task from queue and return [mt q' decision rng-state s-after].
+  "Select a task from queue and return [mt q' decision rng-select s-after].
   When task-id is provided, selects that specific task.
-  Otherwise uses schedule/FIFO/random selection."
+  Otherwise uses schedule/FIFO/random selection.
+  Uses :rng-select stream for random selection (separate from :rng-duration)."
   [^TestScheduler sched s q task-id]
   (let [q-size (count q)]
     (if task-id
@@ -573,12 +651,12 @@
                           {:mt/kind task-id-not-found
                            :target-id task-id
                            :available-ids (mapv :id v)}))
-          [(nth v idx) (vec->q (remove-nth v idx)) task-id (:rng-state s) s]))
+          [(nth v idx) (vec->q (remove-nth v idx)) task-id (:rng-select s) s]))
       ;; No task-id: use schedule/FIFO/random
       (if (= q-size 1)
-        [(q-peek q) (q-pop q) :fifo (:rng-state s) s]
+        [(q-peek q) (q-pop q) :fifo (:rng-select s) s]
         (let [[decision s-after] (get-schedule-decision sched s)
-              [mt q' new-rng] (select-from-queue q decision (:rng-state s-after))]
+              [mt q' new-rng] (select-from-queue q decision (:rng-select s-after))]
           [mt q' decision new-rng s-after])))))
 
 (defn- promote-due-timers!
@@ -616,10 +694,15 @@
 (defn step!
   "Run exactly 1 microtask. Returns ::idle if no microtasks.
 
-  Timers due at the current time are automatically promoted to microtasks
-  before selection. Before execution, virtual time advances by the task's
-  duration-ms (if any), and newly-due timers are promoted. This ensures
-  that when a task's continuation runs, it observes the updated time.
+  Timer promotion behavior depends on :timer-policy:
+  - :promote-first (default): promote due timers first, then select among all.
+    Timers compete equally with microtasks. More adversarial for testing.
+  - :microtasks-first: only promote timers when microtask queue is empty.
+    Drain microtasks first, like JS event loop. More realistic.
+
+  Before execution, virtual time advances by the task's duration-ms (if any),
+  and newly-due timers are promoted. This ensures that when a task's
+  continuation runs, it observes the updated time.
 
   (step! sched)        - select next task per schedule/FIFO/random
   (step! sched task-id) - run specific task by ID (for manual stepping)
@@ -629,8 +712,14 @@
   ([^TestScheduler sched task-id]
    (ensure-driver-thread! sched "step!")
    (binding [*scheduler* sched]
-     ;; Promote due timers before checking microtask queue
-     (promote-due-timers! sched)
+     ;; Timer promotion based on policy
+     (let [policy (or (:timer-policy sched) :promote-first)
+           q-before (:micro-q @(:state sched))]
+       ;; :promote-first - always promote due timers before selection
+       ;; :microtasks-first - only promote if queue is empty
+       (when (or (= policy :promote-first)
+                 (and (= policy :microtasks-first) (q-empty? q-before)))
+         (promote-due-timers! sched)))
      (let [state-atom (:state sched)]
        (loop []
          (let [s @state-atom
@@ -650,7 +739,7 @@
                                    :now-ms now})
                    s' (-> s-after
                           (assoc :micro-q q')
-                          (assoc :rng-state new-rng)
+                          (assoc :rng-select new-rng)
                           (cond-> select-trace (maybe-trace-state select-trace))
                           (maybe-trace-state {:event :run-microtask
                                               :id (:id mt)
@@ -684,8 +773,9 @@
 (defn tick!
   "Drain all microtasks at current virtual time. Returns number of microtasks executed.
 
-  Timers due at the current time are automatically promoted to microtasks
-  before draining (via step!).
+  Timer promotion follows the scheduler's :timer-policy (see step! docs).
+  With :promote-first (default), timers compete with microtasks.
+  With :microtasks-first, microtasks drain before timers are promoted.
 
   Binds *scheduler* to sched for the duration of execution."
   [^TestScheduler sched]
@@ -906,17 +996,20 @@
              ;; Duration priority: explicit :duration-fn > scheduler's duration-range > 0
              duration-ms (if-let [duration-fn (:duration-fn opts)]
                            (duration-fn)
-                           (next-duration! sched))]
-         (enqueue-microtask!
-          sched
-          (fn []
-            (when (compare-and-set! done? false true)
-              (s x)))
-          {:kind :yield
-           :label "yield"
-           :duration-ms duration-ms})
+                           (next-duration! sched))
+             ;; Store microtask ID for cancellation
+             mt-id (enqueue-microtask!
+                    sched
+                    (fn []
+                      (when (compare-and-set! done? false true)
+                        (s x)))
+                    {:kind :yield
+                     :label "yield"
+                     :duration-ms duration-ms})]
          (fn cancel []
            (when (compare-and-set! done? false true)
+             ;; Remove from queue so it doesn't consume a step or advance time
+             (cancel-microtask! sched mt-id)
              ;; fail synchronously, matching Missionary semantics
              (f (cancelled-ex)))
            nil))
@@ -1146,11 +1239,22 @@
    (defn deterministic-via-call*
      "Deterministic replacement for missionary.core/via-call.
 
-      Semantics (deterministic mode):
-      - Ignores real thread hopping: schedules work on the TestScheduler microtask queue.
-      - Runs thunk inside m/sp so `?` and `!` behave as in normal Missionary code.
-      - Cancellation is cooperative: cancels the inner sp and fails with missionary.Cancelled.
-      - DOES NOT interrupt any JVM thread (intentionally diverges from production via semantics)."
+      Contract (deterministic mode):
+      - This is a 'scheduler hop' - thunk runs on the microtask queue, not a real executor.
+      - Thunk SHOULD be pure or non-blocking. m/? inside thunk works but blocks the scheduler.
+      - Thunk is executed synchronously once its microtask starts; no real concurrency.
+      - Duration-range applies: thunk gets a virtual duration for timeout race testing.
+
+      Cancellation semantics:
+      - Before microtask starts: task is removed from queue, no CPU/time consumed.
+      - During microtask execution: NOT interruptible (single-threaded scheduler).
+      - After microtask completes: result discarded if cancel races with completion.
+      - Always fails with missionary.Cancelled when cancelled.
+
+      Limitations vs production:
+      - No JVM thread interrupt - cancellation is cooperative only.
+      - Thunk cannot be interrupted mid-execution (use yield points for interleaving).
+      - Real I/O in thunk will break determinism (same as any real I/O in tests)."
      [exec thunk]
      (fn [s f]
        (let [sched (require-scheduler!)
@@ -1168,35 +1272,35 @@
                     :else :default)
 
              done?        (atom false)
-             duration-ms  (next-duration! sched)]
-
-         ;; Schedule the "executor hop" as a microtask
-         (enqueue-microtask!
-          sched
-          (fn []
-            ;; If cancelled before we start, do nothing.
-            (when-not @done?
-              (let [cont (try
-                           (let [x (thunk)]
-                             #(s x))
-                           (catch Exception e
-                             #(f e))
-                           (catch missionary.Cancelled t
-                             nil))]
-                (when (compare-and-set! done? false true)
-                  (when cont
-                    (cont))))))
-          {:kind  :via-call
-           :label "via-call"
-           :lane  lane
-           :duration-ms duration-ms})
+             duration-ms  (next-duration! sched)
+             ;; Store microtask ID for cancellation
+             mt-id (enqueue-microtask!
+                    sched
+                    (fn []
+                      ;; If cancelled before we start, do nothing.
+                      (when-not @done?
+                        (let [cont (try
+                                     (let [x (thunk)]
+                                       #(s x))
+                                     (catch Exception e
+                                       #(f e))
+                                     (catch missionary.Cancelled t
+                                       nil))]
+                          (when (compare-and-set! done? false true)
+                            (when cont
+                              (cont))))))
+                    {:kind  :via-call
+                     :label "via-call"
+                     :lane  lane
+                     :duration-ms duration-ms})]
 
          ;; Cancel thunk
          (fn cancel []
            ;; keep determinism: cancellation must happen on the driver thread
            (ensure-driver-thread! sched "via-call cancel")
            (when (compare-and-set! done? false true)
-             ;; we could cancel thunk here, but it does not make sense in a single threaded context
+             ;; Remove from queue so it doesn't consume a step or advance time
+             (cancel-microtask! sched mt-id)
              ;; fail immediately like other cancelled primitives
              (f (cancelled-ex)))
            nil))))
@@ -1206,19 +1310,32 @@
 
 
 (defn via-call
-  "Deterministic replacement for missionary.core/via-call.
+  "Execute thunk on executor, with dispatch based on determinism mode.
 
-      Semantics (deterministic mode):
-      - Ignores real thread hopping: schedules work on the TestScheduler microtask queue.
-      - Runs thunk inside m/sp so `?` and `!` behave as in normal Missionary code.
-      - Cancellation is cooperative: cancels the inner sp and fails with missionary.Cancelled.
-      - DOES NOT interrupt any JVM thread (intentionally diverges from production via semantics)."
+  In deterministic mode (*is-deterministic* true):
+  - Thunk runs on the scheduler's microtask queue (not a real executor).
+  - This is a 'scheduler hop' for deterministic testing, not real thread pool execution.
+  - Thunk SHOULD be pure or non-blocking; m/? works but blocks the scheduler.
+  - Duration-range applies: gets virtual duration for timeout race testing.
+  - Cancellation removes from queue if not started, or races with completion.
+  - Only m/cpu and m/blk executors are supported; others throw.
+
+  In production mode (*is-deterministic* false):
+  - Delegates to original missionary.core/via-call.
+  - Thunk runs on the actual executor with real concurrency.
+
+  Contract for deterministic testing:
+  - Thunk cannot be interrupted mid-execution (no Thread.interrupt).
+  - For interleaving at points within thunk, use mt/yield explicitly.
+  - Tests passing under testkit may still have concurrency bugs in production
+    if thunk relies on real thread interruption.
+
+  See deterministic-via-call* for detailed cancellation semantics."
   ([exec thunk]
    ;; Return a task that dispatches at execution time
    (fn [s f]
      (if *is-deterministic*
        ((deterministic-via-call* exec thunk) s f)
-
        ((original-via-call exec thunk) s f)))))
 
 
@@ -1376,27 +1493,21 @@
        (mapv :selected-id)))
 
 (defn replay-schedule
-  "Run a task with the exact schedule from a previous trace.
+  "Run a task with the exact schedule and configuration from a previous run.
   Returns the task result.
 
   IMPORTANT: Must be called inside a with-determinism body.
 
-  Usage:
-    (def original-trace (mt/trace sched))
-    (with-determinism
-      (mt/replay-schedule (make-task) (mt/trace->schedule original-trace)))"
+  Typically you should use mt/replay instead, which automatically extracts
+  the correct configuration from a check-interleaving failure bundle."
   ([task schedule]
    (replay-schedule task schedule {}))
-  ([task schedule {:keys [trace? max-steps max-time-ms]
-                   :or {trace? true
-                        max-steps 100000
-                        max-time-ms 60000}}]
+  ([task schedule opts]
    (when-not *is-deterministic*
      (throw (ex-info "replay-schedule must be called inside with-determinism body"
                      {:mt/kind ::replay-without-determinism})))
-   (let [sched (make-scheduler {:micro-schedule schedule :trace? trace?})]
-     (run sched task {:max-steps max-steps
-                      :max-time-ms max-time-ms}))))
+   (let [sched (make-scheduler (assoc opts :micro-schedule schedule))]
+     (run sched task (select-keys opts [:max-steps :max-time-ms])))))
 
 (defn replay
   "Replay a failure from check-interleaving.
@@ -1404,27 +1515,20 @@
   IMPORTANT: Must be called inside a with-determinism body.
 
   Takes a failure bundle (from check-interleaving) and a task factory,
-  re-runs the task with the same schedule that caused the failure.
+  re-runs the task with the exact schedule and configuration that caused
+  the failure.
 
   Usage:
     (let [result (mt/check-interleaving make-task {:seed 42 :property valid?})]
       (when-not (:ok? result)
-        (mt/replay make-task result)))
-
-  Options (merged with failure bundle):
-  - :trace?      - whether to record trace (default true)
-  - :max-steps   - max scheduler steps (default 100000)
-  - :max-time-ms - max virtual time (default 60000)
-
-  Returns the task result (same as replay-schedule)."
-  ([task-fn failure]
-   (replay task-fn failure {}))
-  ([task-fn failure opts]
-   (let [schedule (or (:schedule failure)
-                      (throw (ex-info "Failure bundle missing :schedule"
-                                      {:mt/kind ::invalid-failure-bundle
-                                       :failure failure})))]
-     (replay-schedule (task-fn) schedule opts))))
+        (mt/with-determinism
+          (mt/replay make-task result))))"
+  [task-fn failure]
+  (let [schedule (or (:schedule failure)
+                     (throw (ex-info "Failure bundle missing :schedule"
+                                     {:mt/kind ::invalid-failure-bundle
+                                      :failure failure})))]
+    (replay-schedule (task-fn) schedule failure)))
 
 
 ;; -----------------------------------------------------------------------------
@@ -1439,11 +1543,15 @@
   "Run a task once with random selection seeded by test-seed. Returns map with result info.
   Internal helper for check-interleaving and explore-interleavings.
   Must be called inside a with-determinism body."
-  [task {:keys [test-seed max-steps max-time-ms duration-range]
-         :or {max-time-ms 60000}}]
+  [task {:keys [test-seed max-steps max-time-ms duration-range initial-ms timer-policy]
+         :or {max-time-ms 60000
+              initial-ms 0
+              timer-policy :promote-first}}]
   (let [sched (make-scheduler {:trace? true
                                :seed test-seed
-                               :duration-range duration-range})
+                               :duration-range duration-range
+                               :initial-ms initial-ms
+                               :timer-policy timer-policy})
         result (try
                  {:value (run sched task {:max-steps max-steps
                                           :max-time-ms max-time-ms})}
@@ -1471,6 +1579,8 @@
   - :duration-range - [lo hi] virtual duration range for microtasks (default nil)
                       When set, each microtask gets a random duration in [lo,hi]ms.
                       This enables realistic timeout races and timing exploration.
+  - :timer-policy   - :promote-first (default) or :microtasks-first
+                      Controls whether timers compete with microtasks at same time.
 
   Returns on success:
   {:ok?            true
@@ -1478,21 +1588,28 @@
    :iterations-run number of iterations completed}
 
   Returns on failure:
-  {:ok?       false
-   :kind      :exception | :property-failed
-   :seed      seed used for this iteration
-   :schedule  schedule that caused failure (for replay)
-   :trace     full trace
-   :iteration which iteration failed
-   :error     exception (present when :kind is :exception)
-   :value     result value (present when :kind is :property-failed)}
+  {:ok?            false
+   :kind           :exception | :property-failed
+   :seed           seed used for this iteration (for RNG replay)
+   :schedule       schedule that caused failure (for replay)
+   :duration-range [lo hi] if timing fuzz was enabled (for replay)
+   :timer-policy   timer policy if non-default (for replay)
+   :trace          full trace
+   :iteration      which iteration failed
+   :error          exception (present when :kind is :exception)
+   :value          result value (present when :kind is :property-failed)}
 
   Note: For reproducible tests, always specify :seed. Without it, the current
-  system time is used, making results non-reproducible across runs."
-  [task-fn {:keys [num-tests seed property max-steps max-time-ms duration-range]
+  system time is used, making results non-reproducible across runs.
+
+  The failure bundle contains all information needed to reproduce the exact
+  failure using mt/replay, including timing configuration."
+  [task-fn {:keys [num-tests seed property max-steps max-time-ms duration-range initial-ms timer-policy]
             :or {num-tests 100
                  max-steps 10000
-                 max-time-ms 60000}}]
+                 max-time-ms 60000
+                 initial-ms 0
+                 timer-policy :promote-first}}]
   (let [base-seed (or seed (default-base-seed))]
     (loop [i 0]
       (if (>= i num-tests)
@@ -1501,21 +1618,28 @@
                                                        {:test-seed (+ base-seed i)
                                                         :max-steps max-steps
                                                         :max-time-ms max-time-ms
-                                                        :duration-range duration-range})
+                                                        :duration-range duration-range
+                                                        :initial-ms initial-ms
+                                                        :timer-policy timer-policy})
               {:keys [result seed micro-schedule trace]} run-result
               exception? (some? (:error result))
               property-failed? (and property
                                     (not exception?)
                                     (not (property (:value result))))]
           (if (or exception? property-failed?)
-            {:ok? false
-             :kind (if exception? :exception :property-failed)
-             :seed seed
-             :schedule micro-schedule
-             :trace trace
-             :iteration i
-             :error (when exception? (:error result))
-             :value (when-not exception? (:value result))}
+            (cond-> {:ok? false
+                     :kind (if exception? :exception :property-failed)
+                     :seed seed
+                     :schedule micro-schedule
+                     :trace trace
+                     :iteration i}
+              ;; Include timing config for replay
+              duration-range (assoc :duration-range duration-range)
+              (not= 0 initial-ms) (assoc :initial-ms initial-ms)
+              (not= :promote-first timer-policy) (assoc :timer-policy timer-policy)
+              ;; Include result data
+              exception? (assoc :error (:error result))
+              (not exception?) (assoc :value (:value result)))
             (recur (inc i))))))))
 
 (defn explore-interleavings
@@ -1533,6 +1657,8 @@
   - :duration-range - [lo hi] virtual duration range for microtasks (default nil)
                       When set, each microtask gets a random duration in [lo,hi]ms.
                       This enables realistic timeout races and timing exploration.
+  - :timer-policy   - :promote-first (default) or :microtasks-first
+                      Controls whether timers compete with microtasks at same time.
 
   Returns:
   {:unique-results - count of distinct results seen
@@ -1541,15 +1667,17 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-  [task-fn {:keys [num-samples seed max-steps duration-range]
+  [task-fn {:keys [num-samples seed max-steps duration-range timer-policy]
             :or {num-samples 100
-                 max-steps 10000}}]
+                 max-steps 10000
+                 timer-policy :promote-first}}]
   (let [base-seed (or seed (default-base-seed))
         results (for [i (range num-samples)
                       :let [run-result (run-with-random-interleaving (task-fn)
                                                                      {:test-seed (+ base-seed i)
                                                                       :max-steps max-steps
-                                                                      :duration-range duration-range})
+                                                                      :duration-range duration-range
+                                                                      :timer-policy timer-policy})
                             ;; Extract value or return error map
                             r (let [res (:result run-result)]
                                 (if (:error res) res (:value res)))]]

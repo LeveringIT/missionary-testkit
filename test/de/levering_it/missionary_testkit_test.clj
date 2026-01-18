@@ -1463,9 +1463,10 @@
     ;; When work duration > timeout, the timer becomes due during the work's duration.
     ;; After duration advances, both the timer callback and work-success callback
     ;; are in the queue. The outcome depends on which is selected first.
-    ;; With seed 1, timeout wins; with seed 0, work wins.
+    ;; With seed 2, timeout wins; with seed 1, work wins.
+    ;; (Note: seeds changed after RNG stream split - selection now uses independent stream)
     (mt/with-determinism
-      (let [sched (mt/make-scheduler {:duration-range [100 100] :seed 1})]
+      (let [sched (mt/make-scheduler {:duration-range [100 100] :seed 2})]
         (is (= :timed-out
                (mt/run sched
                        (m/sp
@@ -1475,7 +1476,7 @@
                                   :work-completed)
                                 50 ;; 50ms timeout
                                 :timed-out)))))
-            "With seed 1, timeout wins the race"))))
+            "With seed 2, timeout wins the race"))))
 
   (testing "work beats timeout when work duration is less than timeout"
     ;; When work duration < timeout, work completes before timeout is due.
@@ -1633,3 +1634,155 @@
                        (m/sp
                          (m/? (mt/yield :my-value {:duration-fn (constantly 10)})))))
             "yield with opts should return the value")))))
+
+;; -----------------------------------------------------------------------------
+;; Cancel-microtask tests
+;; -----------------------------------------------------------------------------
+
+(deftest cancel-microtask-test
+  (testing "cancel-microtask! returns false when task not found"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)]
+        (is (false? (mt/cancel-microtask! sched 999)) "Should return false for unknown ID"))))
+
+  (testing "yield cancellation removes from queue"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:trace? true})
+            result (atom nil)
+            cancel-fn (atom nil)]
+        ;; Need to bind scheduler for yield to work
+        (binding [mt/*scheduler* sched]
+          ;; Start a yield but capture the cancel function
+          (reset! cancel-fn
+                  ((mt/yield :should-not-see)
+                   (fn [x] (reset! result x))
+                   (fn [e] (reset! result [:error e])))))
+        ;; Cancel it
+        (@cancel-fn)
+        ;; Step should be idle - yield was removed from queue
+        (is (= :de.levering-it.missionary-testkit/idle (mt/step! sched))
+            "Queue should be empty after yield cancellation")
+        ;; Result should be the cancelled error
+        (is (vector? @result) "Should have error result")
+        (is (= :error (first @result)))
+        ;; Trace should have cancel-microtask event
+        (let [cancel-events (filter #(= :cancel-microtask (:event %)) (mt/trace sched))]
+          (is (= 1 (count cancel-events)) "Should have one cancel event")))))
+
+  (testing "via-call cancellation removes from queue"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:trace? true})
+            executed (atom false)
+            cancel-fn (atom nil)]
+        ;; Need to bind scheduler for via-call to work
+        (binding [mt/*scheduler* sched]
+          ;; Start a via-call but capture the cancel function
+          (reset! cancel-fn
+                  ((mt/via-call m/cpu (fn [] (reset! executed true) :result))
+                   (fn [x] nil)
+                   (fn [e] nil))))
+        ;; Cancel it
+        (@cancel-fn)
+        ;; Step should be idle - via-call was removed from queue
+        (is (= :de.levering-it.missionary-testkit/idle (mt/step! sched))
+            "Queue should be empty after via-call cancellation")
+        (is (false? @executed) "Thunk should not have executed")
+        ;; Trace should have cancel-microtask event
+        (let [cancel-events (filter #(= :cancel-microtask (:event %)) (mt/trace sched))]
+          (is (= 1 (count cancel-events)) "Should have one cancel event"))))))
+
+;; -----------------------------------------------------------------------------
+;; Timer-policy tests
+;; -----------------------------------------------------------------------------
+
+(deftest timer-policy-test
+  (testing ":microtasks-first ensures microtask drains before timer promotion"
+    ;; The :microtasks-first policy should drain all microtasks before promoting
+    ;; timers. We test this by having a yield (microtask) and sleep 0 (timer at t=0)
+    ;; running in parallel. With :microtasks-first, yield should complete before
+    ;; the sleep timer is promoted.
+    (mt/with-determinism
+      ;; With :microtasks-first, microtask drains before timer is promoted
+      (let [sched (mt/make-scheduler {:timer-policy :microtasks-first})
+            order (atom [])
+            result (mt/run sched
+                           (m/sp
+                             (m/? (m/join  ;; Need m/? to await the join
+                                    vector
+                                    ;; sleep 0 = timer due immediately, but won't be promoted
+                                    ;; until microtask queue is empty
+                                    (m/sp (m/? (m/sleep 0)) (swap! order conj :timer) :a)
+                                    ;; yield = microtask, runs first
+                                    (m/sp (m/? (mt/yield)) (swap! order conj :micro) :b)))))]
+        ;; With :microtasks-first, the yield completes before sleep timer is promoted
+        ;; Note: m/join adds its own microtasks, but the key ordering we're testing
+        ;; is that the yield's effect happens before the sleep timer's effect
+        (is (= [:micro :timer] @order)
+            "Microtask should complete before timer with :microtasks-first"))))
+
+  (testing ":timer-policy included in failure bundles"
+    (mt/with-determinism
+      ;; Check that timer-policy is passed through check-interleaving
+      (let [result (mt/check-interleaving
+                     (fn []
+                       (let [order (atom [])]
+                         (m/sp
+                           (m/? (m/join  ;; Need m/? to await the join
+                                  vector
+                                  (m/sp (m/? (m/sleep 0)) (swap! order conj :timer) :a)
+                                  (m/sp (m/? (mt/yield)) (swap! order conj :micro) :b)))
+                           @order)))
+                     {:num-tests 10
+                      :seed 42
+                      :timer-policy :microtasks-first
+                      :property (fn [r] (= [:micro :timer] r))})]
+        ;; With :microtasks-first, the order should always be [:micro :timer]
+        (is (:ok? result)
+            "With :microtasks-first, order should always be [:micro :timer]")))))
+
+;; -----------------------------------------------------------------------------
+;; Split RNG streams tests
+;; -----------------------------------------------------------------------------
+
+(deftest split-rng-streams-test
+  (testing "duration-range doesn't affect interleaving order"
+    (mt/with-determinism
+      ;; Run same seed with and without duration-range, compare interleaving
+      (let [make-task (fn []
+                        (let [result (atom [])]
+                          (m/sp
+                            (m/join
+                              vector
+                              (m/sp (swap! result conj :a) (m/? (mt/yield)) (swap! result conj :a2))
+                              (m/sp (swap! result conj :b) (m/? (mt/yield)) (swap! result conj :b2)))
+                            @result)))
+            ;; Without duration-range
+            sched1 (mt/make-scheduler {:seed 42 :trace? true})
+            result1 (mt/run sched1 (make-task))
+            schedule1 (mt/trace->schedule (mt/trace sched1))
+            ;; With duration-range
+            sched2 (mt/make-scheduler {:seed 42 :duration-range [10 100] :trace? true})
+            result2 (mt/run sched2 (make-task))
+            schedule2 (mt/trace->schedule (mt/trace sched2))]
+        ;; The interleaving order should be identical
+        (is (= schedule1 schedule2)
+            "Same seed should produce same interleaving with or without duration-range")
+        (is (= result1 result2)
+            "Same seed should produce same result with or without duration-range"))))
+
+  (testing "different duration-range values don't change interleaving"
+    (mt/with-determinism
+      (let [make-task (fn []
+                        (m/sp
+                          (m/join vector
+                                  (m/sp (m/? (mt/yield)) :a)
+                                  (m/sp (m/? (mt/yield)) :b)
+                                  (m/sp (m/? (mt/yield)) :c))))
+            sched1 (mt/make-scheduler {:seed 123 :duration-range [1 10] :trace? true})
+            _ (mt/run sched1 (make-task))
+            schedule1 (mt/trace->schedule (mt/trace sched1))
+            sched2 (mt/make-scheduler {:seed 123 :duration-range [100 1000] :trace? true})
+            _ (mt/run sched2 (make-task))
+            schedule2 (mt/trace->schedule (mt/trace sched2))]
+        (is (= schedule1 schedule2)
+            "Different duration-range should produce same interleaving")))))
