@@ -106,7 +106,7 @@
 ;; -----------------------------------------------------------------------------
 
 (defrecord TestScheduler
-           [state seed trace? micro-schedule])
+           [state seed trace? micro-schedule duration-range])
 
 (defn- maybe-trace-state
   "If tracing enabled (state has non-nil :trace vector), append event."
@@ -123,13 +123,23 @@
    :seed           nil | number        ; nil (default) = FIFO ordering
                                        ; number = random ordering with that seed
    :trace?         true|false
-   :micro-schedule nil | vector        ; explicit selection decisions (overrides seed)}
+   :micro-schedule nil | vector        ; explicit selection decisions (overrides seed)
+   :duration-range nil | [lower upper] ; virtual duration range for microtasks
+                                       ; nil (default) = 0ms duration (instant)
+                                       ; [lo hi] = random duration in [lo,hi]ms per task}
 
   Ordering behavior:
   - No seed (or nil): FIFO ordering for both timers and microtasks.
     Predictable, good for unit tests with specific expected order.
   - With seed: Random ordering (seeded RNG) for both timers and microtasks.
     Deterministic but shuffled, good for fuzz/property testing.
+
+  Duration behavior:
+  - No duration-range (or nil): All microtasks complete instantly (0ms).
+    Current behavior, backward compatible.
+  - With duration-range [lo hi]: Each microtask gets a random duration in [lo,hi]ms
+    at enqueue time. After execution, virtual time advances by that duration.
+    This enables realistic timeout races and timing-dependent interleaving.
 
   The :micro-schedule option provides explicit control over microtask selection
   when you need to replay a specific interleaving or test a particular order.
@@ -138,10 +148,11 @@
   thread. Cross-thread callbacks will throw an error to catch accidental nondeterminism."
   ([]
    (make-scheduler {}))
-  ([{:keys [initial-ms seed trace? micro-schedule]
+  ([{:keys [initial-ms seed trace? micro-schedule duration-range]
      :or {initial-ms 0
           trace? false
-          micro-schedule nil}}]
+          micro-schedule nil
+          duration-range nil}}]
    (->TestScheduler
     (atom {:now-ms (long initial-ms)
            :next-id 0
@@ -156,7 +167,7 @@
            :schedule-idx 0
            ;; deterministic RNG state for :random selection (LCG)
            :rng-state (if seed (long seed) 0)})
-    seed (boolean trace?) micro-schedule)))
+    seed (boolean trace?) micro-schedule duration-range)))
 
 (defn now-ms
   "Current virtual time in milliseconds."
@@ -270,6 +281,25 @@
   (let [x (+ (* 1664525 (long order)) (long seed))]
     (long (mod x 4294967296)))) ; 2^32
 
+(defn- lcg-next
+  "Linear Congruential Generator step. Returns next RNG state.
+  Uses parameters that work well within 32-bit range for CLJS compatibility."
+  [rng-state]
+  (let [;; LCG parameters (same as MINSTD)
+        a 48271
+        m 2147483647 ; 2^31 - 1
+        next-state (mod (* a (long rng-state)) m)]
+    (if (zero? next-state) 1 next-state)))
+
+(defn- rand-in-range
+  "Generate a random integer in [lo, hi] inclusive using RNG state.
+  Returns [value new-rng-state]."
+  [rng-state lo hi]
+  (let [next-rng (lcg-next rng-state)
+        range-size (inc (- (long hi) (long lo)))
+        value (+ (long lo) (mod next-rng range-size))]
+    [value next-rng]))
+
 (defn- next-id!
   [^TestScheduler sched]
   (:next-id (swap! (:state sched) update :next-id inc)))
@@ -304,7 +334,7 @@
 
 (defn- enqueue-microtask!
   ([^TestScheduler sched f] (enqueue-microtask! sched f {}))
-  ([^TestScheduler sched f {:keys [label kind lane]
+  ([^TestScheduler sched f {:keys [label kind lane duration-ms]
                             :or {kind :microtask
                                  lane :default}}]
    (ensure-driver-thread! sched "enqueue-microtask!")
@@ -312,20 +342,34 @@
      (swap! (:state sched)
             (fn [s]
               (let [now (:now-ms s)
+                    ;; Determine duration: explicit override > random from range > 0
+                    [duration new-rng]
+                    (if (some? duration-ms)
+                      ;; Explicit duration provided
+                      [duration-ms (:rng-state s)]
+                      ;; Check for duration-range on scheduler
+                      (if-let [[lo hi] (:duration-range sched)]
+                        ;; Generate random duration from range
+                        (rand-in-range (:rng-state s) lo hi)
+                        ;; No range, default to 0
+                        [0 (:rng-state s)]))
                     mt {:id id
                         :kind kind
                         :label label
                         :lane lane
                         :enq-ms now
                         :from :micro
+                        :duration-ms duration
                         :f f}]
                 (-> s
+                    (assoc :rng-state new-rng)
                     (update :micro-q q-conj mt)
                     (maybe-trace-state {:event :enqueue-microtask
                                         :id id
                                         :kind kind
                                         :label label
                                         :lane lane
+                                        :duration-ms duration
                                         :now-ms now})))))
      id)))
 
@@ -403,16 +447,6 @@
   "Remove item at index n from vector."
   [v n]
   (into (subvec v 0 n) (subvec v (inc n))))
-
-(defn- lcg-next
-  "Linear Congruential Generator step. Returns next RNG state.
-  Uses parameters that work well within 32-bit range for CLJS compatibility."
-  [rng-state]
-  (let [;; LCG parameters (same as MINSTD)
-        a 48271
-        m 2147483647 ; 2^31 - 1
-        next-state (mod (* a (long rng-state)) m)]
-    (if (zero? next-state) 1 next-state)))
 
 (defn- select-from-queue
   "Select an item from the queue based on the decision.
@@ -551,11 +585,34 @@
           (when-not (compare-and-set! state-atom s s')
             (recur)))))))
 
+(defn- advance-time-by-duration!
+  "Advance virtual time by duration-ms and promote any newly-due timers.
+  Called before a microtask executes to account for its virtual duration.
+  This way, when the task's continuation runs, it sees the updated time."
+  [^TestScheduler sched duration-ms]
+  (when (pos? duration-ms)
+    (let [state-atom (:state sched)]
+      (loop []
+        (let [s @state-atom
+              old-now (:now-ms s)
+              new-now (+ old-now (long duration-ms))
+              s' (-> s
+                     (assoc :now-ms new-now)
+                     (maybe-trace-state {:event :duration-advance
+                                         :from-ms old-now
+                                         :to-ms new-now
+                                         :duration-ms duration-ms})
+                     (->> (promote-due-timers-in-state sched)))]
+          (when-not (compare-and-set! state-atom s s')
+            (recur)))))))
+
 (defn step!
   "Run exactly 1 microtask. Returns ::idle if no microtasks.
 
   Timers due at the current time are automatically promoted to microtasks
-  before selection.
+  before selection. Before execution, virtual time advances by the task's
+  duration-ms (if any), and newly-due timers are promoted. This ensures
+  that when a task's continuation runs, it observes the updated time.
 
   (step! sched)        - select next task per schedule/FIFO/random
   (step! sched task-id) - run specific task by ID (for manual stepping)
@@ -576,6 +633,7 @@
              (let [q-size (count q)
                    [mt q' decision new-rng s-after] (select-and-remove-task sched s q task-id)
                    now (:now-ms s-after)
+                   duration (:duration-ms mt 0)
                    select-trace (when (> q-size 1)
                                   {:event :select-task
                                    :decision decision
@@ -592,9 +650,13 @@
                                               :kind (:kind mt)
                                               :label (:label mt)
                                               :lane (:lane mt)
+                                              :duration-ms duration
                                               :now-ms now}))]
                (if (compare-and-set! state-atom s s')
                  (do
+                   ;; Advance time by duration BEFORE executing the task
+                   ;; This way the continuation sees the updated time
+                   (advance-time-by-duration! sched duration)
                    (try
                      ((:f mt))
                      (catch #?(:clj Throwable :cljs :default) e
@@ -793,15 +855,21 @@
 
   (mt/yield)
   (mt/yield x)
+  (mt/yield x opts)
 
   In production (outside with-determinism): completes immediately with x (or nil).
   In test mode (inside with-determinism): creates a scheduling point that allows
   other concurrent tasks to interleave, then completes with x.
 
+  Options map (optional, only used in deterministic mode):
+  - :duration-fn  (fn [] ms) - called before enqueueing to get this yield's duration.
+                  Takes precedence over scheduler's :duration-range.
+
   This is useful for:
   - Testing concurrent code under different task orderings
   - Creating explicit interleaving points without time delays
   - Simulating cooperative multitasking yield points
+  - Modeling specific work durations with :duration-fn
 
   Example:
     ;; In production, this just returns :done immediately
@@ -816,21 +884,29 @@
                    (m/sp (swap! result conj :a) (m/? (mt/yield)) (swap! result conj :a2))
                    (m/sp (swap! result conj :b) (m/? (mt/yield)) (swap! result conj :b2))))
             @result)))
-      {:property (fn [r] (= 4 (count r)))})"
+      {:property (fn [r] (= 4 (count r)))})
+
+    ;; Yield with explicit duration
+    (m/? (mt/yield :result {:duration-fn (constantly 50)}))"
   ([] (yield nil))
-  ([x]
+  ([x] (yield x nil))
+  ([x opts]
    (fn [s f]
      (if *is-deterministic*
        ;; Test mode: create a scheduling point via microtask
        (let [sched (require-scheduler!)
-             done? (atom false)]
+             done? (atom false)
+             ;; Call duration-fn before enqueueing if provided
+             duration-ms (when-let [duration-fn (:duration-fn opts)]
+                           (duration-fn))]
          (enqueue-microtask!
           sched
           (fn []
             (when (compare-and-set! done? false true)
               (s x)))
-          {:kind :yield
-           :label "yield"})
+          (cond-> {:kind :yield
+                   :label "yield"}
+            (some? duration-ms) (assoc :duration-ms duration-ms)))
          (fn cancel []
            (when (compare-and-set! done? false true)
              ;; fail synchronously, matching Missionary semantics
@@ -1353,10 +1429,11 @@
   "Run a task once with random selection seeded by test-seed. Returns map with result info.
   Internal helper for check-interleaving and explore-interleavings.
   Must be called inside a with-determinism body."
-  [task {:keys [test-seed max-steps max-time-ms]
+  [task {:keys [test-seed max-steps max-time-ms duration-range]
          :or {max-time-ms 60000}}]
   (let [sched (make-scheduler {:trace? true
-                               :seed test-seed})
+                               :seed test-seed
+                               :duration-range duration-range})
         result (try
                  {:value (run sched task {:max-steps max-steps
                                           :max-time-ms max-time-ms})}
@@ -1376,11 +1453,14 @@
   This ensures mutable state (like atoms) is reset between iterations.
 
   Options:
-  - :num-tests   - number of different interleavings to try (default 100)
-  - :seed        - base seed for RNG (default: current time)
-  - :property    - (fn [result] boolean) - returns true if result is valid
-  - :max-steps   - max scheduler steps per run (default 10000)
-  - :max-time-ms - max virtual time per run (default 60000)
+  - :num-tests      - number of different interleavings to try (default 100)
+  - :seed           - base seed for RNG (default: current time)
+  - :property       - (fn [result] boolean) - returns true if result is valid
+  - :max-steps      - max scheduler steps per run (default 10000)
+  - :max-time-ms    - max virtual time per run (default 60000)
+  - :duration-range - [lo hi] virtual duration range for microtasks (default nil)
+                      When set, each microtask gets a random duration in [lo,hi]ms.
+                      This enables realistic timeout races and timing exploration.
 
   Returns on success:
   {:ok?            true
@@ -1399,7 +1479,7 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-  [task-fn {:keys [num-tests seed property max-steps max-time-ms]
+  [task-fn {:keys [num-tests seed property max-steps max-time-ms duration-range]
             :or {num-tests 100
                  max-steps 10000
                  max-time-ms 60000}}]
@@ -1410,7 +1490,8 @@
         (let [run-result (run-with-random-interleaving (task-fn)
                                                        {:test-seed (+ base-seed i)
                                                         :max-steps max-steps
-                                                        :max-time-ms max-time-ms})
+                                                        :max-time-ms max-time-ms
+                                                        :duration-range duration-range})
               {:keys [result seed micro-schedule trace]} run-result
               exception? (some? (:error result))
               property-failed? (and property
@@ -1436,9 +1517,12 @@
   This ensures mutable state (like atoms) is reset between iterations.
 
   Options:
-  - :num-samples - number of different interleavings to try (default 100)
-  - :seed        - base seed for RNG (default: current time)
-  - :max-steps   - max scheduler steps per run (default 10000)
+  - :num-samples    - number of different interleavings to try (default 100)
+  - :seed           - base seed for RNG (default: current time)
+  - :max-steps      - max scheduler steps per run (default 10000)
+  - :duration-range - [lo hi] virtual duration range for microtasks (default nil)
+                      When set, each microtask gets a random duration in [lo,hi]ms.
+                      This enables realistic timeout races and timing exploration.
 
   Returns:
   {:unique-results - count of distinct results seen
@@ -1447,14 +1531,15 @@
 
   Note: For reproducible tests, always specify :seed. Without it, the current
   system time is used, making results non-reproducible across runs."
-  [task-fn {:keys [num-samples seed max-steps]
+  [task-fn {:keys [num-samples seed max-steps duration-range]
             :or {num-samples 100
                  max-steps 10000}}]
   (let [base-seed (or seed (default-base-seed))
         results (for [i (range num-samples)
                       :let [run-result (run-with-random-interleaving (task-fn)
                                                                      {:test-seed (+ base-seed i)
-                                                                      :max-steps max-steps})
+                                                                      :max-steps max-steps
+                                                                      :duration-range duration-range})
                             ;; Extract value or return error map
                             r (let [res (:result run-result)]
                                 (if (:error res) res (:value res)))]]

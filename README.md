@@ -106,6 +106,29 @@ Add to your `deps.edn`:
 ;; => :timed-out
 ```
 
+### Testing Realistic Timeout Races
+
+By default, microtasks complete instantly (0ms). Use `:duration-range` to give tasks realistic virtual durations, enabling timeout races where work competes with deadlines:
+
+```clojure
+(mt/with-determinism
+  (let [sched (mt/make-scheduler {:duration-range [10 10] :seed 42})]
+    (mt/run sched
+      (m/sp
+        ;; Each yield takes 10ms virtual time
+        (m/? (m/timeout
+               (m/sp
+                 (m/? (mt/yield))  ; 10ms
+                 (m/? (mt/yield))  ; 10ms
+                 (m/? (mt/yield))  ; 10ms = 30ms total
+                 :completed)
+               25  ; timeout at 25ms
+               :timed-out))))))
+;; => :timed-out (work takes 30ms, timeout fires at 25ms)
+```
+
+With different seeds, the race outcome may differ because task selection order affects which completes first when both are ready.
+
 ## Core Concepts
 
 ### The `with-determinism` Entry Point
@@ -174,10 +197,11 @@ This is useful for code that needs to behave differently in tests vs production.
 The scheduler manages virtual time and a queue of pending tasks:
 
 ```clojure
-(def sched (mt/make-scheduler {:initial-ms      0       ; starting time
-                                :seed            42      ; seed for random ordering (nil = FIFO)
-                                :trace?          true    ; enable execution trace
-                                :micro-schedule  nil}))  ; explicit decisions (see Schedule Decisions)
+(def sched (mt/make-scheduler {:initial-ms      0         ; starting time
+                                :seed            42        ; seed for random ordering (nil = FIFO)
+                                :trace?          true      ; enable execution trace
+                                :micro-schedule  nil       ; explicit decisions (see Schedule Decisions)
+                                :duration-range  [10 50]}))  ; virtual task duration range [lo hi]
 
 (mt/now-ms sched)   ; => 0 (current virtual time)
 (mt/pending sched)  ; => {:microtasks [...] :timers [...]}
@@ -187,6 +211,10 @@ The scheduler manages virtual time and a queue of pending tasks:
 **Ordering behavior:**
 - **No seed (default):** FIFO ordering for both timers and microtasks. Predictable, good for unit tests.
 - **With seed:** Random ordering (seeded RNG) for both timers and microtasks. Deterministic but shuffled, good for fuzz/property testing.
+
+**Virtual task duration:**
+- **No duration-range (default):** All microtasks complete instantly (0ms virtual time).
+- **With duration-range:** Each microtask takes a pseudo-random virtual duration between `[lo hi]` (inclusive). This enables realistic timeout testing where work can take varying amounts of time.
 
 ```clojure
 ;; FIFO ordering (default) - predictable for unit tests
@@ -808,7 +836,8 @@ The scheduler automatically detects common problems:
 ### Virtual Time Primitives
 - `(mt/sleep ms)` / `(mt/sleep ms x)` - virtual sleep task
 - `(mt/timeout task ms)` / `(mt/timeout task ms x)` - virtual timeout wrapper
-- `(mt/yield)` / `(mt/yield x)` - yield point for interleaving (no-op in production)
+- `(mt/yield)` / `(mt/yield x)` / `(mt/yield x opts)` - yield point for interleaving (no-op in production)
+  - `opts` can contain `:duration-fn` - a 0-arity function returning the duration for this specific yield (overrides scheduler's `:duration-range`)
 
 ### Utilities
 - `(collect flow)` / `(collect flow opts)` - collect flow to vector task
@@ -821,8 +850,8 @@ The scheduler automatically detects common problems:
 - `(with-determinism & body)` - set `*is-deterministic*` to `true` and rebind `m/sleep`, `m/timeout`, `m/cpu`, `m/blk`. **All tasks and flows must be both created and executed inside this macro body** (see [The `with-determinism` Entry Point](#the-with-determinism-entry-point)). `run` and `start!` automatically bind `*scheduler*` to the passed scheduler.
 
 ### Interleaving (Concurrency Testing)
-- `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:ok? true :seed s ...}` or `{:ok? false :kind ... :schedule ... :seed s ...}`.
-- `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`.
+- `(check-interleaving task-fn opts)` - find failures across many interleavings. Returns `{:ok? true :seed s ...}` or `{:ok? false :kind ... :schedule ... :seed s ...}`. Options: `:num-tests`, `:seed`, `:property`, `:duration-range`.
+- `(explore-interleavings task-fn opts)` - explore unique outcomes, returns `{:unique-results n :results [...] :seed s}`. Options: `:num-samples`, `:seed`, `:duration-range`.
 - `(replay task-fn failure)` - replay a failure bundle from `check-interleaving`
 - `(replay-schedule task schedule)` - replay exact execution order (task created inside `with-determinism`)
 - `(trace->schedule trace)` - extract schedule (vector of task IDs) from trace

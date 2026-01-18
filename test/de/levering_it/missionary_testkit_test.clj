@@ -1365,3 +1365,268 @@
                          (m/sp :instant-winner)))))
         (is (false? @via-body-ran)
             "Via body should not execute when cancelled before microtask runs")))))
+
+;; =============================================================================
+;; Virtual Task Duration Tests
+;; =============================================================================
+
+(deftest duration-range-basic-test
+  (testing "without duration-range, yields complete at t=0"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            times (atom [])]
+        (mt/run sched
+                (m/sp
+                  (swap! times conj (mt/now-ms sched))
+                  (m/? (mt/yield))
+                  (swap! times conj (mt/now-ms sched))
+                  (m/? (mt/yield))
+                  (swap! times conj (mt/now-ms sched))
+                  :done))
+        (is (= [0 0 0] @times)
+            "All events should occur at t=0 without duration-range"))))
+
+  (testing "with duration-range, yields advance virtual time"
+    ;; Time advances BEFORE a microtask's continuation executes.
+    ;; So: yield enqueues continuation → time advances by duration → continuation runs
+    ;; When we observe time right after yield returns, time has already passed.
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [10 10] :seed 42})
+            times (atom [])]
+        (mt/run sched
+                (m/sp
+                  (swap! times conj (mt/now-ms sched))  ;; t=0
+                  (m/? (mt/yield))                       ;; yield takes 10ms
+                  (swap! times conj (mt/now-ms sched))  ;; t=10 (after yield's duration)
+                  (m/? (mt/yield))                       ;; second yield takes 10ms
+                  (swap! times conj (mt/now-ms sched))  ;; t=20 (after second yield's duration)
+                  :done))
+        (is (= 0 (first @times)) "First observation at t=0")
+        (is (= 10 (second @times)) "Second observation at t=10 (after first yield)")
+        (is (= 20 (nth @times 2)) "Third observation at t=20 (after second yield)")
+        (is (= 30 (mt/now-ms sched)) "Final time is 30ms (3 microtasks × 10ms each)"))))
+
+  (testing "duration-range generates varied durations with seed"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [1 100] :seed 42 :trace? true})]
+        (mt/run sched
+                (m/sp
+                  (m/? (mt/yield))
+                  (m/? (mt/yield))
+                  (m/? (mt/yield))
+                  :done))
+        (let [trace (mt/trace sched)
+              durations (->> trace
+                             (filter #(= :enqueue-microtask (:event %)))
+                             (map :duration-ms))]
+          ;; Should have multiple microtasks with durations in range
+          (is (seq durations))
+          (is (every? #(and (>= % 1) (<= % 100)) durations)
+              "All durations should be within [1, 100]"))))))
+
+(deftest duration-range-timer-promotion-test
+  (testing "duration advance promotes due timers"
+    ;; This test verifies that when a microtask's duration causes time to pass
+    ;; a timer deadline, that timer gets promoted to the microtask queue
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [20 20] :seed 42 :trace? true})
+            events (atom [])]
+        (mt/run sched
+                (m/sp
+                  (m/? (m/join vector
+                         ;; Worker: yields with 20ms duration
+                         (m/sp
+                           (swap! events conj {:who :worker :event :start :t (mt/now-ms sched)})
+                           (m/? (mt/yield))
+                           (swap! events conj {:who :worker :event :done :t (mt/now-ms sched)})
+                           :worker-done)
+                         ;; Timer: fires at 15ms
+                         (m/sp
+                           (swap! events conj {:who :timer :event :waiting :t (mt/now-ms sched)})
+                           (m/? (m/sleep 15))
+                           (swap! events conj {:who :timer :event :fired :t (mt/now-ms sched)})
+                           :timer-fired)))))
+        ;; Verify timer was promoted during worker's duration advance
+        (let [trace (mt/trace sched)
+              promote-events (filter #(= :promote-timers (:event %)) trace)]
+          (is (seq promote-events) "Should have timer promotion events"))
+        ;; Timer should fire at or after its scheduled time
+        (let [timer-fired (first (filter #(= :fired (:event %)) @events))]
+          (is (some? timer-fired))
+          (is (>= (:t timer-fired) 15) "Timer should fire at or after 15ms"))))))
+
+(deftest duration-range-timeout-race-test
+  (testing "timeout can beat work when work duration exceeds timeout"
+    ;; When work duration > timeout, the timer becomes due during the work's duration.
+    ;; After duration advances, both the timer callback and work-success callback
+    ;; are in the queue. The outcome depends on which is selected first.
+    ;; With seed 0, timeout wins; with seed 42, work wins.
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [100 100] :seed 0})]
+        (is (= :timed-out
+               (mt/run sched
+                       (m/sp
+                         (m/? (m/timeout
+                                (m/sp
+                                  (m/? (mt/yield)) ;; 100ms duration
+                                  :work-completed)
+                                50 ;; 50ms timeout
+                                :timed-out)))))
+            "With seed 0, timeout wins the race"))))
+
+  (testing "work beats timeout when work duration is less than timeout"
+    ;; When work duration < timeout, work completes before timeout is due.
+    ;; The timer is never promoted, so work always wins.
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [10 10] :seed 42})]
+        (is (= :work-completed
+               (mt/run sched
+                       (m/sp
+                         (m/? (m/timeout
+                                (m/sp
+                                  (m/? (mt/yield)) ;; 10ms duration
+                                  :work-completed)
+                                50 ;; 50ms timeout
+                                :timed-out)))))
+            "Work should complete when work duration (10ms) < timeout (50ms)"))))
+
+  (testing "without duration-range, work always beats timeout"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)]
+        (is (= :work-completed
+               (mt/run sched
+                       (m/sp
+                         (m/? (m/timeout
+                                (m/sp
+                                  (m/? (mt/yield)) ;; 0ms duration
+                                  :work-completed)
+                                1 ;; 1ms timeout (even tiny timeout loses)
+                                :timed-out)))))
+            "Without duration-range, work (0ms) always beats any timeout")))))
+
+(deftest duration-range-explore-interleavings-test
+  (testing "explore-interleavings with duration-range finds both timeout outcomes"
+    (mt/with-determinism
+      (let [result (mt/explore-interleavings
+                     (fn []
+                       (m/sp
+                         (m/? (m/timeout
+                                (m/sp
+                                  (m/? (mt/yield))
+                                  :work)
+                                50
+                                :timeout))))
+                     {:num-samples 30
+                      :seed 42
+                      :duration-range [30 70]})] ;; 30-70ms work vs 50ms timeout
+        (is (= 2 (:unique-results result))
+            "Should find both :work and :timeout outcomes")
+        (let [outcomes (frequencies (map :result (:results result)))]
+          (is (pos? (:work outcomes 0)) "Some runs should complete work")
+          (is (pos? (:timeout outcomes 0)) "Some runs should timeout")))))
+
+  (testing "check-interleaving with duration-range can find timeout failures"
+    (mt/with-determinism
+      (let [result (mt/check-interleaving
+                     (fn []
+                       (m/sp
+                         (m/? (m/timeout
+                                (m/sp (m/? (mt/yield)) :work)
+                                50
+                                :timeout))))
+                     {:num-tests 50
+                      :seed 42
+                      :duration-range [60 80] ;; Always > 50ms timeout
+                      :property (fn [r] (= r :work))})] ;; Expect work to complete
+        (is (not (:ok? result)) "Should find failure (timeout beats work)")
+        (is (= :property-failed (:kind result)))
+        (is (= :timeout (:value result)) "Failed value should be :timeout")))))
+
+(deftest duration-range-trace-events-test
+  (testing "trace includes duration information"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [5 15] :seed 42 :trace? true})]
+        (mt/run sched
+                (m/sp
+                  (m/? (mt/yield))
+                  (m/? (mt/yield))
+                  :done))
+        (let [trace (mt/trace sched)]
+          ;; Check enqueue-microtask events have duration-ms
+          (let [enqueue-events (filter #(= :enqueue-microtask (:event %)) trace)]
+            (is (every? #(contains? % :duration-ms) enqueue-events)
+                "All enqueue events should have :duration-ms"))
+          ;; Check run-microtask events have duration-ms
+          (let [run-events (filter #(= :run-microtask (:event %)) trace)]
+            (is (every? #(contains? % :duration-ms) run-events)
+                "All run events should have :duration-ms"))
+          ;; Check duration-advance events exist
+          (let [advance-events (filter #(= :duration-advance (:event %)) trace)]
+            (is (seq advance-events) "Should have duration-advance events")
+            (is (every? #(and (contains? % :from-ms)
+                              (contains? % :to-ms)
+                              (contains? % :duration-ms)) advance-events)
+                "Advance events should have from-ms, to-ms, and duration-ms")))))))
+
+(deftest yield-duration-fn-test
+  (testing "yield with :duration-fn overrides scheduler duration-range"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [1 1] :seed 42})
+            times (atom [])]
+        (mt/run sched
+                (m/sp
+                  (swap! times conj (mt/now-ms sched))
+                  ;; This yield uses duration-fn = 50ms, overriding the 1ms from duration-range
+                  (m/? (mt/yield :a {:duration-fn (constantly 50)}))
+                  (swap! times conj (mt/now-ms sched))
+                  ;; This yield uses the scheduler's duration-range (1ms)
+                  (m/? (mt/yield :b))
+                  (swap! times conj (mt/now-ms sched))
+                  :done))
+        (is (= 0 (nth @times 0)) "First observation at t=0")
+        (is (= 50 (nth @times 1)) "Second observation at t=50 (after 50ms yield)")
+        (is (= 51 (nth @times 2)) "Third observation at t=51 (after 1ms yield)"))))
+
+  (testing "yield with :duration-fn works without scheduler duration-range"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler) ;; no duration-range
+            times (atom [])]
+        (mt/run sched
+                (m/sp
+                  (swap! times conj (mt/now-ms sched))
+                  ;; This yield uses duration-fn = 100ms
+                  (m/? (mt/yield :a {:duration-fn (constantly 100)}))
+                  (swap! times conj (mt/now-ms sched))
+                  ;; This yield has no duration (0ms default)
+                  (m/? (mt/yield :b))
+                  (swap! times conj (mt/now-ms sched))
+                  :done))
+        (is (= 0 (nth @times 0)) "First observation at t=0")
+        (is (= 100 (nth @times 1)) "Second observation at t=100 (after 100ms yield)")
+        (is (= 100 (nth @times 2)) "Third observation still at t=100 (0ms yield)"))))
+
+  (testing "yield :duration-fn is called at enqueue time"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            call-count (atom 0)
+            duration-fn (fn []
+                          (swap! call-count inc)
+                          (* @call-count 10))] ;; returns 10, 20, 30, ...
+        (mt/run sched
+                (m/sp
+                  (m/? (mt/yield :a {:duration-fn duration-fn}))
+                  (m/? (mt/yield :b {:duration-fn duration-fn}))
+                  (m/? (mt/yield :c {:duration-fn duration-fn}))
+                  :done))
+        (is (= 3 @call-count) "duration-fn called 3 times")
+        ;; Time progression: 10 + 20 + 30 = 60, plus job/complete (0ms)
+        (is (= 60 (mt/now-ms sched)) "Final time is 60ms (10 + 20 + 30)"))))
+
+  (testing "yield returns value correctly with opts"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)]
+        (is (= :my-value
+               (mt/run sched
+                       (m/sp
+                         (m/? (mt/yield :my-value {:duration-fn (constantly 10)})))))
+            "yield with opts should return the value")))))
