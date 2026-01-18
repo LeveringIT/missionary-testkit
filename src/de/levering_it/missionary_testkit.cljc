@@ -159,7 +159,7 @@
   - No duration-range (or nil): All microtasks complete instantly (0ms).
     Current behavior, backward compatible.
   - With duration-range [lo hi]: Each microtask gets a random duration in [lo,hi]ms
-    at enqueue time. After execution, virtual time advances by that duration.
+    at enqueue time. Before the callback runs, virtual time advances by that duration.
     This enables realistic timeout races and timing-dependent interleaving.
 
   Timer policy (microtasks vs timers at same virtual time):
@@ -697,9 +697,10 @@
   - :microtasks-first: only promote timers when microtask queue is empty.
     Drain microtasks first, like JS event loop. More realistic.
 
-  Before execution, virtual time advances by the task's duration-ms (if any),
-  and newly-due timers are promoted. This ensures that when a task's
-  continuation runs, it observes the updated time.
+  Before executing the callback, virtual time advances by the task's duration-ms
+  (if any), and newly-due timers are promoted. This models \"work completed\" -
+  the continuation sees post-work time, and any timers it schedules are relative
+  to that post-work time.
 
   (step! sched)        - select next task per schedule/FIFO/random
   (step! sched task-id) - run specific task by ID (for manual stepping)
@@ -747,8 +748,8 @@
                                               :now-ms now}))]
                (if (compare-and-set! state-atom s s')
                  (do
-                   ;; Advance time by duration BEFORE executing the task
-                   ;; This way the continuation sees the updated time
+                   ;; Advance time by duration BEFORE executing the callback
+                   ;; This models "work completed" - the continuation sees post-work time
                    (advance-time-by-duration! sched duration)
                    (try
                      ((:f mt))
