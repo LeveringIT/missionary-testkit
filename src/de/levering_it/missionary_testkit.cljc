@@ -58,6 +58,60 @@
 
 (def ^:const idle ::idle)
 
+;; Idle reasons for richer diagnostics
+(def ^:const idle-empty ::idle-empty) ; truly nothing pending
+(def ^:const idle-blocked ::idle-blocked) ; tasks pending but lanes full
+(def ^:const idle-awaiting-time ::idle-awaiting-time) ; waiting for time to advance
+
+;; IdleStatus provides rich diagnostics about why step! returned idle.
+;; Use idle? for checking idle state (works with both ::idle and IdleStatus).
+;; Use idle-reason and idle-details for diagnostics.
+;;
+;; BREAKING CHANGE NOTE: step! now returns IdleStatus instead of ::idle.
+;; Code using (= ::idle (step! sched)) should use (mt/idle? (step! sched)) instead.
+;; The IdleStatus is NOT equal to ::idle to avoid confusion and ensure explicit handling.
+(defrecord IdleStatus [reason blocked-lanes pending-count timer-count in-flight-count next-time])
+
+(defn idle?
+  "Check if a step! result indicates idle state. Works with both ::idle keyword
+  and IdleStatus records.
+
+  IMPORTANT: Use this instead of (= ::idle result) for step! results.
+  step! now returns IdleStatus records with diagnostic information."
+  [x]
+  (or (= ::idle x)
+      (instance? IdleStatus x)))
+
+(defn idle-reason
+  "Get the reason for idle state from a step! result.
+  Returns nil if not idle, or one of:
+  - ::idle-empty - truly nothing pending (queue empty, no in-flight)
+  - ::idle-blocked - tasks pending but all their lanes are at capacity
+  - ::idle-awaiting-time - waiting for time to advance (timers/in-flight pending)"
+  [x]
+  (cond
+    (instance? IdleStatus x) (:reason x)
+    (= ::idle x) ::idle-empty ; legacy keyword = empty
+    :else nil))
+
+(defn idle-details
+  "Get detailed diagnostics from an idle step! result.
+  Returns nil if not idle, or a map with:
+  - :reason - why idle (see idle-reason)
+  - :blocked-lanes - map of {lane {:blocked-count n :active a :max m :waiting [ids]}}
+  - :pending-count - number of pending microtasks
+  - :timer-count - number of pending timers
+  - :in-flight-count - number of in-flight tasks
+  - :next-time - next event time (timer or in-flight completion), or nil"
+  [x]
+  (when (instance? IdleStatus x)
+    {:reason (:reason x)
+     :blocked-lanes (:blocked-lanes x)
+     :pending-count (:pending-count x)
+     :timer-count (:timer-count x)
+     :in-flight-count (:in-flight-count x)
+     :next-time (:next-time x)}))
+
 (def ^:const deadlock ::deadlock)
 (def ^:const budget-exceeded ::budget-exceeded)
 (def ^:const off-scheduler-callback ::off-scheduler-callback)
@@ -403,9 +457,13 @@
 (defn- enqueue-microtask!
   "Enqueue a microtask. Duration is only applied if explicitly provided.
   Use next-duration! to get a duration from the scheduler's duration-range
-  for operations that represent user work (yield, via-call)."
+  for operations that represent user work (yield, via-call).
+
+  Run-then-complete support:
+  - :work-thunk - function to execute at start time (nil = no work)
+  - :deliver-fn - function to call at completion time with result map"
   ([^TestScheduler sched f] (enqueue-microtask! sched f {}))
-  ([^TestScheduler sched f {:keys [label kind lane duration-ms]
+  ([^TestScheduler sched f {:keys [label kind lane duration-ms work-thunk deliver-fn]
                             :or {kind :microtask
                                  lane :default}}]
    (ensure-driver-thread! sched "enqueue-microtask!")
@@ -414,14 +472,17 @@
      (swap! (:state sched)
             (fn [s]
               (let [now (:now-ms s)
-                    mt {:id id
-                        :kind kind
-                        :label label
-                        :lane lane
-                        :enq-ms now
-                        :from :micro
-                        :duration-ms duration
-                        :f f}]
+                    mt (cond-> {:id id
+                                :kind kind
+                                :label label
+                                :lane lane
+                                :enq-ms now
+                                :from :micro
+                                :duration-ms duration
+                                :f f}
+                         ;; Include run-then-complete fields if present
+                         (some? deliver-fn) (assoc :deliver-fn deliver-fn)
+                         (some? work-thunk) (assoc :work-thunk work-thunk))]
                 (-> s
                     (update :micro-q q-conj mt)
                     (maybe-trace-state {:event :enqueue-microtask
@@ -684,6 +745,26 @@
   (let [v (q->vec q)]
     (vec->q (filterv #(lane-has-capacity? sched s (:lane %)) v))))
 
+(defn- compute-blocked-lanes
+  "Compute which lanes are blocking tasks and why.
+  Returns map of {lane {:blocked-count n :active a :max m :waiting [task-ids]}}
+  for lanes that have waiting tasks but no capacity."
+  [^TestScheduler sched s q]
+  (let [v (q->vec q)
+        by-lane (group-by :lane v)]
+    (reduce-kv
+     (fn [acc lane tasks]
+       (let [active (get-in s [:active-threads lane] 0)
+             max-threads (lane-max-threads sched lane)]
+         (if (>= active max-threads)
+           (assoc acc lane {:blocked-count (count tasks)
+                            :active active
+                            :max max-threads
+                            :waiting (mapv :id tasks)})
+           acc)))
+     {}
+     by-lane)))
+
 (defn- next-in-flight-completion
   "Get the next in-flight task that can complete (end-ms <= now).
   Returns [key task-info] or nil."
@@ -699,7 +780,9 @@
     (first k)))
 
 (defn- start-in-flight!
-  "Mark a task as in-flight: increment lane thread count, add to in-flight map."
+  "Mark a task as in-flight: increment lane thread count, add to in-flight map.
+  The task-entry should include :completion-fn (thunk to call at completion time)
+  and optionally :thunk-result for the work result."
   [s ^TestScheduler sched mt]
   (let [lane (:lane mt)
         duration (:duration-ms mt 0)
@@ -766,29 +849,15 @@
           (when-not (compare-and-set! state-atom s s')
             (recur)))))))
 
-(defn- advance-time-by-duration!
-  "Advance virtual time by duration-ms and promote any newly-due timers.
-  Called before a microtask executes to account for its virtual duration.
-  This way, when the task's continuation runs, it sees the updated time."
-  [^TestScheduler sched duration-ms]
-  (when (pos? duration-ms)
-    (let [state-atom (:state sched)]
-      (loop []
-        (let [s @state-atom
-              old-now (:now-ms s)
-              new-now (+ old-now (long duration-ms))
-              s' (-> s
-                     (assoc :now-ms new-now)
-                     (maybe-trace-state {:event :duration-advance
-                                         :from-ms old-now
-                                         :to-ms new-now
-                                         :duration-ms duration-ms})
-                     (->> (promote-due-timers-in-state sched)))]
-          (when-not (compare-and-set! state-atom s s')
-            (recur)))))))
+;; NOTE: advance-time-by-duration! was removed.
+;; With run-then-complete model, time advancement happens through in-flight completion:
+;; - Task starts at time T, thunk executes immediately
+;; - Task completes at time T+duration via run*/advance-to! jumping to end-ms
+;; - Completion callback delivers result at T+duration
 
 (defn- complete-one-in-flight!
-  "Complete a single in-flight task. Returns the task or nil if none ready."
+  "Complete a single in-flight task. Calls :completion-fn to deliver result.
+  Returns the task or nil if none ready."
   [^TestScheduler sched]
   (let [state-atom (:state sched)]
     (loop []
@@ -797,25 +866,37 @@
           (let [s' (complete-in-flight! s sched key mt)]
             (if (compare-and-set! state-atom s s')
               (do
-                (try
-                  ((:f mt))
-                  (catch #?(:clj Throwable :cljs :default) e
-                    (throw (ex-info (str "In-flight task completion threw: " (ex-message e))
-                                    (cond-> {:mt/kind ::microtask-exception
-                                             :mt/now-ms (:now-ms s')
-                                             :mt/task {:id (:id mt)
-                                                       :kind (:kind mt)
-                                                       :label (:label mt)
-                                                       :lane (:lane mt)}
-                                             :mt/pending (pending sched)}
-                                      (:trace? sched)
-                                      (assoc :mt/recent-trace (vec (take-last 10 (trace sched)))))
-                                    e))))
+                ;; Call :completion-fn if present, otherwise fall back to :f for backward compat
+                (when-let [completion-fn (or (:completion-fn mt) (:f mt))]
+                  (try
+                    (completion-fn)
+                    (catch #?(:clj Throwable :cljs :default) e
+                      (throw (ex-info (str "In-flight task completion threw: " (ex-message e))
+                                      (cond-> {:mt/kind ::microtask-exception
+                                               :mt/now-ms (:now-ms s')
+                                               :mt/task {:id (:id mt)
+                                                         :kind (:kind mt)
+                                                         :label (:label mt)
+                                                         :lane (:lane mt)}
+                                               :mt/pending (pending sched)}
+                                        (:trace? sched)
+                                        (assoc :mt/recent-trace (vec (take-last 10 (trace sched)))))
+                                      e)))))
                 mt)
               (recur))))))))
 
 (defn- start-task-in-flight!
-  "Start a task as in-flight (with duration > 0). Returns the task."
+  "Start a task as in-flight (with duration > 0).
+  Run-then-complete model: executes work at start time, delays result delivery.
+
+  If task has :work-thunk and :deliver-fn:
+    - Execute :work-thunk immediately (user work)
+    - Store result, create :completion-fn that calls :deliver-fn with result
+  Otherwise (legacy):
+    - Store :f as :completion-fn for backward compatibility
+
+  Lane capacity is held from start until completion.
+  Returns the task or nil if CAS fails."
   [^TestScheduler sched s mt q' decision new-rng s-after]
   (let [state-atom (:state sched)
         now (:now-ms s-after)
@@ -827,11 +908,33 @@
                         :selected-id (:id mt)
                         :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec (:micro-q s))))
                         :now-ms now})
+        ;; Check if task uses new run-then-complete model
+        has-rtc-support? (contains? mt :deliver-fn)
+        ;; Execute work and prepare completion
+        [thunk-result completion-fn]
+        (if has-rtc-support?
+          ;; Run-then-complete: execute work now, deliver later
+          (let [work-thunk (:work-thunk mt)
+                deliver-fn (:deliver-fn mt)
+                result (if work-thunk
+                         (try
+                           {:status :success :value (work-thunk)}
+                           (catch #?(:clj Throwable :cljs :default) e
+                             {:status :error :error e}))
+                         ;; No work (e.g., yield) - just a delay
+                         {:status :success :value nil})]
+            [result (fn [] (deliver-fn result))])
+          ;; Legacy: defer to :f at completion
+          [nil (:f mt)])
+
+        mt-with-completion (assoc mt
+                                  :completion-fn completion-fn
+                                  :thunk-result thunk-result)
         s' (-> s-after
                (assoc :micro-q q')
                (assoc :rng-select new-rng)
                (cond-> select-trace (maybe-trace-state select-trace))
-               (start-in-flight! sched mt))]
+               (start-in-flight! sched mt-with-completion))]
     (if (compare-and-set! state-atom s s')
       mt
       nil)))
@@ -894,7 +997,14 @@
   3. If no completions, start a new task from queue (if lane has capacity):
      - Tasks with duration > 0: start as in-flight, thread occupied until end-ms
      - Tasks with duration == 0: execute immediately (backward compatible)
-  4. Return ::idle if nothing can be done
+  4. Return IdleStatus if nothing can be done (use idle? to check)
+
+  Return value:
+  - On success: the executed task map
+  - On idle: IdleStatus record with diagnostic information:
+    - Use (idle? result) to check if idle
+    - Use (idle-reason result) to get why: ::idle-empty, ::idle-blocked, ::idle-awaiting-time
+    - Use (idle-details result) for full diagnostics including blocked-lanes, counts, next-time
 
   Timer promotion behavior depends on :timer-policy:
   - :promote-first (default): promote due timers first, then select among all.
@@ -925,8 +1035,39 @@
                  ;; Filter queue to tasks whose lane has capacity
                  available-q (filter-by-capacity sched s q)]
              (if (q-empty? available-q)
-               ;; No tasks can start - either queue empty or all lanes full
-               idle
+               ;; No tasks can start - compute why and return rich IdleStatus
+               (let [q-count (count q)
+                     timer-count (count (:timers s))
+                     in-flight-count (count (:in-flight s))
+                     blocked-lanes (when (pos? q-count)
+                                     (compute-blocked-lanes sched s q))
+                     timer-time (when-let [[_ t] (first (:timers s))] (:at-ms t))
+                     in-flight-time (next-in-flight-time s)
+                     next-time (cond
+                                 (and timer-time in-flight-time) (min timer-time in-flight-time)
+                                 timer-time timer-time
+                                 in-flight-time in-flight-time
+                                 :else nil)
+                     reason (cond
+                              ;; Tasks pending but lanes full
+                              (pos? q-count) idle-blocked
+                              ;; Timers or in-flight tasks waiting
+                              (or timer-time in-flight-time) idle-awaiting-time
+                              ;; Truly empty
+                              :else idle-empty)]
+                 ;; Add trace event for blocked-by-capacity when tasks are waiting
+                 (when (and (seq blocked-lanes) (:trace? sched))
+                   (swap! (:state sched)
+                          maybe-trace-state
+                          {:event :idle-blocked
+                           :reason reason
+                           :blocked-lanes blocked-lanes
+                           :pending-count q-count
+                           :timer-count timer-count
+                           :in-flight-count in-flight-count
+                           :next-time next-time
+                           :now-ms (:now-ms s)}))
+                 (->IdleStatus reason blocked-lanes q-count timer-count in-flight-count next-time))
                ;; Select from available-q (tasks with lane capacity), but remove from original q
                (let [[mt _ decision new-rng s-after] (select-and-remove-task sched s available-q task-id)
                      q' (remove-microtask-by-id q (:id mt))
@@ -955,7 +1096,7 @@
   (binding [*scheduler* sched]
     (loop [n 0]
       (let [r (step! sched)]
-        (if (= r idle)
+        (if (idle? r)
           n
           (recur (inc n)))))))
 
@@ -1134,6 +1275,11 @@
   - :duration-fn  (fn [] ms) - called before enqueueing to get this yield's duration.
                   Takes precedence over scheduler's :duration-range.
 
+  Run-then-complete model:
+  - When duration > 0, yield occupies the lane immediately but delays result delivery
+  - Work executes at start time, result delivered at completion time
+  - For yield, there's no user work - it's a pure scheduling delay
+
   This is useful for:
   - Testing concurrent code under different task orderings
   - Creating explicit interleaving points without time delays
@@ -1169,15 +1315,26 @@
              duration-ms (if-let [duration-fn (:duration-fn opts)]
                            (duration-fn)
                            (next-duration! sched))
+             ;; For run-then-complete model, separate work from delivery:
+             ;; - work-thunk: executed at start (nil for yield - no user work)
+             ;; - deliver-fn: called at completion with result map (ignored for yield)
+             deliver-fn (fn [_result]
+                          (when (compare-and-set! done? false true)
+                            (s x)))
+             ;; Legacy :f for immediate execution (duration=0) path
+             legacy-f (fn []
+                        (when (compare-and-set! done? false true)
+                          (s x)))
              ;; Store microtask ID for cancellation
              mt-id (enqueue-microtask!
                     sched
-                    (fn []
-                      (when (compare-and-set! done? false true)
-                        (s x)))
+                    legacy-f
                     {:kind :yield
                      :label "yield"
-                     :duration-ms duration-ms})]
+                     :duration-ms duration-ms
+                     ;; Run-then-complete support: no work, just delivery delay
+                     :work-thunk nil
+                     :deliver-fn deliver-fn})]
          (fn cancel []
            (when (compare-and-set! done? false true)
              ;; Remove from queue so it doesn't consume a step or advance time
@@ -1361,9 +1518,39 @@
             ;; Recheck done? to handle off-thread callbacks that may have completed the job
             (if (done? job)
               (result job)
-              (throw (mt-ex deadlock sched
-                            "Deadlock: task not done after draining microtasks, and auto-advance? is false."
-                            {:label label})))
+              ;; Compute diagnostic info about why we're blocked
+              (let [s @(:state sched)
+                    q (:micro-q s)
+                    q-count (count q)
+                    blocked-lanes (when (pos? q-count)
+                                    (compute-blocked-lanes sched s q))
+                    timer-count (count (:timers s))
+                    in-flight-count (count (:in-flight s))
+                    timer-time (next-timer-time sched)
+                    in-flight-time (next-in-flight-time s)
+                    next-time (cond
+                                (and timer-time in-flight-time) (min timer-time in-flight-time)
+                                timer-time timer-time
+                                in-flight-time in-flight-time
+                                :else nil)]
+                (throw (mt-ex deadlock sched
+                              (cond
+                                (seq blocked-lanes)
+                                (str "Deadlock: " q-count " task(s) blocked by lane capacity. "
+                                     "Blocked lanes: " (keys blocked-lanes) ". "
+                                     "Set auto-advance? true or advance time to unblock.")
+                                (or timer-time in-flight-time)
+                                (str "Deadlock: waiting for time advance. Next event at " next-time "ms. "
+                                     "Timers: " timer-count ", In-flight: " in-flight-count ". "
+                                     "Set auto-advance? true or call advance-to! " next-time ".")
+                                :else
+                                "Deadlock: task not done after draining microtasks, and auto-advance? is false.")
+                              {:label label
+                               :mt/blocked-lanes blocked-lanes
+                               :mt/pending-count q-count
+                               :mt/timer-count timer-count
+                               :mt/in-flight-count in-flight-count
+                               :mt/next-event-ms next-time}))))
             ;; Find next event: timer or in-flight task completion, whichever is sooner
             (let [timer-time (next-timer-time sched)
                   in-flight-time (next-in-flight-time @(:state sched))
@@ -1386,9 +1573,21 @@
                 ;; Recheck done? to handle off-thread callbacks that may have completed the job
                 (if (done? job)
                   (result job)
-                  (throw (mt-ex deadlock sched
-                                "Deadlock: no microtasks, no timers, no in-flight tasks, and task still pending."
-                                {:label label})))))))))))
+                  ;; True deadlock: nothing pending at all
+                  (let [s @(:state sched)
+                        q (:micro-q s)
+                        q-count (count q)
+                        blocked-lanes (when (pos? q-count)
+                                        (compute-blocked-lanes sched s q))]
+                    (throw (mt-ex deadlock sched
+                                  (if (seq blocked-lanes)
+                                    (str "Deadlock: " q-count " task(s) blocked by lane capacity with no way to unblock. "
+                                         "Blocked lanes: " (keys blocked-lanes) ". "
+                                         "This may indicate tasks waiting for lane capacity that will never free.")
+                                    "Deadlock: no microtasks, no timers, no in-flight tasks, and task still pending.")
+                                  {:label label
+                                   :mt/blocked-lanes blocked-lanes
+                                   :mt/pending-count q-count}))))))))))))
 
 (defn run
   "Run task deterministically to completion (or throw).
@@ -1451,26 +1650,47 @@
 
              done? (atom false)
              duration-ms (next-duration! sched)
+
+             ;; For run-then-complete model, separate work from delivery:
+             ;; - work-thunk: the user's thunk (executed at start time)
+             ;; - deliver-fn: called at completion time with result
+             work-thunk thunk
+             deliver-fn (fn [result]
+                          (when (compare-and-set! done? false true)
+                            (case (:status result)
+                              :success (s (:value result))
+                              :error (f (:error result))
+                              ;; cancelled during execution - do nothing
+                              nil)))
+
+             ;; Legacy :f wraps work + delivery for immediate execution (duration=0) path
+             legacy-f (fn []
+                        ;; If cancelled before we start, do nothing.
+                        (when-not @done?
+                          (let [cont (try
+                                       (let [x (thunk)]
+                                         #(s x))
+                                       (catch missionary.Cancelled t
+                                         ;; Thunk threw Cancelled - must still notify parent via f
+                                         ;; to avoid deadlock (task appears "done" but parent never notified)
+                                         #(f t))
+                                       (catch Exception e
+                                         #(f e)))]
+                            (when (compare-and-set! done? false true)
+                              (when cont
+                                (cont))))))
+
              ;; Store microtask ID for cancellation
              mt-id (enqueue-microtask!
                     sched
-                    (fn []
-                      ;; If cancelled before we start, do nothing.
-                      (when-not @done?
-                        (let [cont (try
-                                     (let [x (thunk)]
-                                       #(s x))
-                                     (catch Exception e
-                                       #(f e))
-                                     (catch missionary.Cancelled t
-                                       nil))]
-                          (when (compare-and-set! done? false true)
-                            (when cont
-                              (cont))))))
+                    legacy-f
                     {:kind :via-call
                      :label "via-call"
                      :lane lane
-                     :duration-ms duration-ms})]
+                     :duration-ms duration-ms
+                     ;; Run-then-complete support
+                     :work-thunk work-thunk
+                     :deliver-fn deliver-fn})]
 
          ;; Cancel thunk
          (fn cancel []

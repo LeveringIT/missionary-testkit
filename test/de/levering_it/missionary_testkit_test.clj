@@ -28,11 +28,54 @@
 (deftest step-and-tick-test
   (testing "step! returns idle when no microtasks"
     (let [sched (mt/make-scheduler)]
-      (is (= ::mt/idle (mt/step! sched)))))
+      (is (mt/idle? (mt/step! sched)))))
 
   (testing "tick! returns 0 when no microtasks"
     (let [sched (mt/make-scheduler)]
-      (is (= 0 (mt/tick! sched))))))
+      (is (= 0 (mt/tick! sched)))))
+
+  (testing "step! returns IdleStatus with reason :idle-empty when truly empty"
+    (let [sched (mt/make-scheduler)
+          result (mt/step! sched)]
+      (is (mt/idle? result))
+      (is (= ::mt/idle-empty (mt/idle-reason result)))
+      (let [details (mt/idle-details result)]
+        (is (= 0 (:pending-count details)))
+        (is (= 0 (:timer-count details)))
+        (is (= 0 (:in-flight-count details)))
+        (is (nil? (:blocked-lanes details))))))
+
+  (testing "step! returns IdleStatus with reason :idle-blocked when lanes full"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:cpu-threads 1 :duration-range [100 100]})
+            ;; Start two CPU tasks - first occupies lane, second blocked
+            _ (mt/start! sched
+                         (m/sp (m/? (m/join vector
+                                            (m/via m/cpu :first)
+                                            (m/via m/cpu :second)))))]
+        ;; First step starts the first cpu task
+        (mt/step! sched)
+        ;; Second step should be blocked
+        (let [result (mt/step! sched)]
+          (is (mt/idle? result))
+          (is (= ::mt/idle-blocked (mt/idle-reason result)))
+          (let [details (mt/idle-details result)]
+            (is (= 1 (:pending-count details)) "One task waiting")
+            (is (= 1 (:in-flight-count details)) "One task in-flight")
+            (is (contains? (:blocked-lanes details) :cpu) "CPU lane should be blocked")
+            (is (= 100 (:next-time details)) "Next event at 100ms"))))))
+
+  (testing "step! returns IdleStatus with reason :idle-awaiting-time when timers pending"
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            _ (mt/start! sched (m/sleep 100 :done))]
+        (let [result (mt/step! sched)]
+          (is (mt/idle? result))
+          (is (= ::mt/idle-awaiting-time (mt/idle-reason result)))
+          (let [details (mt/idle-details result)]
+            (is (= 0 (:pending-count details)))
+            (is (= 1 (:timer-count details)))
+            (is (= 100 (:next-time details)))))))))
 
 (deftest next-event-test
   (testing "returns nil when idle"
@@ -356,7 +399,30 @@
                              (m/sp
                               (m/? (m/via m/blk
                                           (* 2 3 4)))))]
-          (is (= 24 result)))))))
+          (is (= 24 result))))))
+
+  (testing "via-call propagates Cancelled exception (no deadlock)"
+    ;; Bug fix: When a via-call thunk throws missionary.Cancelled, the testkit
+    ;; must still notify the parent via f(). Previously, it swallowed the exception
+    ;; setting done?=true but never calling s or f, causing deadlock.
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:trace? true})
+            task (m/sp
+                   (m/? (m/via m/cpu
+                               (throw (Cancelled.)))))]
+        ;; Should complete (with Cancelled failure) without hanging
+        (is (thrown? Cancelled
+                     (mt/run sched task {:max-steps 100}))))))
+
+  (testing "via-call propagates Cancelled exception with duration-range"
+    ;; Same test but with duration > 0 (run-then-complete path)
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:trace? true :duration-range [10 10]})
+            task (m/sp
+                   (m/? (m/via m/cpu
+                               (throw (Cancelled.)))))]
+        (is (thrown? Cancelled
+                     (mt/run sched task {:max-steps 100})))))))
 
 ;; =============================================================================
 ;; Edge Cases and Error Handling
@@ -1701,7 +1767,7 @@
         ;; Cancel it
         (@cancel-fn)
         ;; Step should be idle - yield was removed from queue
-        (is (= :de.levering-it.missionary-testkit/idle (mt/step! sched))
+        (is (mt/idle? (mt/step! sched))
             "Queue should be empty after yield cancellation")
         ;; Result should be the cancelled error
         (is (vector? @result) "Should have error result")
@@ -1725,7 +1791,7 @@
         ;; Cancel it
         (@cancel-fn)
         ;; Step should be idle - via-call was removed from queue
-        (is (= :de.levering-it.missionary-testkit/idle (mt/step! sched))
+        (is (mt/idle? (mt/step! sched))
             "Queue should be empty after via-call cancellation")
         (is (false? @executed) "Thunk should not have executed")
         ;; Trace should have cancel-microtask event
