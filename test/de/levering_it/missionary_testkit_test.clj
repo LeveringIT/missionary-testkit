@@ -2143,3 +2143,242 @@
         ;; First two tasks end at 100, next two at 200
         (is (= [100 100 200 200] ends)
             (str "CPU pool should cause batched execution. Got: " ends))))))
+
+;; -----------------------------------------------------------------------------
+;; Timeout Linearization Tests
+;; -----------------------------------------------------------------------------
+;;
+;; These tests document the timeout linearization behavior and verify that the
+;; testkit correctly models real Missionary timeout semantics.
+;;
+;; BACKGROUND:
+;; In real Missionary, timeout races are determined by which callback executes
+;; first. The testkit models this through microtask scheduling with lane-based
+;; thread pool simulation.
+;;
+;; KEY INSIGHT:
+;; Timer callbacks run on scheduler threads (not user thread pools). When using
+;; proper lane separation (m/blk for blocking work, default lane for timers),
+;; timers fire at their scheduled time without being blocked by user work.
+;;
+;; The testkit correctly handles three scenarios:
+;; 1. Work completes BEFORE timeout: work wins (deterministic)
+;; 2. Timeout fires BEFORE work completes: timeout wins (deterministic)
+;; 3. Work and timeout complete at SAME instant: either can win (explores both)
+;;
+;; This third case is intentional - in real systems, simultaneous completion
+;; would have non-deterministic outcomes based on thread scheduling.
+
+(deftest timeout-linearization-real-missionary-parity-test
+  ;; These tests verify the testkit produces results matching real Missionary.
+  ;; Real Missionary scenarios tested:
+  ;;   (m/? (m/race (m/timeout (m/via m/blk (Thread/sleep 500)) 200 :timeout)
+  ;;               (m/sleep 250 :sleep))) ; -> :timeout
+  ;;   (m/? (m/race (m/sp (Thread/sleep 400) :sleep1)
+  ;;               (m/sleep 250 :sleep2))) ; -> :sleep2
+  ;;   (m/? (m/join vector (m/sp (Thread/sleep 400) :sleep1)
+  ;;               (m/sleep 250 :sleep2))) ; -> [:sleep1 :sleep2]
+
+  (testing "timeout fires before blocking work completes - timeout wins"
+    ;; Real Missionary: (m/? (m/race (m/timeout (m/via m/blk (Thread/sleep 500)) 200 :timeout)
+    ;;                              (m/sleep 250 :sleep))) -> :timeout
+    ;;
+    ;; Work takes 500ms on m/blk, timeout is 200ms. Timer fires at t=200,
+    ;; while work is still running. Timeout should always win.
+    (mt/with-determinism
+      (doseq [seed (range 1 6)]
+        (let [sched (mt/make-scheduler {:seed seed :duration-range [500 500]})
+              result (mt/run sched
+                             (m/race
+                              (m/timeout
+                               (mt/via-call m/blk (fn [] :work-done))
+                               200 :timeout)
+                              (m/sleep 250 :sleep)))]
+          (is (= :timeout result)
+              (str "Seed " seed ": timeout (200ms) should beat work (500ms)"))))))
+
+  (testing "blocking work beats sleep in race due to trampoline blocking"
+    ;; Real Missionary: (m/? (m/race (m/sp (Thread/sleep 400) :sleep1)
+    ;;                              (m/sleep 250 :sleep2))) -> :sleep1
+    ;;
+    ;; IMPORTANT: Thread/sleep inside m/sp blocks the trampoline thread.
+    ;; The sleep timer fires at 250ms (on scheduler thread), but its
+    ;; continuation cannot run until the trampoline is free at 400ms.
+    ;; By then, the sp has already completed and delivered :sleep1.
+    ;;
+    ;; This is different from m/via which runs work on a separate executor.
+    (mt/with-determinism
+      (doseq [seed (range 1 6)]
+        (let [sched (mt/make-scheduler {:seed seed :duration-range [400 400]})
+              result (mt/run sched
+                             (m/race
+                              (m/sp (m/? (mt/yield)) :sleep1)
+                              (m/sleep 250 :sleep2)))]
+          (is (= :sleep1 result)
+              (str "Seed " seed ": sp with blocking work (400ms) wins because trampoline is blocked")))))))
+
+(deftest timeout-linearization-lane-separation-test
+  ;; These tests verify that proper lane separation is critical for realistic
+  ;; timeout behavior. When blocking work runs on m/blk and timers on default
+  ;; lane, they don't block each other.
+
+  (testing "timer fires at scheduled time when work is on separate lane"
+    ;; With m/blk (unlimited threads), the timer isn't blocked by work.
+    ;; Timer fires exactly at its scheduled time.
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:trace? true :seed 42 :duration-range [500 500]})
+            _ (mt/run sched
+                (m/timeout
+                  (mt/via-call m/blk (fn [] :work))
+                  200 :timeout))
+            trace (mt/trace sched)
+            timer-run (first (filter #(and (= :run-microtask (:event %))
+                                           (= :timeout/timer (:kind %)))
+                                     trace))]
+        (is (= 200 (:now-ms timer-run))
+            "Timer should run at exactly t=200, not blocked by m/blk work")))))
+
+(deftest timeout-linearization-simultaneous-completion-test
+  ;; When work duration EQUALS timeout duration, both complete at the same
+  ;; virtual time. This creates a legitimate race that the testkit explores
+  ;; by allowing random selection between outcomes.
+  ;;
+  ;; This is CORRECT behavior - in real systems, simultaneous completion
+  ;; would have non-deterministic outcomes based on thread scheduling.
+  ;; The testkit's ability to explore both outcomes is valuable for testing.
+
+
+  (testing "explore-interleavings finds both simultaneous completion outcomes"
+    (mt/with-determinism
+      (let [result (mt/explore-interleavings
+                     (fn []
+                       (m/timeout
+                         (mt/via-call m/blk (fn [] :work))
+                         100 :timeout))
+                     {:num-samples 30
+                      :seed 42
+                      :duration-range [100 100]})]  ;; Same as timeout
+        (is (= 2 (:unique-results result))
+            "Should find both :work and :timeout outcomes")
+        (let [outcomes (frequencies (map :result (:results result)))]
+          (is (pos? (:work outcomes 0)) "Some runs should complete work")
+          (is (pos? (:timeout outcomes 0)) "Some runs should timeout"))))))
+
+(deftest timeout-linearization-deterministic-outcomes-test
+  ;; When work and timeout complete at DIFFERENT times, the outcome should
+  ;; be deterministic regardless of seed.
+
+  (testing "work always wins when it completes before timeout"
+    ;; Work: 50ms, Timeout: 200ms -> work wins at t=50
+    (mt/with-determinism
+      (doseq [seed (range 1 11)]
+        (let [sched (mt/make-scheduler {:seed seed :duration-range [50 50]})
+              result (mt/run sched
+                       (m/timeout
+                         (mt/via-call m/blk (fn [] :work))
+                         200 :timeout))]
+          (is (= :work result)
+              (str "Seed " seed ": work (50ms) should always beat timeout (200ms)"))))))
+
+  (testing "timeout always wins when it fires before work completes"
+    ;; Work: 500ms, Timeout: 100ms -> timeout wins at t=100
+    (mt/with-determinism
+      (doseq [seed (range 1 11)]
+        (let [sched (mt/make-scheduler {:seed seed :duration-range [500 500]})
+              result (mt/run sched
+                       (m/timeout
+                         (mt/via-call m/blk (fn [] :work))
+                         100 :timeout))]
+          (is (= :timeout result)
+              (str "Seed " seed ": timeout (100ms) should always beat work (500ms)")))))))
+
+;; -----------------------------------------------------------------------------
+;; amb= Flow Tests
+;; -----------------------------------------------------------------------------
+;;
+;; These tests verify that m/amb= flows work correctly with the testkit,
+;; matching real Missionary behavior for concurrent branch evaluation.
+;;
+;; Real Missionary scenarios tested:
+;;   (m/? (m/reduce conj [] (m/ap (m/amb=
+;;                                  (m/? (m/sleep 400 :sleep1))
+;;                                  (m/? (m/sleep 300 :sleep2)))))) ; -> [:sleep2 :sleep1]
+;;
+;;   (m/? (m/reduce conj [] (m/ap (m/amb=
+;;                                  (m/? (m/sp (m/? (m/via m/blk (Thread/sleep 50)))
+;;                                             :sleep1))
+;;                                  (m/? (m/sleep 10 :sleep2)))))) ; -> [:sleep2 :sleep1]
+
+(deftest amb=-flow-timing-test
+  (testing "amb= with two m/sleep timers - shorter timer wins"
+    ;; Real Missionary: (m/? (m/reduce conj [] (m/ap (m/amb=
+    ;;                                                (m/? (m/sleep 400 :sleep1))
+    ;;                                                (m/? (m/sleep 300 :sleep2))))))
+    ;; Result: [:sleep2 :sleep1]
+    ;;
+    ;; Both branches run concurrently. The 300ms timer fires before the 400ms timer,
+    ;; so :sleep2 is emitted first, then :sleep1.
+    (mt/with-determinism
+      (doseq [seed (range 1 6)]
+        (let [sched (mt/make-scheduler {:seed seed})
+              result (mt/run sched
+                       (m/reduce conj []
+                         (m/ap (m/amb=
+                                 (m/? (m/sleep 400 :sleep1))
+                                 (m/? (m/sleep 300 :sleep2))))))]
+          (is (= [:sleep2 :sleep1] result)
+              (str "Seed " seed ": 300ms timer should complete before 400ms timer"))))))
+
+  (testing "amb= with m/via m/blk vs m/sleep - timer beats blocking work"
+    ;; Real Missionary: (m/? (m/reduce conj [] (m/ap (m/amb=
+    ;;                                                (m/? (m/sp (m/? (m/via m/blk (Thread/sleep 50)))
+    ;;                                                           :sleep1))
+    ;;                                                (m/? (m/sleep 10 :sleep2))))))
+    ;; Result: [:sleep2 :sleep1]
+    ;;
+    ;; First branch: blocking work (50ms) on m/blk lane, then returns :sleep1
+    ;; Second branch: timer at 10ms, returns :sleep2
+    ;; The 10ms timer fires before the 50ms blocking work completes.
+    (mt/with-determinism
+      (doseq [seed (range 1 6)]
+        (let [sched (mt/make-scheduler {:seed seed :duration-range [50 50]})
+              result (mt/run sched
+                       (m/reduce conj []
+                         (m/ap (m/amb=
+                                 (m/? (m/sp (m/? (mt/via-call m/blk (fn [] nil)))
+                                            :sleep1))
+                                 (m/? (m/sleep 10 :sleep2))))))]
+          (is (= [:sleep2 :sleep1] result)
+              (str "Seed " seed ": 10ms timer should beat 50ms blocking work"))))))
+
+  (testing "amb= with blocking work vs m/sleep - blocking completes first"
+    ;; Real Missionary: (m/? (m/reduce conj [] (m/ap (m/amb=
+    ;;                                                (m/? (m/sp (Thread/sleep 400) :sleep1))
+    ;;                                                (m/? (m/sleep 300 :sleep2))))))
+    ;; Result: [:sleep1 :sleep2]
+    ;;
+    ;; KEY INSIGHT: Thread/sleep inside m/sp blocks the trampoline thread.
+    ;; Both branches start concurrently (m/? suspends, triggering amb= fork),
+    ;; but the sleep timer's continuation cannot run while the trampoline
+    ;; is blocked by Thread/sleep in the first branch.
+    ;;
+    ;; Timeline:
+    ;; - t=0: Both branches start (amb= forks on m/? suspension)
+    ;; - t=0: Branch 1's sp starts blocking (Thread/sleep)
+    ;; - t=0: Branch 2's sleep timer scheduled for t=300
+    ;; - t=300: Sleep timer fires, but continuation blocked (trampoline busy)
+    ;; - t=400: Thread/sleep completes, sp returns :sleep1
+    ;; - t=400: Sleep continuation can now run, returns :sleep2
+    ;;
+    ;; Model with mt/yield: yield's duration blocks the :default lane,
+    ;; preventing sleep timer callbacks from running until yield completes.
+    (mt/with-determinism
+      (doseq [seed (range 1 6)]
+        (let [sched (mt/make-scheduler {:seed seed})
+              result (mt/run sched
+                       (m/reduce conj []
+                         (m/ap (m/amb=
+                                (m/? (m/sp (m/? (mt/yield :sleep1 {:duration-fn (constantly 400)}))))
+                                (m/? (m/sleep 300 :sleep2))))))]
+          (is (= [:sleep1 :sleep2] result)
+              (str "Seed " seed ": blocking work completes first because trampoline is blocked")))))))

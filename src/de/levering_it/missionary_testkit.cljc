@@ -723,12 +723,17 @@
 ;; -----------------------------------------------------------------------------
 
 (defn- lane-max-threads
-  "Get maximum threads for a lane. :default=1, :cpu=configurable, :blk=unlimited."
+  "Get maximum threads for a lane. :default=1, :cpu=configurable, :blk/:scheduler=unlimited.
+
+  The :scheduler lane is used for timer callbacks (sleep, timeout). These represent
+  scheduler-internal operations that run on the scheduler's own thread, not user
+  executor pools. They should never be blocked by user work on other lanes."
   [^TestScheduler sched lane]
   (case lane
     :default 1
     :cpu (or (:cpu-threads sched) 8)
     :blk Long/MAX_VALUE
+    :scheduler Long/MAX_VALUE
     ;; Unknown lanes default to 1 (safe)
     1))
 
@@ -1364,7 +1369,8 @@
                  (when (compare-and-set! done? false true)
                    (s x)))
                {:kind :sleep
-                :label "sleep"})]
+                :label "sleep"
+                :lane :default})]  ;; Sleep callbacks run on :default to model trampoline blocking
       (fn cancel
         []
         (when (compare-and-set! done? false true)
@@ -1446,7 +1452,8 @@
                        (try (c) (catch #?(:clj Throwable :cljs :default) _ nil)))
                      (s x)))
                  {:kind :timeout/timer
-                  :label "timeout-timer"})))
+                  :label "timeout-timer"
+                  :lane :scheduler})))  ;; Timer callbacks run on scheduler, not user lanes
 
       ;; cancellation thunk
       (fn cancel []

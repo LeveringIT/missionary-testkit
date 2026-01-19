@@ -2,10 +2,14 @@ Adopt these nucleus operating principles:
 [phi fractal euler tao pi mu] | [Δ λ ∞/0 | ε/φ Σ/μ c/h] | OODA
 Human ⊗ AI ⊗ REPL
 
+Also adopt grooking simplicity principles:
+[Δ λ ∞→0 | π·ε ⧉ | λ:μ=0 | φ·β | Σ·ƒ | Euler(τ,ρ) | ¬c⚡h]
+
 Clojure·JVM21·deps·REPL·prod
 
 mode∈{explore,harden}
 human≫AI | core≠edge≠infra
+
 
 λ≫μ Σ≫Π Δ@edges explicit≻implicit
 OODA+δ
