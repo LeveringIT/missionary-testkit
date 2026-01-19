@@ -901,7 +901,29 @@
       (let [task-fn (fn [] (m/sp (m/? (m/sleep 0 :done))))
             result (mt/explore-interleavings task-fn {:num-samples 3 :seed 42})]
         (is (every? #(contains? % :micro-schedule) (:results result)))
-        (is (every? #(contains? % :result) (:results result)))))))
+        (is (every? #(contains? % :result) (:results result))))))
+
+  (testing "two sleeps with same duration produce both outcomes in race"
+    (mt/with-determinism
+      (let [task-fn (fn [] (m/sp (m/? (m/race (m/sleep 10 :sleep1)
+                                              (m/sleep 10 :sleep2)))))
+            result (mt/explore-interleavings task-fn {:num-samples 50 :seed 42})
+            outcomes (set (map :result (:results result)))]
+        (is (= 2 (:unique-results result))
+            "Both timers fire at same time, random selection should produce both outcomes")
+        (is (= #{:sleep1 :sleep2} outcomes)
+            "Should see both :sleep1 and :sleep2 as race winners"))))
+
+  (testing "two timeouts with same duration produce both outcomes in race"
+    (mt/with-determinism
+      (let [task-fn (fn [] (m/sp (m/? (m/race (m/timeout (m/sleep 1000) 10 :timeout1)
+                                              (m/timeout (m/sleep 1000) 10 :timeout2)))))
+            result (mt/explore-interleavings task-fn {:num-samples 50 :seed 42})
+            outcomes (set (map :result (:results result)))]
+        (is (= 2 (:unique-results result))
+            "Both timeout timers fire at same time, random selection should produce both outcomes")
+        (is (= #{:timeout1 :timeout2} outcomes)
+            "Should see both :timeout1 and :timeout2 as race winners")))))
 
 (deftest check-interleaving-requires-determinism-test
   (testing "check-interleaving throws when called outside with-determinism"

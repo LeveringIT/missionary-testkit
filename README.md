@@ -115,12 +115,12 @@ By default, user work (`yield`, `via-call`) completes instantly (0ms). Use `:dur
   (let [sched (mt/make-scheduler {:duration-range [10 10] :seed 42})]
     (mt/run sched
       (m/sp
-        ;; Each yield takes 10ms virtual time
+        ;; Each via-call takes 10ms virtual time on :blk lane
         (m/? (m/timeout
                (m/sp
-                 (m/? (mt/yield))  ; 10ms
-                 (m/? (mt/yield))  ; 10ms
-                 (m/? (mt/yield))  ; 10ms = 30ms total
+                 (m/? (m/via m/blk (mt/yield)))  ; 10ms
+                 (m/? (m/via m/blk (mt/yield)))  ; 10ms
+                 (m/? (m/via m/blk (mt/yield)))  ; 10ms = 30ms total
                  :completed)
                25  ; timeout at 25ms
                :timed-out))))))
@@ -738,13 +738,13 @@ The scheduler automatically detects common problems:
       {:auto-advance? false})))
 ;; throws: "Deadlock: task not done after draining microtasks"
 
-;; Infinite loop protection
+;; Time budget protection
 (mt/with-determinism
   (let [sched (mt/make-scheduler)]
     (mt/run sched
-      (m/sp (loop [] (m/? (m/sleep 0)) (recur)))
-      {:max-steps 100})))
-;; throws: "Step budget exceeded: 101 > 100"
+      (m/sp (loop [] (m/? (m/sleep 1)) (recur)))
+      {:max-time-ms 100})))
+;; throws: "Time budget exceeded..."
 
 ;; Time budget
 (mt/with-determinism
