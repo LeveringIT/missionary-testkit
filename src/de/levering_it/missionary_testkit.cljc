@@ -723,17 +723,16 @@
 ;; -----------------------------------------------------------------------------
 
 (defn- lane-max-threads
-  "Get maximum threads for a lane. :default=1, :cpu=configurable, :blk/:scheduler=unlimited.
+  "Get maximum threads for a lane. :default=1, :cpu=configurable, :blk=unlimited.
 
-  The :scheduler lane is used for timer callbacks (sleep, timeout). These represent
-  scheduler-internal operations that run on the scheduler's own thread, not user
-  executor pools. They should never be blocked by user work on other lanes."
+  Timer callbacks (sleep, timeout) run on :default lane to correctly model
+  trampoline blocking - when blocking work occupies the trampoline, timer
+  callbacks cannot deliver their results until the trampoline is free."
   [^TestScheduler sched lane]
   (case lane
     :default 1
     :cpu (or (:cpu-threads sched) 8)
     :blk Long/MAX_VALUE
-    :scheduler Long/MAX_VALUE
     ;; Unknown lanes default to 1 (safe)
     1))
 
@@ -1427,15 +1426,14 @@
         (reset! cancel-child
                 (task
                  (fn [v]
-                   ;; if child succeeds first, succeed
-                   (enqueue-microtask! sched (fn [] (finish! :success v))
-                                       {:kind :timeout/child-success
-                                        :label "timeout-child-success"}))
+                   ;; Child succeeds: call finish! synchronously to win the race
+                   ;; against any timer callback already in the queue.
+                   ;; In real Missionary, Thread/sleep blocks the trampoline,
+                   ;; so child completion happens before timer callback can run.
+                   (finish! :success v))
                  (fn [e]
-                   ;; if child fails first, fail
-                   (enqueue-microtask! sched (fn [] (finish! :failure e))
-                                       {:kind :timeout/child-failure
-                                        :label "timeout-child-failure"}))))
+                   ;; Child fails: same synchronous handling
+                   (finish! :failure e))))
         (catch #?(:clj Throwable :cljs :default) e
           (finish! :failure e)
           (reset! cancel-child (fn [] nil))))
@@ -1453,7 +1451,7 @@
                      (s x)))
                  {:kind :timeout/timer
                   :label "timeout-timer"
-                  :lane :scheduler})))  ;; Timer callbacks run on scheduler, not user lanes
+                  :lane :default})))  ;; Timer callbacks run on :default to model trampoline blocking
 
       ;; cancellation thunk
       (fn cancel []

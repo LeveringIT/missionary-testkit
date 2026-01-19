@@ -1565,24 +1565,38 @@
           (is (>= (:t timer-fired) 15) "Timer should fire at or after 15ms"))))))
 
 (deftest duration-range-timeout-race-test
-  (testing "timeout can beat work when work duration exceeds timeout"
-    ;; When work duration > timeout, the timer becomes due during the work's duration.
-    ;; After duration advances, both the timer callback and work-success callback
-    ;; are in the queue. The outcome depends on which is selected first.
-    ;; With seed 2, timeout wins; with seed 1, work wins.
-    ;; (Note: seeds changed after RNG stream split - selection now uses independent stream)
+  (testing "timeout beats work when work runs on separate lane (m/blk)"
+    ;; When work runs on m/blk (separate lane), the timeout timer can fire
+    ;; and deliver its result without being blocked by the work.
+    ;; Real Missionary: (m/? (m/timeout (m/via m/blk (Thread/sleep 100) :work) 50 :timeout)) -> :timeout
     (mt/with-determinism
       (let [sched (mt/make-scheduler {:duration-range [100 100] :seed 2})]
         (is (= :timed-out
                (mt/run sched
                        (m/sp
                          (m/? (m/timeout
-                                (m/sp
-                                  (m/? (mt/yield)) ;; 100ms duration
-                                  :work-completed)
+                                (mt/via-call m/blk (fn [] :work-completed)) ;; 100ms on :blk lane
                                 50 ;; 50ms timeout
                                 :timed-out)))))
-            "With seed 2, timeout wins the race"))))
+            "Timeout wins when work (100ms on blk) > timeout (50ms)"))))
+
+  (testing "work beats timeout when work blocks trampoline (m/sp)"
+    ;; When work runs via m/sp with blocking (yield), it occupies the trampoline.
+    ;; The timeout timer fires but can't deliver until trampoline is free.
+    ;; By then, work has completed and wins the race.
+    ;; Real Missionary: (m/? (m/timeout (m/sp (Thread/sleep 100) :work) 50 :timeout)) -> :work
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler {:duration-range [100 100] :seed 42})]
+        (is (= :work-completed
+               (mt/run sched
+                       (m/sp
+                         (m/? (m/timeout
+                                (m/sp
+                                  (m/? (mt/yield)) ;; 100ms blocking the trampoline
+                                  :work-completed)
+                                50 ;; 50ms timeout - fires but blocked
+                                :timed-out)))))
+            "Work wins when it blocks the trampoline, even if timeout is shorter"))))
 
   (testing "work beats timeout when work duration is less than timeout"
     ;; When work duration < timeout, work completes before timeout is due.
@@ -1616,16 +1630,14 @@
 
 (deftest duration-range-explore-interleavings-test
   (testing "explore-interleavings with duration-range finds both timeout outcomes"
+    ;; Use mt/via-call m/blk so work runs on separate lane and timeout can win
     (mt/with-determinism
       (let [result (mt/explore-interleavings
                      (fn []
-                       (m/sp
-                         (m/? (m/timeout
-                                (m/sp
-                                  (m/? (mt/yield))
-                                  :work)
-                                50
-                                :timeout))))
+                       (m/timeout
+                         (mt/via-call m/blk (fn [] :work))
+                         50
+                         :timeout))
                      {:num-samples 30
                       :seed 42
                       :duration-range [30 70]})] ;; 30-70ms work vs 50ms timeout
@@ -1636,14 +1648,14 @@
           (is (pos? (:timeout outcomes 0)) "Some runs should timeout")))))
 
   (testing "check-interleaving with duration-range can find timeout failures"
+    ;; Use mt/via-call m/blk so work runs on separate lane and timeout can win
     (mt/with-determinism
       (let [result (mt/check-interleaving
                      (fn []
-                       (m/sp
-                         (m/? (m/timeout
-                                (m/sp (m/? (mt/yield)) :work)
-                                50
-                                :timeout))))
+                       (m/timeout
+                         (mt/via-call m/blk (fn [] :work))
+                         50
+                         :timeout))
                      {:num-tests 50
                       :seed 42
                       :duration-range [60 80] ;; Always > 50ms timeout
@@ -2240,29 +2252,25 @@
 
 (deftest timeout-linearization-simultaneous-completion-test
   ;; When work duration EQUALS timeout duration, both complete at the same
-  ;; virtual time. This creates a legitimate race that the testkit explores
-  ;; by allowing random selection between outcomes.
+  ;; virtual time. In our model, in-flight task completion is processed
+  ;; before queued microtasks (timer callbacks), so work wins deterministically.
   ;;
-  ;; This is CORRECT behavior - in real systems, simultaneous completion
-  ;; would have non-deterministic outcomes based on thread scheduling.
-  ;; The testkit's ability to explore both outcomes is valuable for testing.
+  ;; This differs slightly from real systems where truly simultaneous completion
+  ;; would have non-deterministic outcomes. However, the testkit correctly models
+  ;; that work runs on a separate lane (m/blk) and completes independently.
 
-
-  (testing "explore-interleavings finds both simultaneous completion outcomes"
+  (testing "simultaneous completion: work wins because in-flight completes before queue"
+    ;; When work duration equals timeout, both are ready at the same time.
+    ;; In-flight task completion runs before queued timer callback, so work wins.
     (mt/with-determinism
-      (let [result (mt/explore-interleavings
-                     (fn []
+      (doseq [seed (range 1 6)]
+        (let [sched (mt/make-scheduler {:seed seed :duration-range [100 100]})
+              result (mt/run sched
                        (m/timeout
                          (mt/via-call m/blk (fn [] :work))
-                         100 :timeout))
-                     {:num-samples 30
-                      :seed 42
-                      :duration-range [100 100]})]  ;; Same as timeout
-        (is (= 2 (:unique-results result))
-            "Should find both :work and :timeout outcomes")
-        (let [outcomes (frequencies (map :result (:results result)))]
-          (is (pos? (:work outcomes 0)) "Some runs should complete work")
-          (is (pos? (:timeout outcomes 0)) "Some runs should timeout"))))))
+                         100 :timeout))]
+          (is (= :work result)
+              (str "Seed " seed ": work wins simultaneous completion")))))))
 
 (deftest timeout-linearization-deterministic-outcomes-test
   ;; When work and timeout complete at DIFFERENT times, the outcome should
