@@ -292,6 +292,9 @@
              :active-threads {:default 0 :cpu 0 :blk 0}})
       seed (boolean trace?) micro-schedule duration-range timer-policy cpu-threads))))
 
+;; Forward declarations for lane capacity filtering (defined in thread pool section)
+(declare lane-has-capacity?)
+
 (defn now-ms
   "Current virtual time in milliseconds."
   [^TestScheduler sched]
@@ -362,6 +365,10 @@
 (defn next-tasks
   "Returns vector of available microtasks that can be selected for execution.
 
+  Only returns tasks whose lanes have capacity - tasks blocked by lane limits
+  are excluded. Use (mt/pending sched) to see all pending tasks regardless of
+  lane capacity.
+
   Use this for manual stepping to see which tasks are available and their IDs.
   Each task map contains :id :kind :label :lane keys.
 
@@ -373,9 +380,11 @@
 
   Returns empty vector if no microtasks are ready (check timers with next-event)."
   [^TestScheduler sched]
-  (let [{:keys [micro-q]} @(:state sched)]
-    (mapv (fn [mt] (select-keys mt [:id :kind :label :lane]))
-          (seq micro-q))))
+  (let [s @(:state sched)
+        micro-q (:micro-q s)]
+    (->> (seq micro-q)
+         (filter #(lane-has-capacity? sched s (:lane %)))
+         (mapv #(select-keys % [:id :kind :label :lane])))))
 
 (defn- diag
   ([sched] (diag sched nil))
@@ -528,23 +537,6 @@
                                       :now-ms now}))))
      k)))
 
-(defn- cancel-timer!
-  [^TestScheduler sched timer-token]
-  (ensure-driver-thread! sched "cancel-timer!")
-  (when timer-token
-    (swap! (:state sched)
-           (fn [s]
-             (if-let [t (get-in s [:timers timer-token])]
-               (-> s
-                   (update :timers dissoc timer-token)
-                   (maybe-trace-state {:event :cancel-timer
-                                       :id (:id t)
-                                       :at-ms (:at-ms t)
-                                       :label (:label t)
-                                       :now-ms (:now-ms s)}))
-               s))))
-  nil)
-
 (defn- remove-microtask-by-id
   "Remove a microtask from the queue by its ID. Returns the updated queue."
   [q target-id]
@@ -556,6 +548,40 @@
             #?(:clj clojure.lang.PersistentQueue/EMPTY
                :cljs cljs.core/PersistentQueue.EMPTY)
             v)))
+
+(defn- cancel-timer!
+  "Cancel a timer by its token. Handles both cases:
+  1. Timer still in :timers map (not yet promoted)
+  2. Timer already promoted to microtask queue
+
+  The timer-token is [at-ms id], where id is used for microtask lookup."
+  [^TestScheduler sched timer-token]
+  (ensure-driver-thread! sched "cancel-timer!")
+  (when timer-token
+    (let [timer-id (second timer-token)] ; extract id from [at-ms id]
+      (swap! (:state sched)
+             (fn [s]
+               (if-let [t (get-in s [:timers timer-token])]
+                 ;; Case 1: Timer still in timers map - remove it
+                 (-> s
+                     (update :timers dissoc timer-token)
+                     (maybe-trace-state {:event :cancel-timer
+                                         :id (:id t)
+                                         :at-ms (:at-ms t)
+                                         :label (:label t)
+                                         :now-ms (:now-ms s)}))
+                 ;; Case 2: Timer not in timers - may have been promoted to micro-q
+                 ;; Check if a microtask with this ID exists and remove it
+                 (let [q (:micro-q s)
+                       has-mt? (some #(= timer-id (:id %)) (seq q))]
+                   (if has-mt?
+                     (-> s
+                         (assoc :micro-q (remove-microtask-by-id q timer-id))
+                         (maybe-trace-state {:event :cancel-promoted-timer
+                                             :id timer-id
+                                             :now-ms (:now-ms s)}))
+                     s)))))))
+  nil)
 
 (defn cancel-microtask!
   "Cancel an enqueued microtask by its ID, removing it from the microtask queue.
@@ -893,69 +919,86 @@
   "Start a task as in-flight (with duration > 0).
   Run-then-complete model: executes work at start time, delays result delivery.
 
+  IMPORTANT: CAS must succeed BEFORE executing work-thunk to prevent duplicate
+  execution on retry. The sequence is:
+    1. CAS to claim task (remove from queue, occupy lane)
+    2. Execute work-thunk (only if CAS succeeded)
+    3. Update in-flight entry with completion-fn that delivers result
+
   If task has :work-thunk and :deliver-fn:
-    - Execute :work-thunk immediately (user work)
-    - Store result, create :completion-fn that calls :deliver-fn with result
+    - Execute :work-thunk after CAS succeeds (user work)
+    - Update in-flight with :completion-fn that calls :deliver-fn with result
   Otherwise (legacy):
-    - Store :f as :completion-fn for backward compatibility
+    - :f is called at completion time (no work at start)
 
   Lane capacity is held from start until completion.
-  Returns the task or nil if CAS fails."
-  [^TestScheduler sched s mt q' decision new-rng s-after]
+  Returns the task or nil if CAS fails.
+
+  available-q is the lane-filtered queue used for trace alternatives."
+  [^TestScheduler sched s mt q' decision new-rng s-after available-q]
   (let [state-atom (:state sched)
         now (:now-ms s-after)
-        q-size (count (:micro-q s))
-        select-trace (when (> q-size 1)
+        available-size (count available-q)
+        select-trace (when (> available-size 1)
                        {:event :select-task
                         :decision decision
-                        :queue-size q-size
+                        :queue-size available-size
                         :selected-id (:id mt)
-                        :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec (:micro-q s))))
+                        :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec available-q)))
                         :now-ms now})
-        ;; Check if task uses new run-then-complete model
         has-rtc-support? (contains? mt :deliver-fn)
-        ;; Execute work and prepare completion
-        [thunk-result completion-fn]
-        (if has-rtc-support?
-          ;; Run-then-complete: execute work now, deliver later
+        ;; For CAS, use placeholder completion-fn (will be updated after work executes)
+        ;; Legacy tasks keep :f as completion-fn
+        mt-for-inflight (if has-rtc-support?
+                          (assoc mt :completion-fn nil) ; placeholder, updated after work
+                          (assoc mt :completion-fn (:f mt)))
+        s' (-> s-after
+               (assoc :micro-q q')
+               (assoc :rng-select new-rng)
+               (cond-> select-trace (maybe-trace-state select-trace))
+               (start-in-flight! sched mt-for-inflight))]
+    ;; CAS FIRST - claim the task before any side effects
+    (if (compare-and-set! state-atom s s')
+      ;; CAS succeeded - now safe to execute work and return task
+      (do
+        (when has-rtc-support?
           (let [work-thunk (:work-thunk mt)
                 deliver-fn (:deliver-fn mt)
+                ;; Execute work-thunk now (after CAS, so no duplicate on retry)
                 result (if work-thunk
                          (try
                            {:status :success :value (work-thunk)}
                            (catch #?(:clj Throwable :cljs :default) e
                              {:status :error :error e}))
-                         ;; No work (e.g., yield) - just a delay
-                         {:status :success :value nil})]
-            [result (fn [] (deliver-fn result))])
-          ;; Legacy: defer to :f at completion
-          [nil (:f mt)])
-
-        mt-with-completion (assoc mt
-                                  :completion-fn completion-fn
-                                  :thunk-result thunk-result)
-        s' (-> s-after
-               (assoc :micro-q q')
-               (assoc :rng-select new-rng)
-               (cond-> select-trace (maybe-trace-state select-trace))
-               (start-in-flight! sched mt-with-completion))]
-    (if (compare-and-set! state-atom s s')
-      mt
+                         {:status :success :value nil})
+                ;; Create completion-fn that delivers this result
+                completion-fn (fn [] (deliver-fn result))
+                ;; Find and update the in-flight entry with completion-fn
+                duration (:duration-ms mt 0)
+                end-ms (+ now (long duration))
+                inflight-key [end-ms (:id mt)]]
+            ;; Update in-flight entry with actual completion-fn
+            (swap! state-atom update-in [:in-flight inflight-key]
+                   assoc :completion-fn completion-fn :thunk-result result)))
+        mt)
+      ;; CAS failed - return nil, caller will retry (but no work was executed!)
       nil)))
 
 (defn- run-task-immediately!
-  "Run a task immediately (duration == 0). Returns the task."
-  [^TestScheduler sched s mt q' decision new-rng s-after]
+  "Run a task immediately (duration == 0). Returns the task.
+
+  available-q is the lane-filtered queue used for trace alternatives."
+  [^TestScheduler sched s mt q' decision new-rng s-after available-q]
   (let [state-atom (:state sched)
         now (:now-ms s-after)
         duration (:duration-ms mt 0)
-        q-size (count (:micro-q s))
-        select-trace (when (> q-size 1)
+        available-size (count available-q)
+        select-trace (when (> available-size 1)
                        {:event :select-task
                         :decision decision
-                        :queue-size q-size
+                        :queue-size available-size
                         :selected-id (:id mt)
-                        :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec (:micro-q s))))
+                        :alternatives (mapv :id (filter #(not= (:id %) (:id mt)) (q->vec available-q)))
                         :now-ms now})
         s' (-> s-after
                (assoc :micro-q q')
@@ -1079,11 +1122,11 @@
                  ;; Lane has capacity (guaranteed by available-q filter) - start or run the task
                  (if (pos? duration)
                    ;; Task has duration: start as in-flight
-                   (if-let [result (start-task-in-flight! sched s mt q' decision new-rng s-after)]
+                   (if-let [result (start-task-in-flight! sched s mt q' decision new-rng s-after available-q)]
                      result
                      (recur))
                    ;; No duration: run immediately (backward compatible)
-                   (if-let [result (run-task-immediately! sched s mt q' decision new-rng s-after)]
+                   (if-let [result (run-task-immediately! sched s mt q' decision new-rng s-after available-q)]
                      result
                      (recur))))))))))))
 
@@ -1174,20 +1217,17 @@
            job-state (atom {:status :pending})
            cancel-cell (atom nil)
 
-           ;; Complete job via scheduler microtask, so completions become part of deterministic order.
+           ;; Complete job synchronously - this matches real Missionary where the s/f
+           ;; callbacks run immediately when the task completes. The task primitives
+           ;; (via-call, sleep, etc.) are responsible for scheduling their completions
+           ;; appropriately; the Job wrapper should not add extra microtask hops.
            complete! (fn [status v]
-                       (enqueue-microtask!
-                        sched
-                        (fn []
-                          (swap! job-state
-                                 (fn [st]
-                                   (if (= :pending (:status st))
-                                     (assoc st :status status
-                                            (if (= status :success) :value :error) v)
-                                     st))))
-                        {:label label
-                         :kind :job/complete
-                         :lane :default}))
+                       (swap! job-state
+                              (fn [st]
+                                (if (= :pending (:status st))
+                                  (assoc st :status status
+                                         (if (= status :success) :value :error) v)
+                                  st))))
 
            ;; Fail job directly without scheduler (for off-thread callback errors).
            ;; This avoids deadlock when ensure-driver-thread! would throw in enqueue-microtask!.
@@ -1198,7 +1238,7 @@
                                        (assoc st :status :failure :error ex)
                                        st))))]
 
-       ;; Start task immediately (but its completion is always delivered through scheduler microtasks).
+       ;; Start task immediately. Job completion is synchronous (matching Missionary semantics).
        (try
          (let [cancel
                (task

@@ -573,7 +573,8 @@ Enable tracing to see exactly what happened:
 | `:run-microtask` | Task executed (0ms duration) | `:id`, `:kind`, `:now-ms` |
 | `:task-start` | Task with duration started | `:id`, `:kind`, `:duration-ms`, `:end-ms`, `:now-ms` |
 | `:task-complete` | In-flight task completed | `:id`, `:kind`, `:now-ms` |
-| `:select-task` | Task selected from multiple options | `:id`, `:kind`, `:now-ms` |
+| `:select-task` | Task selected from multiple runnable options | `:selected-id`, `:alternatives`, `:queue-size`, `:decision`, `:now-ms` |
+| `:cancel-promoted-timer` | Promoted timer microtask cancelled | `:id`, `:now-ms` |
 | `:promote-timers` | Due timers moved to queue | `:ids`, `:count`, `:now-ms` |
 | `:advance-to` | Virtual time advanced | `:from`, `:to`, `:now-ms` |
 | `:cancel-timer` | Timer cancelled | `:id`, `:now-ms` |
@@ -857,7 +858,7 @@ The scheduler automatically detects common problems:
 - `(clock)` - current time: virtual when scheduler bound, real otherwise (for production code)
 - `(pending sched)` - queued microtasks and timers
 - `(next-event sched)` - what would execute next: `{:type :microtask ...}`, `{:type :timer ...}`, or `nil`
-- `(next-tasks sched)` - vector of available microtasks with `:id`, `:kind`, `:label`, `:lane` (for manual stepping)
+- `(next-tasks sched)` - vector of runnable microtasks with `:id`, `:kind`, `:label`, `:lane` (filtered by lane capacity; use `pending` for full queue)
 - `(trace sched)` - execution trace (if enabled)
 
 ### Time Control
@@ -1080,6 +1081,14 @@ Missionary uses cooperative single-threaded execution by default. Tasks interlea
 1. **Virtual time** - Which sleeps/timeouts complete first
 2. **Task ordering** - Which ready task runs next (via schedule)
 3. **`m/via` calls** - `via-call` is patched to run work on the driver thread (executor is ignored)
+
+### Execution semantics
+
+The testkit matches Missionary's execution semantics:
+
+- **Job completion is synchronous** - When a task's success/failure callback is invoked, the Job state updates immediately (no extra microtask hop). This matches real Missionary where `s`/`f` callbacks run synchronously.
+- **Via-call work executes at start, delivers at completion** - When `:duration-range` is set, `m/via` tasks execute their work immediately when started, but result delivery is delayed until the virtual duration elapses. The lane is occupied during this entire period.
+- **Timer callbacks are scheduled** - Sleep/timeout completions go through the timer → microtask promotion flow, giving you control over interleaving with other tasks.
 
 ### m/via Behavior
 

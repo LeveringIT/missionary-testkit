@@ -83,12 +83,13 @@
       (is (nil? (mt/next-event sched)))))
 
   (testing "returns microtask info when microtask queued"
-    (let [sched (mt/make-scheduler)]
-      (mt/start! sched (mt/yield :done) {:label "test-yield"})
-      (let [ev (mt/next-event sched)]
-        (is (= :microtask (:type ev)))
-        (is (some? (:kind ev)))
-        (is (some? (:id ev))))))
+    (binding [mt/*is-deterministic* true]
+      (let [sched (mt/make-scheduler)]
+        (mt/start! sched (mt/yield :done) {:label "test-yield"})
+        (let [ev (mt/next-event sched)]
+          (is (= :microtask (:type ev)))
+          (is (some? (:kind ev)))
+          (is (some? (:id ev)))))))
 
   (testing "returns timer info when only timer pending"
     (binding [mt/*is-deterministic* true]
