@@ -2413,3 +2413,245 @@
                                 (m/? (m/sleep 300 :sleep2))))))]
           (is (= [:sleep1 :sleep2] result)
               (str "Seed " seed ": blocking work completes first because trampoline is blocked")))))))
+
+;; =============================================================================
+;; Diamond-Shaped Flow Tests (Continuous Signals)
+;; =============================================================================
+;;
+;; Diamond topology for continuous flows:
+;;
+;;       !input (atom)
+;;          |
+;;       <input (m/signal watching atom)
+;;        /   \
+;;    <left   <right    (derived signals via m/latest)
+;;        \   /
+;;       <merged        (combined via m/latest)
+;;
+;; Key property: glitch-free propagation - merged always sees consistent state
+;; from both branches (never sees old-left + new-right or vice versa).
+
+(deftest diamond-flow-basic-test
+  (testing "diamond flow produces consistent merged results"
+    ;; Basic diamond: source signal -> two derived signals -> merged output
+    ;; When source changes, merged should always see consistent left+right
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            result (mt/run sched
+                     (let [!input (atom 1)
+                           <input (m/signal (m/watch !input))
+                           <left (m/signal (m/latest #(* 2 %) <input))
+                           <right (m/signal (m/latest #(+ 10 %) <input))
+                           <merged (m/signal (m/latest (fn [l r] {:input (/ l 2) :left l :right r})
+                                                       <left <right))
+                           results (atom [])]
+                       (m/sp
+                         (m/? (m/race
+                                ;; Consumer - collect 4 results
+                                (m/reduce (fn [_ v]
+                                            (swap! results conj v)
+                                            (when (>= (count @results) 4)
+                                              (reduced @results)))
+                                          nil
+                                          <merged)
+                                ;; Producer - drive changes
+                                (m/sp
+                                  (m/? (m/sleep 10))
+                                  (reset! !input 2)
+                                  (m/? (m/sleep 10))
+                                  (reset! !input 5)
+                                  (m/? (m/sleep 10))
+                                  (reset! !input 10)
+                                  (m/? (m/sleep 1000))))))))]
+        ;; Each result should be consistent
+        (is (= [{:input 1 :left 2 :right 11}
+                {:input 2 :left 4 :right 12}
+                {:input 5 :left 10 :right 15}
+                {:input 10 :left 20 :right 20}]
+               result))
+        ;; Verify glitch-free: left = input*2, right = input+10
+        (doseq [{:keys [input left right]} result]
+          (is (= left (* 2 input)) "left should be input * 2")
+          (is (= right (+ 10 input)) "right should be input + 10"))))))
+
+(deftest diamond-flow-glitch-free-test
+
+  (testing "glitch-free property holds under interleaving exploration"
+    (mt/with-determinism
+      (let [make-task (fn []
+                        (let [!input (atom 10)
+                              observations (atom [])]
+                          (m/sp
+                            (let [<input (m/signal (m/watch !input))
+                                  <left (m/signal (m/latest #(* 2 %) <input))
+                                  <right (m/signal (m/latest #(+ 5 %) <input))
+                                  <merged (m/signal (m/latest (fn [l r]
+                                                                (let [obs {:left l :right r}]
+                                                                  (swap! observations conj obs)
+                                                                  obs))
+                                                              <left <right))]
+                              (m/? (m/race
+                                     (m/reduce (fn [_ _] nil) nil <merged)
+                                     (m/sp
+                                       (m/? (m/sleep 5))
+                                       (reset! !input 20)
+                                       (m/? (m/sleep 5))
+                                       (reset! !input 30)
+                                       (m/? (m/sleep 5)))))
+                              @observations))))
+            ;; Property: all observations are glitch-free
+            glitch-free? (fn [observations]
+                           (every? (fn [{:keys [left right]}]
+                                     ;; left = input*2, right = input+5
+                                     ;; so left/2 = right-5 = input
+                                     (= (/ left 2) (- right 5)))
+                                   observations))
+            result (mt/check-interleaving make-task
+                                          {:num-tests 50
+                                           :seed 42
+                                           :property glitch-free?})]
+        (is (:ok? result) "Diamond flow should be glitch-free under all interleavings")))))
+
+(deftest diamond-flow-complex-dag-test
+  (testing "complex diamond: multiple sources converging"
+    ;; Topology:
+    ;;    !a        !b
+    ;;     |         |
+    ;;    <a        <b
+    ;;     |    \  / |
+    ;;    <a2    <ab  <b2
+    ;;      \    |   /
+    ;;       <result
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            result (mt/run sched
+                     (let [!a (atom 2)
+                           !b (atom 3)
+                           <a (m/signal (m/watch !a))
+                           <b (m/signal (m/watch !b))
+                           <a2 (m/signal (m/latest #(* % %) <a))        ; a^2
+                           <ab (m/signal (m/latest * <a <b))            ; a*b
+                           <b2 (m/signal (m/latest #(* % %) <b))        ; b^2
+                           <result (m/signal (m/latest (fn [a2 ab b2]
+                                                         {:a2 a2 :ab ab :b2 b2
+                                                          :sum (+ a2 ab b2)})
+                                                       <a2 <ab <b2))
+                           results (atom [])]
+                       (m/sp
+                         (m/? (m/race
+                                (m/reduce (fn [_ v]
+                                            (swap! results conj v)
+                                            (when (>= (count @results) 4)
+                                              (reduced @results)))
+                                          nil
+                                          <result)
+                                (m/sp
+                                  (m/? (m/sleep 10))
+                                  (reset! !a 4)
+                                  (m/? (m/sleep 10))
+                                  (reset! !b 5)
+                                  (m/? (m/sleep 10))
+                                  (reset! !a 1)
+                                  (m/? (m/sleep 1000))))))))]
+        ;; Initial: a=2, b=3 -> a2=4, ab=6, b2=9, sum=19
+        ;; After !a=4: a=4, b=3 -> a2=16, ab=12, b2=9, sum=37
+        ;; After !b=5: a=4, b=5 -> a2=16, ab=20, b2=25, sum=61
+        ;; After !a=1: a=1, b=5 -> a2=1, ab=5, b2=25, sum=31
+        (is (= [{:a2 4 :ab 6 :b2 9 :sum 19}
+                {:a2 16 :ab 12 :b2 9 :sum 37}
+                {:a2 16 :ab 20 :b2 25 :sum 61}
+                {:a2 1 :ab 5 :b2 25 :sum 31}]
+               result))))))
+
+
+
+(deftest diamond-flow-sampling-test
+  (testing "diamond with sampling: slow sampler reads from the flow"
+    ;; Demonstrates sampling from a diamond-shaped continuous flow.
+    ;; Uses m/relieve to convert continuous <combined to discrete,
+    ;; then takes first value - this samples the current flow value.
+    ;;
+    ;; Timeline:
+    ;;   Producer updates !counter every 10ms: 0, 1, 2, 3, 4, 5, 6, 7
+    ;;   Slow sampler samples <combined at t=35ms and t=70ms
+    ;;   At t=35: counter=3, <combined=15
+    ;;   At t=70: counter=6, <combined=30
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            result (mt/run sched
+                     (let [!counter (atom 0)
+                           <counter (m/signal (m/watch !counter))
+                           <doubled (m/signal (m/latest #(* 2 %) <counter))
+                           <tripled (m/signal (m/latest #(* 3 %) <counter))
+                           <combined (m/signal (m/latest + <doubled <tripled))  ; = 5 * counter
+                           sampled-values (atom [])
+                           ;; Helper to sample current value from continuous flow
+                           sample-flow (fn [flow]
+                                         (m/reduce (fn [_ x] (reduced x)) nil (m/relieve {} flow)))]
+                       (m/sp
+                         (m/? (m/race
+                                ;; Fast producer: update counter every 10ms
+                                (m/sp
+                                  (dotimes [i 8]
+                                    (reset! !counter i)
+                                    (m/? (m/sleep 10))))
+                                ;; Slow sampler: sample <combined at t=35ms and t=70ms
+                                (m/sp
+                                  ;; First sample at t=35ms
+                                  (m/? (m/sleep 35))
+                                  (let [v (m/? (sample-flow <combined))]
+                                    (swap! sampled-values conj {:time 35 :combined v}))
+                                  ;; Second sample at t=70ms
+                                  (m/? (m/sleep 35))
+                                  (let [v (m/? (sample-flow <combined))]
+                                    (swap! sampled-values conj {:time 70 :combined v}))
+                                  ;; Keep running until producer finishes
+                                  (m/? (m/sleep 100)))))
+                         @sampled-values)))]
+        ;; Verify slow sampler captured values at expected times
+        (is (= 2 (count result)) "Should have 2 samples")
+        ;; At t=35, combined should be 15 (counter=3, 5*3=15)
+        (let [{:keys [time combined]} (first result)]
+          (is (= 35 time))
+          (is (= 15 combined) "Combined should be 15 at t=35"))
+        ;; At t=70, combined should be 30 (counter=6, 5*6=30)
+        (let [{:keys [time combined]} (second result)]
+          (is (= 70 time))
+          (is (= 30 combined) "Combined should be 30 at t=70")))))
+
+  (testing "slow sampler at irregular intervals samples from flow"
+    ;; Sample from <sum flow at irregular intervals while producer runs fast
+    (mt/with-determinism
+      (let [sched (mt/make-scheduler)
+            samples (mt/run sched
+                      (let [!n (atom 0)
+                            <n (m/signal (m/watch !n))
+                            <x2 (m/signal (m/latest #(* 2 %) <n))
+                            <x3 (m/signal (m/latest #(* 3 %) <n))
+                            <sum (m/signal (m/latest + <x2 <x3))  ; = 5 * n
+                            collected (atom [])
+                            sample-flow (fn [flow]
+                                          (m/reduce (fn [_ x] (reduced x)) nil (m/relieve {} flow)))]
+                        (m/sp
+                          (m/? (m/race
+                                 ;; Producer: rapid updates every 2ms
+                                 (m/sp
+                                   (dotimes [i 50]
+                                     (reset! !n i)
+                                     (m/? (m/sleep 2))))
+                                 ;; Slow sampler: sample at irregular intervals
+                                 (m/sp
+                                   (doseq [delay [7 13 11 17 23]]
+                                     (m/? (m/sleep delay))
+                                     ;; Sample from the flow, not the atom
+                                     (let [sum-val (m/? (sample-flow <sum))]
+                                       (swap! collected conj sum-val)))
+                                   (m/? (m/sleep 200)))))
+                          @collected)))]
+        ;; Should have collected 5 samples
+        (is (= 5 (count samples)) "Should have 5 samples")
+        ;; Each sample should be a multiple of 5 (glitch-free)
+        (is (every? #(zero? (mod % 5)) samples)
+            (str "All samples should be multiples of 5 (5*n). Got: " samples))
+        ;; Samples should be increasing (producer is incrementing)
+        (is (apply <= samples) "Samples should be non-decreasing")))))
