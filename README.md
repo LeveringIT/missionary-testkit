@@ -118,9 +118,9 @@ By default, user work (`yield`, `via-call`) completes instantly (0ms). Use `:dur
         ;; Each via-call takes 10ms virtual time on :blk lane
         (m/? (m/timeout
                (m/sp
-                 (m/? (m/via m/blk (mt/yield)))  ; 10ms
-                 (m/? (m/via m/blk (mt/yield)))  ; 10ms
-                 (m/? (m/via m/blk (mt/yield)))  ; 10ms = 30ms total
+                 (m/? (m/via m/blk :work))  ; 10ms
+                 (m/? (m/via m/blk :work))  ; 10ms
+                 (m/? (m/via m/blk :work))  ; 10ms = 30ms total
                  :completed)
                25  ; timeout at 25ms
                :timed-out))))))
